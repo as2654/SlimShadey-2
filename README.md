@@ -11,6 +11,7 @@ SlimShadey 2.0 is a complete reimplementation of the [original SlimShadey](https
 ### Shading
 
 - **Standard** — editable per-residue color schemes with automatic nucleotide/protein detection and a global luminance control for automatic text contrast
+- **ClustalX** — the original amino acid color-scheme provided by ClustalX's UI
 - **Frequency** — shade residues by column frequency against a tunable threshold, with optional inversion
 - **Uniqueness** — highlight residues that occur at most *n* times in a column, with optional gap shading
 - **Substitution matrix** — shade against a reference sequence or the column majority using any matrix from the built-in BLOSUM, PAM, and Gonnet families, with a continuous color gradient between perfect match and absolute mismatch
