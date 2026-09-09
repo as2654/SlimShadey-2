@@ -7577,6 +7577,15 @@ function createTab(name, records, presetState = null) {
     clustalXColors: null
   };
 
+  const invalidateMotifCaches = () => {
+    for (const key of ["regex", "scanprosite"]) {
+      const cfg = tabState.shadeConfig[key];
+      if (!cfg) continue;
+      cfg.hitsByRow = null; // cached hit positions — wrong after any structural edit
+      cfg.appliedHits = []; // revert list — reverting at stale coordinates corrupts colors
+    }
+  };
+
   tabState.records.forEach((rec) => {
     if (rec.charColors && !rec.colorIdx) {
       rec.colorIdx = colorIdxFromObject(rec.charColors, rec.seq.length);
@@ -7595,8 +7604,14 @@ function createTab(name, records, presetState = null) {
   }
 
   function getColCount() {
-    return Math.max(1, ...tabState.records.map((r) => r.seq.length), ...tabState.annotations.map((a) => a.data.length));
+    let n = 1;
+    const recs = tabState.records;
+    for (let i = 0; i < recs.length; i++) if (recs[i].seq.length > n) n = recs[i].seq.length;
+    const anns = tabState.annotations;
+    for (let i = 0; i < anns.length; i++) if (anns[i].data.length > n) n = anns[i].data.length;
+    return n;
   }
+
   function getCellDims() {
     return cellDimsFor(tabState.fontSize);
   }
@@ -8046,7 +8061,13 @@ function createTab(name, records, presetState = null) {
           delete tabState.consensusColors[c];
           const ch =
             tabState.consensusOverrides[c] !== undefined ? tabState.consensusOverrides[c] : consensusStr[c] || "-";
-          consensusCtl.applyColorOverrides([{ row: 0, col: c, ch, color: getColorForChar(tabState, ch) }]);
+          const bakedIdx = tabState.consensusBaked ? tabState.consensusBaked.colors[c] : 0;
+          const color = bakedIdx
+            ? hexToRgbFloat(paletteHex(bakedIdx))
+            : tabState.consensusTinted
+              ? getColorForChar(tabState, ch)
+              : [1, 1, 1];
+          consensusCtl.applyColorOverrides([{ row: 0, col: c, ch, color }]);
         }
       );
     },
@@ -8124,8 +8145,10 @@ function createTab(name, records, presetState = null) {
     },
     onDeleteColumns: (lo, hi) => {
       tabState.records.forEach((rec) => {
-        if (rec.seq.length > lo) rec.seq = rec.seq.slice(0, lo) + rec.seq.slice(hi + 1);
-        //if (rec.charColors) rec.charColors = reindexColumnMap(rec.charColors, lo, hi);
+        if (rec.seq.length > lo) {
+          rec.seq = rec.seq.slice(0, lo) + rec.seq.slice(hi + 1);
+        }
+        if (rec.charColors) rec.charColors = reindexColumnMap(rec.charColors, lo, hi);
         if (rec.colorIdx) {
           const next = new Uint16Array(Math.max(0, rec.colorIdx.length - (hi - lo + 1)));
           next.set(rec.colorIdx.subarray(0, lo), 0);
@@ -8134,17 +8157,23 @@ function createTab(name, records, presetState = null) {
         }
       });
       tabState.annotations.forEach((entry) => {
-        if (entry.data.length > lo) entry.data = entry.data.slice(0, lo) + entry.data.slice(hi + 1);
+        if (entry.data.length > lo) {
+          entry.data = entry.data.slice(0, lo) + entry.data.slice(hi + 1);
+        }
         if (entry.colors) entry.colors = reindexColumnMap(entry.colors, lo, hi);
       });
       tabState.consensusOverrides = reindexColumnMap(tabState.consensusOverrides, lo, hi);
       tabState.consensusColors = reindexColumnMap(tabState.consensusColors, lo, hi);
-      refreshConsensus(); // clears both consensus cache layers
-      // column indexes shifted — strip caches are column-keyed, drop them wholesale
+      refreshConsensus(); // clears both consensus cache layers — column indexes shifted
+      // strip caches are column-keyed, drop them wholesale
       conservationStrip.invalidate();
       logoStrip.invalidate();
       overviewStrip.invalidate();
-      tabState.consensusBaked = null; // indexes shifted / rows changed — baked consensus is stale
+      tabState.consensusBaked = null; // indexes shifted — baked consensus is stale
+      invalidateMotifCaches(); // regex/scanprosite hit coordinates are stale after column shifts
+      tabState.frequencyColumns = null;
+      tabState.uniqueColCounts = null;
+      tabState.matrixCache = null;
       annotationCtl.rebuildBuffer();
       numberingCtl.rebuildBuffer();
       consensusCtl.rebuildBuffer();
@@ -8533,17 +8562,24 @@ function createTab(name, records, presetState = null) {
 
   // ---- Sequence names panel ----
   function refreshAfterRecordsChanged() {
-    refreshConsensus(); // clears both consensus cache layers
-    // rows changed — every column's stats are stale
-    tabState.consensusBaked = null; // indexes shifted / rows changed — baked consensus is stale
+    refreshConsensus(); // clears both consensus cache layers — rows changed, every column's stats are stale
+    tabState.consensusBaked = null; // rows changed — baked consensus is stale
     conservationStrip.invalidate();
     logoStrip.invalidate();
     overviewStrip.invalidate();
+    invalidateMotifCaches(); // hitsByRow/appliedHits are row-index keyed
+    // row-coordinate caches: sequence/matrix headers cache refIndex; the frequency
+    // header caches seqNum; unique counts are computed over the row set
+    tabState.sequenceCache = null;
+    tabState.matrixCache = null;
+    tabState.frequencyColumns = null;
+    tabState.uniqueColCounts = null;
     consensusCtl.rebuildBuffer();
     numberingCtl.rebuildBuffer();
     alignmentCtl.rebuildBuffer();
     updateHScrollSpacer();
     updateAlignmentHeight();
+    buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
   }
   buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
 
