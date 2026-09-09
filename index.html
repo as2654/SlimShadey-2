@@ -5,16 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SlimShadey</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="icon" type="image/svg+xml" href="slimshadey-logo.svg">
   </head>
   <body>
     <div class="app-root">
       <header class="app-header">
         <h1 class="app-title">
-          <a href="https://github.com/as2654/SlimShadey2.0" target="_blank" rel="noopener noreferrer">SlimShadey</a>
+          <a href="https://github.com/as2654/SlimShadey2.0" target="_blank" rel="noopener noreferrer" id="titleLink"
+            >SlimShadey</a
+          >
+          <span class="click-me-halo" id="clickMeHalo">Click me!</span>
         </h1>
         <button id="startBtn" class="start-btn">Open file</button>
         <button id="useExamplesBtn" class="start-btn examples-btn">Use examples</button>
-        <input type="file" id="fileInput" accept=".fasta,.fa,.fna,.txt,.mm" style="display: none" />
+        <input type="file" id="fileInput" accept=".fasta,.fa,.fna,.txt,.blim,.slim,.mm" style="display: none" />
       </header>
 
       <div class="tab-bar" id="tabBar"></div>

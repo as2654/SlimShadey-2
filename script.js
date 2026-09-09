@@ -610,7 +610,7 @@ function getSubstitutionScore(matrixName, charA, charB) {
   return m.matrix[i][j];
 }
 
-// ---------- FASTA parsing ----------
+//  FASTA parsing
 function parseFasta(text) {
   const records = [];
   let current = null;
@@ -633,7 +633,7 @@ function cellDimsFor(fontSize) {
   return { w: Math.round(fontSize * 0.85), h: Math.round(fontSize * 1.25) };
 }
 
-// ---------- Glyph atlas (supports upper + lowercase) ----------
+//  Glyph atlas (supports upper + lowercase)
 const GLYPH_CHARSET = [];
 for (let code = 32; code <= 126; code++) GLYPH_CHARSET.push(String.fromCharCode(code));
 const charToGlyphIndex = new Map(GLYPH_CHARSET.map((c, i) => [c, i]));
@@ -670,7 +670,9 @@ function buildGlyphAtlas() {
 }
 const GLYPH_ATLAS = buildGlyphAtlas();
 
-// ---------- Color scheme defaults ----------
+let webglAlertShown = false; // fire the unsupported-browser alert once, not once per canvas
+
+//  Color scheme defaults
 function hexToRgbFloat(hex) {
   const h = hex.replace("#", "");
   return [
@@ -686,6 +688,58 @@ function rgbFloatToHex(rgb) {
       .padStart(2, "0");
   return `#${to2(rgb[0])}${to2(rgb[1])}${to2(rgb[2])}`.toUpperCase();
 }
+
+// ---------- Color palette: store 2-byte palette indices, not hex strings ----------
+// index 0 is reserved: 0 = "no override". Read contract matches the old
+// charColors[c]: a hex string, or undefined when the cell has no override.
+const COLOR_PALETTE = ["#FFFFFF"]; // dummy; index 0 is never read
+const colorIndexByHex = new Map();
+
+function paletteIndexFor(hex) {
+  hex = hex[0] === "#" ? hex.toUpperCase() : "#" + hex.toUpperCase();
+  let i = colorIndexByHex.get(hex);
+  if (i === undefined) {
+    i = COLOR_PALETTE.length;
+    COLOR_PALETTE.push(hex);
+    colorIndexByHex.set(hex, i);
+  }
+  return i;
+}
+function paletteHex(i) {
+  return COLOR_PALETTE[i];
+}
+
+function recordColorAt(rec, c) {
+  const arr = rec.colorIdx;
+  if (!arr || c >= arr.length) return undefined;
+  const i = arr[c];
+  return i === 0 ? undefined : COLOR_PALETTE[i];
+}
+
+function setRecordColor(rec, c, hex) {
+  let arr = rec.colorIdx;
+  if (!arr || c >= arr.length) {
+    const next = new Uint16Array(Math.max(c + 1, arr ? arr.length : 0));
+    if (arr) next.set(arr);
+    rec.colorIdx = arr = next;
+  }
+  arr[c] = paletteIndexFor(hex);
+}
+
+function clearRecordColor(rec, c) {
+  const arr = rec.colorIdx;
+  if (arr && c < arr.length) arr[c] = 0;
+}
+
+// bridge for producers that still build plain {col: hex} objects
+function colorIdxFromObject(obj, len) {
+  const keys = Object.keys(obj);
+  if (!keys.length) return null;
+  const arr = new Uint16Array(len);
+  for (const k of keys) arr[Number(k)] = paletteIndexFor(obj[k]);
+  return arr;
+}
+
 function lerpColor(c1, c2, t) {
   return [c1[0] + (c2[0] - c1[0]) * t, c1[1] + (c2[1] - c1[1]) * t, c1[2] + (c2[2] - c1[2]) * t];
 }
@@ -791,7 +845,7 @@ function detectAlphabet(records) {
 const ANNOTATION_BG = [1, 1, 1];
 const NUMBERING_BG = [1, 1, 1];
 
-// ---------- Residue / nucleotide categories (for By-sequence shading) ----------
+//  Residue / nucleotide categories (for By-sequence shading)
 const RESIDUE_CATEGORY = {
   A: "aliphatic",
   V: "aliphatic",
@@ -843,115 +897,117 @@ function categoryFor(tabState, ch) {
   return map[ch.toUpperCase()] || null;
 }
 
-// ---------- Shading mode color functions ----------
-function computeFrequencyColumns(tabState, colCount) {
+//  Shading mode color functions
+function frequencyCacheHeader(tabState) {
+  const cfg = tabState.shadeConfig.frequency;
   const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
   const residueKeys = alphaList.map((e) => e.code).filter((c) => c !== "-");
   const categoryOrder = [];
-  const catOf = {}; // category per residue char, resolved once per rebuild
+  const catOf = {};
   residueKeys.forEach((c) => {
     const cat = categoryFor(tabState, c);
     catOf[c] = cat;
     if (cat && !categoryOrder.includes(cat)) categoryOrder.push(cat);
   });
-
-  const cfg = tabState.shadeConfig.frequency;
-  const records = tabState.records;
-  const seqNum = records.length;
-
-  // colors parsed once per rebuild; level order pre-inverted when inverse is on
-  // (inverse maps level L -> 2-L, i.e. the reversed palette)
   const identityRgb = hexToRgbFloat(cfg.identityHex);
   const similarRgb = hexToRgbFloat(cfg.similarHex);
   const diffRgb = hexToRgbFloat(cfg.diffHex);
-  const white = [1, 1, 1];
-  const levelColors = cfg.inverse ? [identityRgb, similarRgb, diffRgb] : [diffRgb, similarRgb, identityRgb];
 
-  // Phase 1: count residues and categories per column. Row-major, so string
-  // access is sequential and toUpperCase() runs once per row, not per cell.
-  // Missing chars in short rows counted as "-" before, and "-" contributes
-  // nothing to either count, so they're simply skipped here.
-  const residueCounts = new Array(colCount);
-  const categoryCounts = new Array(colCount);
-  for (let c = 0; c < colCount; c++) {
-    const rc = {};
-    residueKeys.forEach((r) => {
-      rc[r] = 0;
-    });
-    residueCounts[c] = rc;
-    const cc = {};
-    categoryOrder.forEach((cat) => {
-      cc[cat] = 0;
-    });
-    categoryCounts[c] = cc;
+  // integer lookup tables: the counting loop runs rows x cols times, so it must
+  // neither allocate (seq[col].toUpperCase()) nor hash strings ({}[ch]).
+  // 255 is the sentinel for "gap / unknown / uncategorized"
+  const charToRes = new Uint8Array(256).fill(255); // charCode -> residueKeys index
+  residueKeys.forEach((c, i) => {
+    charToRes[c.charCodeAt(0)] = i;
+    const lower = c.toLowerCase();
+    if (lower !== c) charToRes[lower.charCodeAt(0)] = i; // lowercase counts too (was toUpperCase)
+  });
+  const catIndex = {};
+  categoryOrder.forEach((cat, i) => (catIndex[cat] = i));
+  const resToCat = new Uint8Array(256).fill(255); // residueKeys index -> categoryOrder index
+  residueKeys.forEach((c, i) => {
+    const cat = catOf[c];
+    if (cat) resToCat[i] = catIndex[cat];
+  });
+
+  return {
+    cfg,
+    alphaList,
+    residueKeys,
+    categoryOrder,
+    catOf,
+    charToRes,
+    resToCat,
+    white: [1, 1, 1],
+    levelColors: cfg.inverse ? [identityRgb, similarRgb, diffRgb] : [diffRgb, similarRgb, identityRgb],
+    seqNum: tabState.records.length
+  };
+}
+
+function computeFrequencyColumnColor(tabState, header, col) {
+  const { cfg, alphaList, residueKeys, categoryOrder, catOf, charToRes, resToCat, levelColors, white, seqNum } = header;
+
+  // counting pass: allocation-free, hash-free — two table reads + two typed-array
+  // increments per cell, instead of a string allocation + two object lookups
+  const resCount = new Int32Array(residueKeys.length);
+  const catCount = new Int32Array(categoryOrder.length);
+  const records = tabState.records;
+  for (let ri = 0; ri < records.length; ri++) {
+    const seq = records[ri].seq;
+    if (col >= seq.length) continue; // treated as gap, as before
+    const code = seq.charCodeAt(col);
+    const idx = code < 256 ? charToRes[code] : 255;
+    if (idx === 255) continue; // gaps and non-residues don't count, as before
+    resCount[idx]++;
+    const ci = resToCat[idx];
+    if (ci !== 255) catCount[ci]++;
   }
-  for (let k = 0; k < seqNum; k++) {
-    const seq = records[k].seq.toUpperCase();
-    const n = Math.min(seq.length, colCount);
-    for (let c = 0; c < n; c++) {
-      const ch = seq[c];
-      const rc = residueCounts[c];
-      if (rc[ch] !== undefined) {
-        rc[ch]++;
-        const cat = catOf[ch];
-        if (cat) categoryCounts[c][cat]++;
-      }
+
+  let dominantChar = null;
+  for (let i = 0; i < residueKeys.length; i++) {
+    const freq = seqNum > 0 ? resCount[i] / seqNum : 0;
+    if (freq > cfg.threshold || (freq === 1 && seqNum > 2)) {
+      dominantChar = residueKeys[i];
+      break;
+    }
+  }
+  let dominantCategory = null;
+  for (let i = 0; i < categoryOrder.length; i++) {
+    const freq = seqNum > 0 ? catCount[i] / seqNum : 0;
+    if (freq > cfg.threshold || (freq === 1 && seqNum > 2)) {
+      dominantCategory = categoryOrder[i];
+      break;
     }
   }
 
-  // Phase 2: per column, decide dominants once, then precompute char -> color
-  // for the whole alphabet. `_def` covers any char not in the alphabet
-  // (e.g. "U" in protein mode, "."), which the old logic shaded as "diff".
-  const columns = new Array(colCount);
-  for (let c = 0; c < colCount; c++) {
-    const rc = residueCounts[c];
-    const cc = categoryCounts[c];
-
-    let dominantChar = null;
-    for (const r of residueKeys) {
-      const freq = seqNum > 0 ? rc[r] / seqNum : 0;
-      if (freq > cfg.threshold || (freq === 1 && seqNum > 2)) {
-        dominantChar = r;
-        break;
-      }
+  const hasDominant = dominantChar !== null || dominantCategory !== null;
+  const refCat = dominantChar !== null ? catOf[dominantChar] : null;
+  const colColors = { "-": white, _def: hasDominant ? levelColors[0] : white };
+  alphaList.forEach((entry) => {
+    const code = entry.code;
+    if (code === "-") return;
+    let level = 0;
+    if (dominantChar !== null) {
+      if (code === dominantChar) level = 2;
+      else if (refCat !== null && catOf[code] === refCat) level = 1;
+    } else if (dominantCategory !== null) {
+      level = catOf[code] === dominantCategory ? 1 : 0;
     }
-    let dominantCategory = null;
-    for (const cat of categoryOrder) {
-      const freq = seqNum > 0 ? cc[cat] / seqNum : 0;
-      if (freq > cfg.threshold || (freq === 1 && seqNum > 2)) {
-        dominantCategory = cat;
-        break;
-      }
-    }
-
-    const hasDominant = dominantChar !== null || dominantCategory !== null;
-    const refCat = dominantChar !== null ? catOf[dominantChar] : null;
-    const colColors = { "-": white, _def: hasDominant ? levelColors[0] : white };
-
-    alphaList.forEach((entry) => {
-      const code = entry.code;
-      if (code === "-") return;
-      let level = 0;
-      if (dominantChar !== null) {
-        if (code === dominantChar) level = 2;
-        else if (refCat !== null && catOf[code] === refCat) level = 1;
-      } else if (dominantCategory !== null) {
-        level = catOf[code] === dominantCategory ? 1 : 0;
-      }
-      const color = hasDominant ? levelColors[level] : white;
-      colColors[code] = color;
-      const lower = code.toLowerCase();
-      if (lower !== code) colColors[lower] = color;
-    });
-
-    columns[c] = colColors;
-  }
-  return columns;
+    const color = hasDominant ? levelColors[level] : white;
+    colColors[code] = color;
+    const lower = code.toLowerCase();
+    if (lower !== code) colColors[lower] = color;
+  });
+  return colColors;
 }
 
 function computeFrequencyShadeColor(tabState, row, col, ch) {
-  const colMap = tabState.frequencyColumns && tabState.frequencyColumns[col];
-  if (!colMap) return [1, 1, 1];
+  let cache = tabState.frequencyColumns;
+  if (!cache || !cache.cols) {
+    cache = tabState.frequencyColumns = { header: frequencyCacheHeader(tabState), cols: {} };
+  }
+  let colMap = cache.cols[col];
+  if (!colMap) colMap = cache.cols[col] = computeFrequencyColumnColor(tabState, cache.header, col);
   const c = colMap[ch];
   return c !== undefined ? c : colMap._def;
 }
@@ -967,146 +1023,143 @@ function matrixColorFor(a, b, matchRgb, mismatchRgb, matrixName) {
   return lerpColor(mismatchRgb, matchRgb, t);
 }
 
-function computeMatrixShadeCache(tabState, colCount) {
+function matrixCacheHeader(tabState) {
   const cfg = tabState.shadeConfig.matrix;
-  const matrixName = cfg.matrixName || "BLOSUM62";
-  const matchRgb = hexToRgbFloat(cfg.matchHex);
-  const mismatchRgb = hexToRgbFloat(cfg.mismatchHex);
-  const white = [1, 1, 1];
   const records = tabState.records;
   const rowCount = records.length;
-  const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
-
-  // 1. Resolve the reference char for every column, once per rebuild.
-  const colRef = new Array(colCount);
   let refIndex = -1;
+  let refSeq = null;
   if (cfg.mode === "sequence") {
     let idx = records.findIndex((r) => r.id === cfg.refSeqId);
     if (idx === -1) idx = 0;
     if (rowCount > 0) refIndex = idx;
-    const refSeq = refIndex >= 0 ? records[refIndex].seq.toUpperCase() : "";
-    for (let c = 0; c < colCount; c++) {
-      const ch = c < refSeq.length ? refSeq[c] : "-";
-      colRef[c] = ch === "-" || ch === "." ? null : ch; // gap ref -> white column
-    }
-  } else {
-    for (let c = 0; c < colCount; c++) {
-      const counts = {};
-      for (let r = 0; r < rowCount; r++) {
-        const seq = records[r].seq;
-        const ch = c < seq.length ? seq[c].toUpperCase() : "-";
-        counts[ch] = (counts[ch] || 0) + 1;
-      }
-      let maxFreq = 0,
-        maxChar = null;
-      Object.entries(counts).forEach(([ch, cnt]) => {
-        const freq = cnt / rowCount;
-        if (freq > maxFreq) {
-          maxFreq = freq;
-          maxChar = ch;
-        }
-      });
-      const ref = maxFreq > cfg.frequency ? maxChar : null;
-      colRef[c] = ref === "-" || ref === "." ? null : ref;
-    }
+    refSeq = refIndex >= 0 ? records[refIndex].seq.toUpperCase() : null;
   }
+  return {
+    mode: cfg.mode,
+    refIndex,
+    refSeq,
+    matrixName: cfg.matrixName || "BLOSUM62",
+    matchRgb: hexToRgbFloat(cfg.matchHex),
+    mismatchRgb: hexToRgbFloat(cfg.mismatchHex || "#FFFFFF"),
+    alphaList: tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET
+  };
+}
 
-  // 2. Color table: for each distinct ref char, the color of every possible
-  //    cell char (alphabet-sized, computed once — not per cell).
-  const table = {};
-  new Set(colRef.filter(Boolean)).forEach((refCh) => {
-    const rowColors = { "-": white, ".": white };
-    alphaList.forEach((entry) => {
-      const color = matrixColorFor(refCh, entry.code, matchRgb, mismatchRgb, matrixName);
-      rowColors[entry.code] = color;
-      const lower = entry.code.toLowerCase();
-      if (lower !== entry.code) rowColors[lower] = color;
-    });
-    // unknown chars get the X-row color, mirroring getSubstitutionScore's fallback
-    if (!rowColors["X"]) rowColors["X"] = matrixColorFor(refCh, "X", matchRgb, mismatchRgb, matrixName);
-    rowColors["x"] = rowColors["X"];
-    table[refCh] = rowColors;
+function matrixColumnRef(tabState, header, col) {
+  const cfg = tabState.shadeConfig.matrix;
+  if (header.mode === "sequence") {
+    const ch = header.refSeq && col < header.refSeq.length ? header.refSeq[col] : "-";
+    return ch === "-" || ch === "." ? null : ch;
+  }
+  const records = tabState.records;
+  const rowCount = records.length;
+  if (rowCount === 0) return null;
+  const counts = {};
+  for (let r = 0; r < rowCount; r++) {
+    const seq = records[r].seq;
+    const ch = col < seq.length ? seq[col].toUpperCase() : "-";
+    counts[ch] = (counts[ch] || 0) + 1;
+  }
+  let maxFreq = 0,
+    maxChar = null;
+  Object.entries(counts).forEach(([ch, cnt]) => {
+    const freq = cnt / rowCount;
+    if (freq > maxFreq) {
+      maxFreq = freq;
+      maxChar = ch;
+    }
   });
+  const ref = maxFreq > cfg.frequency ? maxChar : null;
+  return ref === "-" || ref === "." ? null : ref;
+}
 
-  return { mode: cfg.mode, refIndex, colRef, table };
+function matrixColorRowFor(header, refCh) {
+  const white = [1, 1, 1];
+  const rowColors = { "-": white, ".": white };
+  header.alphaList.forEach((entry) => {
+    const color = matrixColorFor(refCh, entry.code, header.matchRgb, header.mismatchRgb, header.matrixName);
+    rowColors[entry.code] = color;
+    const lower = entry.code.toLowerCase();
+    if (lower !== entry.code) rowColors[lower] = color;
+  });
+  if (!rowColors["X"])
+    rowColors["X"] = matrixColorFor(refCh, "X", header.matchRgb, header.mismatchRgb, header.matrixName);
+  rowColors["x"] = rowColors["X"];
+  return rowColors;
 }
 
 function computeMatrixShadeColor(tabState, row, col, ch) {
   let cache = tabState.matrixCache;
-  if (!cache) {
-    // cold path (e.g. an export before any rebuild in this mode): build once
-    let colCount = 1;
-    for (const r of tabState.records) if (r.seq.length > colCount) colCount = r.seq.length;
-    cache = tabState.matrixCache = computeMatrixShadeCache(tabState, colCount);
+  if (!cache || !cache.colRef) {
+    cache = tabState.matrixCache = { header: matrixCacheHeader(tabState), colRef: {}, tables: {} };
   }
   const cfg = tabState.shadeConfig.matrix;
-  if (cache.mode === "sequence" && row === cache.refIndex && !cfg.shadeMaster) return [1, 1, 1];
-  const ref = cache.colRef[col];
-  if (ref == null) return [1, 1, 1];
-  const rowColors = cache.table[ref];
-  return (rowColors && (rowColors[ch] || rowColors["X"])) || [1, 1, 1];
+  if (cache.header.mode === "sequence" && row === cache.header.refIndex && !cfg.shadeMaster) return [1, 1, 1];
+  let ref = cache.colRef[col];
+  if (ref === undefined) ref = cache.colRef[col] = matrixColumnRef(tabState, cache.header, col);
+  if (ref === null) return [1, 1, 1];
+  let rowColors = cache.tables[ref];
+  if (!rowColors) rowColors = cache.tables[ref] = matrixColorRowFor(cache.header, ref);
+  return rowColors[ch] || rowColors["X"] || [1, 1, 1];
 }
-function computeUniqueColumnColors(tabState, colCount) {
+
+function computeUniqueColumnColor(tabState, col) {
   const cfg = tabState.shadeConfig.unique;
-  const records = tabState.records;
   const white = [1, 1, 1];
-  const shadeRgb = hexToRgbFloat(cfg.colorHex); // parsed once per rebuild, not per cell
-
-  // Phase 1: count chars per column. Row-major for sequential string access;
-  // one toUpperCase() per row instead of one per cell.
-  const counts = new Array(colCount);
-  for (let c = 0; c < colCount; c++) counts[c] = new Map();
-  for (let r = 0; r < records.length; r++) {
-    const seq = records[r].seq.toUpperCase();
-    let c = 0;
-    for (; c < seq.length && c < colCount; c++) {
-      const m = counts[c];
-      const ch = seq[c];
-      m.set(ch, (m.get(ch) || 0) + 1);
-    }
-    for (; c < colCount; c++) {
-      // short rows contribute gap counts, matching the old (seq[c] || "-") behavior
-      const m = counts[c];
-      m.set("-", (m.get("-") || 0) + 1);
-    }
+  const shadeRgb = hexToRgbFloat(cfg.colorHex);
+  const counts = new Map();
+  for (const rec of tabState.records) {
+    const seq = rec.seq;
+    const ch = (col < seq.length ? seq[col] : "-").toUpperCase();
+    counts.set(ch, (counts.get(ch) || 0) + 1);
   }
-
-  // Phase 2: per column, precompute char -> color for distinct chars only
-  // (<= alphabet size per column instead of rows per column).
-  // Both cases are stored so the cell loop never calls toUpperCase().
-  const result = new Array(colCount);
-  for (let c = 0; c < colCount; c++) {
-    const colColors = {};
-    counts[c].forEach((count, ch) => {
-      const color = ch === "-" && !cfg.shadeGaps ? white : count <= cfg.maxCount ? shadeRgb : white;
-      colColors[ch] = color;
-      const lower = ch.toLowerCase();
-      if (lower !== ch) colColors[lower] = color;
-    });
-    result[c] = colColors;
-  }
-  return result;
+  const colColors = {};
+  counts.forEach((count, ch) => {
+    const color = ch === "-" && !cfg.shadeGaps ? white : count <= cfg.maxCount ? shadeRgb : white;
+    colColors[ch] = color;
+    const lower = ch.toLowerCase();
+    if (lower !== ch) colColors[lower] = color;
+  });
+  return colColors;
 }
 
 function computeUniqueShadeColor(tabState, col, ch) {
-  const colMap = tabState.uniqueColCounts[col];
-  if (!colMap) return [1, 1, 1];
+  let cache = tabState.uniqueColCounts;
+  if (!cache || !cache.cols) cache = tabState.uniqueColCounts = { cols: {} };
+  let colMap = cache.cols[col];
+  if (!colMap) colMap = cache.cols[col] = computeUniqueColumnColor(tabState, col);
   return colMap[ch] || [1, 1, 1];
 }
 
-function computeSequenceShadeColor(tabState, row, col, ch) {
+function sequenceCacheHeader(tabState) {
   const cfg = tabState.shadeConfig.sequence;
-  let refIndex = tabState.records.findIndex((r) => r.id === cfg.refSeqId);
+  const records = tabState.records;
+  let refIndex = records.findIndex((r) => r.id === cfg.refSeqId);
   if (refIndex === -1) refIndex = 0;
-  if (row === refIndex) return hexToRgbFloat(cfg.masterColorHex);
-  const masterChar = (tabState.records[refIndex].seq[col] || "-").toUpperCase();
+  return {
+    refIndex: records.length ? refIndex : -1,
+    masterRgb: hexToRgbFloat(cfg.masterColorHex),
+    identityRgb: hexToRgbFloat(cfg.identityHex),
+    similarRgb: hexToRgbFloat(cfg.similarHex),
+    diffRgb: hexToRgbFloat(cfg.diffHex)
+  };
+}
+
+function computeSequenceShadeColor(tabState, row, col, ch) {
+  let header = tabState.sequenceCache;
+  if (!header) header = tabState.sequenceCache = sequenceCacheHeader(tabState);
+  if (header.refIndex < 0) return [1, 1, 1];
+  if (row === header.refIndex) return header.masterRgb;
+  const refSeq = tabState.records[header.refIndex].seq;
+  const masterChar = (col < refSeq.length ? refSeq[col] : "-").toUpperCase();
   const actual = ch.toUpperCase();
   if (masterChar === "-" || actual === "-") return [1, 1, 1];
-  if (actual === masterChar) return hexToRgbFloat(cfg.identityHex);
+  if (actual === masterChar) return header.identityRgb;
   const catMaster = categoryFor(tabState, masterChar);
   const catActual = categoryFor(tabState, actual);
-  if (catMaster && catActual && catMaster === catActual) return hexToRgbFloat(cfg.similarHex);
-  return hexToRgbFloat(cfg.diffHex);
+  if (catMaster && catActual && catMaster === catActual) return header.similarRgb;
+  return header.diffRgb;
 }
 
 function degapWithColMap(seq) {
@@ -1225,7 +1278,7 @@ function computeScanPrositeShadeColor(tabState, row, col, ch) {
   const cfg = tabState.shadeConfig.scanprosite;
   if (!cfg.hitsByRow || !cfg.hitsByRow[row]) return null;
   const name = cfg.hitsByRow[row].get(col);
-  return name ? hexToRgbFloat(cfg.colorsByName[name] || "FFFFFF") : [1, 1, 1];
+  return name ? hexToRgbFloat(cfg.colorsByName[name] || "FFFFFF") : null;
 }
 
 let PROSITE_DB_CACHE = null;
@@ -1361,7 +1414,6 @@ function showHmmerLoadingOverlay() {
 
 async function runScanPrositeShading(tabState, ctx) {
   const cfg = tabState.shadeConfig.scanprosite;
-  if (tabState.shadeMode !== "scanprosite") cfg.baseMode = tabState.shadeMode;
 
   const loading = showHmmerLoadingOverlay();
 
@@ -1377,28 +1429,54 @@ async function runScanPrositeShading(tabState, ctx) {
   const hitsByRow = tabState.records.map(() => new Map());
   const colorsByName = {};
 
-  loading.setProgress(0, tabState.records.length);
+  // dereplicate: only unique sequences are scanned; identical copies inherit hits
+  const repOf = new Map(); // sequence string -> representative row index
+  const repForRow = new Array(tabState.records.length);
+  const rowsToScan = [];
+  tabState.records.forEach((rec, r) => {
+    if (repOf.has(rec.seq)) {
+      repForRow[r] = repOf.get(rec.seq);
+    } else {
+      repOf.set(rec.seq, r);
+      repForRow[r] = r;
+      rowsToScan.push(r);
+    }
+  });
 
-  for (let row = 0; row < tabState.records.length; row++) {
+  // compile each pattern once, globally: the engine scans natively instead of
+  // JS slicing the sequence at every position
+  const scanners = db.map((entry) => ({ name: entry.name, re: new RegExp(entry.regex.source, "g") }));
+  const totalSteps = rowsToScan.length * scanners.length;
+  let step = 0;
+
+  for (const row of rowsToScan) {
     const rec = tabState.records[row];
     const { degapped, colMap } = degapWithColMap(rec.seq);
     const upper = degapped.toUpperCase();
-
-    for (const entry of db) {
-      const re = new RegExp(entry.regex.source);
-      for (let i = 0; i < upper.length; i++) {
-        const m = re.exec(upper.slice(i));
-        if (m && m.index === 0) {
-          const start = i,
-            end = i + m[0].length - 1;
-          if (!colorsByName[entry.name]) colorsByName[entry.name] = randomHexColor();
-          for (let c = start; c <= end && c < colMap.length; c++) hitsByRow[row].set(colMap[c], entry.name);
+    for (const { name, re } of scanners) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(upper)) !== null) {
+        const start = m.index;
+        const end = start + m[0].length - 1;
+        if (!colorsByName[name]) colorsByName[name] = randomHexColor();
+        for (let c = start; c <= end && c < colMap.length; c++) {
+          hitsByRow[row].set(colMap[c], name);
         }
+        re.lastIndex = m.index + 1; // overlapping matches are found; zero-length matches can't loop
+      }
+      step++;
+      if ((step & 31) === 0) {
+        loading.setProgress(step, totalSteps);
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
+    loading.setProgress(step, totalSteps);
+  }
 
-    loading.setProgress(row + 1, tabState.records.length);
-    await new Promise((resolve) => requestAnimationFrame(resolve));
+  // fan out: duplicates get an independent copy of their representative's hits
+  for (let r = 0; r < tabState.records.length; r++) {
+    if (repForRow[r] !== r) hitsByRow[r] = new Map(hitsByRow[repForRow[r]]);
   }
 
   cfg.hitsByRow = hitsByRow;
@@ -1416,17 +1494,33 @@ async function runScanPrositeShading(tabState, ctx) {
       tabState.records[row].seq[col] || "-"
     )
   }));
+  // revert the previous scan's cells to computed shading before painting anew
+  if (cfg.appliedHits && cfg.appliedHits.length) {
+    const revertHits = [];
+    cfg.appliedHits.forEach(({ row, col }) => {
+      const rec = tabState.records[row];
+      if (recordColorAt(rec, col) !== undefined) {
+        clearRecordColor(rec, col);
+        revertHits.push({ row, col, color: getShadeColor(tabState, row, col, rec.seq[col] || "-") });
+      }
+    });
+    ctx.applyColorOverrides(revertHits);
+  }
+
+  // motif colors become persistent per-cell overrides on top of the current shading;
+  // the shade mode itself is left untouched
   const newHits = [];
   hitsByRow.forEach((colMap, row) => {
+    const rec = tabState.records[row];
     colMap.forEach((name, col) => {
-      newHits.push({ row, col, color: hexToRgbFloat(colorsByName[name] || "FFFFFF") });
+      const hex = "#" + (colorsByName[name] || "FFFFFF");
+      setRecordColor(rec, col, hex);
+      newHits.push({ row, col, color: hexToRgbFloat(hex) });
     });
   });
 
-  ctx.applyColorOverrides([...revert, ...newHits]);
-  cfg.appliedHits = newHits;
-  tabState.shadeMode = "scanprosite";
-
+  cfg.appliedHits = newHits; // used by the legend's live recoloring
+  ctx.applyColorOverrides(newHits);
   loading.close();
   showScanPrositeColorLegendModal(tabState, ctx);
 }
@@ -1454,9 +1548,14 @@ function showScanPrositeColorLegendModal(tabState, ctx) {
     colorInput.value = "#" + cfg.colorsByName[name];
     colorInput.addEventListener("input", () => {
       cfg.colorsByName[name] = colorInput.value.replace("#", "");
+      const hex = colorInput.value;
       const updated = cfg.appliedHits
         .filter((h) => cfg.hitsByRow[h.row].get(h.col) === name)
-        .map((h) => ({ ...h, color: hexToRgbFloat(cfg.colorsByName[name]) }));
+        .map((h) => {
+          const rec = tabState.records[h.row];
+          setRecordColor(rec, h.col, hex);
+          return { ...h, color: hexToRgbFloat(hex) };
+        });
       ctx.applyColorOverrides(updated);
     });
     const label = document.createElement("label");
@@ -1477,27 +1576,132 @@ function showScanPrositeColorLegendModal(tabState, ctx) {
   });
   document.body.appendChild(overlay);
 }
-function computeRegexHits(tabState) {
+
+function safeCompile(pattern) {
+  try {
+    new RegExp(pattern, "g");
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function computeRegexHits(tabState, onProgress) {
   const cfg = tabState.shadeConfig.regex;
   const compiled = cfg.patterns
     .filter((p) => p.pattern.trim())
-    .map((p) => ({ re: new RegExp(p.pattern, "g"), colorHex: p.colorHex.replace("#", "") }));
+    .map((p) => {
+      try {
+        return { re: new RegExp(p.pattern, "g"), colorHex: p.colorHex.replace("#", "") };
+      } catch (err) {
+        return null; // invalid pattern: excluded from scanning, flagged to the user
+      }
+    })
+    .filter(Boolean);
 
-  const hitsByRow = tabState.records.map(() => new Map());
-  tabState.records.forEach((rec, r) => {
-    const seq = rec.seq;
+  // report invalid patterns back to the modal, if it's open
+  if (typeof window._regexMarkInvalid === "function") {
+    window._regexMarkInvalid(cfg.patterns.map((p) => !p.pattern.trim() || !safeCompile(p.pattern)));
+  }
+
+  const records = tabState.records;
+  const total = records.length;
+  const hitsByRow = new Array(total);
+  let lastYield = performance.now();
+
+  for (let r = 0; r < total; r++) {
+    const rowHits = new Map();
+    hitsByRow[r] = rowHits; // every row gets a Map, even an empty one — downstream forEach relies on the shape
+    const seq = records[r].seq;
     compiled.forEach(({ re, colorHex }) => {
       re.lastIndex = 0;
       let m;
       while ((m = re.exec(seq)) !== null) {
         for (let c = m.index; c < m.index + m[0].length; c++) {
-          hitsByRow[r].set(c, colorHex);
+          rowHits.set(c, colorHex);
         }
         if (m[0].length === 0) re.lastIndex++;
       }
     });
-  });
+
+    // clock checked EVERY row: performance.now() costs microseconds, and with
+    // 30k-char rows even a handful of rows between checks can exceed Chrome's
+    // unresponsive-dialog threshold. Yields happen at most ~20x/sec
+    const now = performance.now();
+    if (now - lastYield > 50) {
+      if (onProgress) onProgress(r + 1, total);
+      await new Promise((res) => setTimeout(res, 0));
+      lastYield = performance.now();
+    }
+  }
+
+  if (onProgress) onProgress(total, total);
   cfg.hitsByRow = hitsByRow;
+}
+
+// Runs a regex search with a live progress modal.
+// Yields between row chunks so the modal paints and progress stays visible;
+// supports cancellation if the overlay exposes an element we can hang a button on.
+// onMatch(recordIndex, matchArray, record) fires per matching record.
+async function regexSearchWithProgress(pattern, tabState, onMatch) {
+  const prog = showProgressOverlay("Searching");
+  let cancelled = false;
+
+  // optional cancel button — piggyback on the overlay's DOM if reachable
+  try {
+    const overlay = document.querySelector(".progress-overlay"); // adjust selector to yours
+    if (overlay) {
+      const btn = document.createElement("button");
+      btn.textContent = "Cancel";
+      btn.style.marginTop = "8px";
+      btn.onclick = () => {
+        cancelled = true;
+      };
+      overlay.appendChild(btn);
+    }
+  } catch (err) {}
+
+  // critical: give the browser two frames so the modal actually renders
+  // before the synchronous regex work begins — otherwise it never appears
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  let re;
+  try {
+    re = new RegExp(pattern, "gi"); // case-insensitive across the alignment
+  } catch (err) {
+    prog.close();
+    alert("Invalid regex: " + err.message);
+    return null;
+  }
+
+  const records = tabState.records;
+  const total = records.length;
+  const CHUNK = 2048; // rows between UI yields
+  const matches = [];
+
+  try {
+    for (let start = 0; start < total; start += CHUNK) {
+      const end = Math.min(start + CHUNK, total);
+      for (let r = start; r < end; r++) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(records[r].seq)) !== null) {
+          if (onMatch) onMatch(r, m, records[r]);
+          matches.push({ row: r, index: m.index, text: m[0] });
+          if (m[0].length === 0) re.lastIndex++; // zero-width safety
+          if (cancelled) break;
+        }
+        if (cancelled) break;
+      }
+      prog.setProgress(end, total);
+      if (cancelled) break;
+      await new Promise((r) => setTimeout(r, 0)); // let the modal paint
+    }
+  } finally {
+    prog.close();
+  }
+
+  return cancelled ? null : matches;
 }
 
 function computeRegexShadeColor(tabState, row, col, ch) {
@@ -1527,7 +1731,7 @@ function sortBySequenceSimilarity(tabState, refId, onDone) {
   onDone();
 }
 
-// ---------- Shared GL program ----------
+//  Shared GL program
 const VS_SOURCE = `#version 300 es
   in vec2 a_quadPos;
   in vec2 a_cellPos;
@@ -1538,19 +1742,34 @@ const VS_SOURCE = `#version 300 es
   uniform vec2 u_scroll;
   uniform vec2 u_windowOrigin;
   uniform vec2 u_atlasGrid;
+  uniform float u_hoverCol;
+  uniform float u_hoverRow;
+  uniform float u_hoverCellCol;
+  uniform float u_hoverCellRow;
+  uniform float u_selStart;
+  uniform float u_selEnd;
   out vec3 v_color;
   out float v_col;
   out float v_row;
   out vec2 v_texCoord;
+  out float v_colHL;
+  out float v_rowHL;
+  out float v_cellHL;
+  out float v_selHL;
   void main() {
     vec2 absCell = a_cellPos + u_windowOrigin;
-    vec2 cellPixel = absCell * u_cellSize - u_scroll;
+    vec2 cellPixel = a_cellPos * u_cellSize - u_scroll;
     vec2 pixelPos = cellPixel + a_quadPos * u_cellSize;
     vec2 clip = (pixelPos / u_resolution) * 2.0 - 1.0;
     gl_Position = vec4(clip.x, -clip.y, 0, 1);
     v_color = a_color;
     v_col = absCell.x;
     v_row = absCell.y;
+    // column uniforms arrive window-relative; row uniforms stay absolute
+    v_colHL = (u_hoverCol >= 0.0 && abs(a_cellPos.x - u_hoverCol) < 0.5) ? 1.0 : 0.0;
+    v_rowHL = (u_hoverRow >= 0.0 && abs(absCell.y - u_hoverRow) < 0.5) ? 1.0 : 0.0;
+    v_cellHL = (u_hoverCellCol >= 0.0 && abs(a_cellPos.x - u_hoverCellCol) < 0.5 && abs(absCell.y - u_hoverCellRow) < 0.5) ? 1.0 : 0.0;
+    v_selHL = (u_selStart >= 0.0 && a_cellPos.x >= u_selStart - 0.5 && a_cellPos.x <= u_selEnd + 0.5) ? 1.0 : 0.0;
     float col = mod(a_glyphIndex, u_atlasGrid.x);
     float rowg = floor(a_glyphIndex / u_atlasGrid.x);
     vec2 glyphOrigin = vec2(col, rowg) / u_atlasGrid;
@@ -1559,19 +1778,17 @@ const VS_SOURCE = `#version 300 es
   }`;
 
 const FS_SOURCE = `#version 300 es
-  precision mediump float;
+  precision highp float;
   in vec3 v_color;
   in float v_col;
   in float v_row;
   in vec2 v_texCoord;
+  in float v_colHL;
+  in float v_rowHL;
+  in float v_cellHL;
+  in float v_selHL;
   uniform sampler2D u_atlas;
-  uniform float u_hoverCol;
-  uniform float u_hoverRow;
-  uniform float u_hoverCellCol;
-  uniform float u_hoverCellRow;
   uniform float u_luminance;
-  uniform float u_selStart;
-  uniform float u_selEnd;
   out vec4 outColor;
 
   float linearize(float c) {
@@ -1585,16 +1802,12 @@ const FS_SOURCE = `#version 300 es
     return (L > threshold) ? vec3(0.0) : vec3(1.0);
   }
   void main() {
-    float colHighlight = (u_hoverCol >= 0.0 && abs(v_col - u_hoverCol) < 0.5) ? 1.0 : 0.0;
-    float rowHighlight = (u_hoverRow >= 0.0 && abs(v_row - u_hoverRow) < 0.5) ? 1.0 : 0.0;
-    float cellHover = (u_hoverCellCol >= 0.0 && abs(v_col - u_hoverCellCol) < 0.5 && abs(v_row - u_hoverCellRow) < 0.5) ? 1.0 : 0.0;
-    float selActive = (u_selStart >= 0.0 && v_col >= u_selStart - 0.5 && v_col <= u_selEnd + 0.5) ? 1.0 : 0.0;
     vec3 hoverColor = vec3(0.55, 0.72, 1.0);
-    vec3 bg = mix(v_color, hoverColor, 0.45 * cellHover);
-    bg = mix(bg, hoverColor, 0.25 * colHighlight);
-    bg = mix(bg, hoverColor, 0.25 * rowHighlight);
+    vec3 bg = mix(v_color, hoverColor, 0.45 * v_cellHL);
+    bg = mix(bg, hoverColor, 0.25 * v_colHL);
+    bg = mix(bg, hoverColor, 0.25 * v_rowHL);
     vec3 selectColor = vec3(0.01, 0.99, 0.01);
-    bg = mix(bg, selectColor, 0.26 * selActive);
+    bg = mix(bg, selectColor, 0.26 * v_selHL);
     vec4 glyph = texture(u_atlas, v_texCoord);
     vec3 textColor = decideTextColor(v_color, u_luminance);
     vec3 finalColor = mix(bg, textColor, glyph.a);
@@ -1696,7 +1909,7 @@ function buildInstanceArray(rowCount, colCount, cellForFn) {
   return data;
 }
 
-// ---------- Column context menu ----------
+//  Column context menu
 function closeContextMenu() {
   if (window._activeContextMenuClearSelection) {
     window._activeContextMenuClearSelection();
@@ -1711,6 +1924,7 @@ function closeContextMenu() {
     window._activeContextMenuDocHandler = null;
   }
 }
+
 function mkMenuItem(label, onClick, disabled = false) {
   const item = document.createElement("div");
   item.className = "context-menu-item" + (disabled ? " disabled" : "");
@@ -1718,6 +1932,7 @@ function mkMenuItem(label, onClick, disabled = false) {
   if (!disabled) item.addEventListener("click", onClick);
   return item;
 }
+
 function showColumnContextMenu(
   x,
   y,
@@ -1728,6 +1943,7 @@ function showColumnContextMenu(
   onBlockShade,
   onGenerateLogo,
   onExport,
+  onCopy,
   onClearSelection
 ) {
   closeContextMenu();
@@ -1781,6 +1997,13 @@ function showColumnContextMenu(
     })
   );
 
+  menu.appendChild(
+    mkMenuItem("Copy selection as FASTA", () => {
+      onCopy(lo, hi);
+      closeContextMenu();
+    })
+  );
+
   document.body.appendChild(menu);
   menu.style.left = Math.max(4, x - menu.offsetWidth) + "px";
   menu.style.top = Math.max(4, y - menu.offsetHeight) + "px";
@@ -1793,7 +2016,7 @@ function showColumnContextMenu(
   setTimeout(() => document.addEventListener("click", docHandler), 0);
 }
 
-// ---------- Cell edit popup (character + per-cell background color) ----------
+//  Cell edit popup (character + per-cell background color)
 function showCellEditPopup(x, y, currentChar, currentColorHex, onApply, onResetColor) {
   closeContextMenu();
   closeDropdown();
@@ -1845,7 +2068,19 @@ function showCellEditPopup(x, y, currentChar, currentColorHex, onApply, onResetC
   setTimeout(() => document.addEventListener("click", docHandler), 0);
 }
 
-// ---------- Generic dropdown (File / Shade menus) ----------
+// Esc closes the topmost popup: modals first, then context menu / dropdown
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const overlays = document.querySelectorAll(".modal-overlay");
+  if (overlays.length) {
+    overlays[overlays.length - 1].remove();
+    return;
+  }
+  if (window._activeContextMenu) closeContextMenu();
+  else if (window._activeDropdown) closeDropdown();
+});
+
+//  Generic dropdown (File / Shade menus)
 function closeDropdown() {
   if (window._activeDropdown) {
     window._activeDropdown.remove();
@@ -1856,6 +2091,7 @@ function closeDropdown() {
     window._activeDropdownDocHandler = null;
   }
 }
+
 function showDropdown(anchorEl, items) {
   closeDropdown();
   const menu = document.createElement("div");
@@ -1871,12 +2107,16 @@ function showDropdown(anchorEl, items) {
       menu.appendChild(hr);
       return;
     }
-    menu.appendChild(
-      mkMenuItem(item.label, () => {
+    const el = mkMenuItem(
+      item.label,
+      () => {
         item.onClick();
         closeDropdown();
-      })
+      },
+      item.disabled
     );
+    if (item.title) el.title = item.title;
+    menu.appendChild(el);
   });
   document.body.appendChild(menu);
   window._activeDropdown = menu;
@@ -1887,9 +2127,714 @@ function showDropdown(anchorEl, items) {
   setTimeout(() => document.addEventListener("click", docHandler), 0);
 }
 
-// ---------- File export helpers ----------
+//  Loading state for execute buttons
+// Defers the action by two frames so the "Loading..." text actually paints
+// before synchronous work blocks the main thread.
+function runWithLoading(btn, action) {
+  const originalText = btn.textContent;
+  btn.textContent = "Loading...";
+  btn.disabled = true;
+  return new Promise((resolve) => {
+    requestAnimationFrame(() =>
+      requestAnimationFrame(async () => {
+        try {
+          await action();
+        } finally {
+          btn.textContent = originalText;
+          btn.disabled = false;
+          resolve();
+        }
+      })
+    );
+  });
+}
+
+//  Streaming file writers
+// Writes text chunks straight to disk via the File System Access API where
+// available (Chrome/Edge); otherwise accumulates chunks and downloads one Blob.
+async function openTextSink(filename, mime, ext, estBytes) {
+  // huge exports: OPFS staging + blob download — no .crswap commit, no SW ceiling
+  if (estBytes && estBytes > 1024 * 1024 * 1024) {
+    const staged = await openOpfsSink(filename);
+    if (staged) return staged;
+  }
+  const streamed = await openStreamSink(filename);
+  if (streamed) return streamed;
+
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: filename, accept: { [mime]: [ext] } }]
+      });
+      // in-place writing: no .crswap, no atomic commit on close() — the commit
+      // is where InvalidStateError killed the 10GB export. truncate(0) clears
+      // any previous content so the write is a clean full overwrite.
+      const stream = await handle.createWritable({ keepExistingData: true });
+      await stream.truncate(0);
+      return { write: (s) => stream.write(s), close: () => stream.close() };
+    } catch (err) {
+      if (err && err.name === "AbortError") return null; // user cancelled the picker
+    }
+  }
+  const parts = [];
+  // Serialize writes onto a promise chain: callers (the bit writer's emit) may
+  // fire writes without awaiting, and the single-credit pull protocol is
+  // strictly one-at-a-time. Without chaining, a second concurrent write
+  // overwrites the first's credit waiter — starving it (which is what fired
+  // the 15s fuse) and posting its chunk out of order.
+  let tail = Promise.resolve();
+  return {
+    write: (s) => {
+      const p = tail.then(async () => {
+        await nextCredit();
+        if (cancelled) throw new Error("Download cancelled");
+        channel.port1.postMessage({ chunk: typeof s === "string" ? encoder.encode(s) : s });
+      });
+      tail = p.catch(() => {}); // keep the chain alive after a failure
+      return p;
+    },
+    close: async () => {
+      await tail; // drain every queued write before finishing
+      await nextCredit();
+      channel.port1.postMessage({ done: true });
+      setTimeout(() => iframe.remove(), 5000);
+    }
+  };
+}
+
+// Byte-oriented variant of openTextSink, for .blim: identical routing (OPFS staging
+// for giants → service-worker stream → FS API → Blob fallback), but write() takes
+// Uint8Array end-to-end. openOpfsSink and the FS-API writable are natively
+// byte-polymorphic; openStreamSink handles bytes after its one-line edit; the
+// Blob fallback's Blob(parts) accepts Uint8Array parts directly.
+// Byte-oriented sink for .blim. OPFS staging first at ANY size: .blim exports
+// write in bursts after a sweep, a pattern that kills live-streamed downloads
+// (the SW tier's fetch dies when its consumer goes idle). Staging decouples
+// writing from downloading entirely — the download starts from a complete file.
+async function openByteSink(filename, estBytes) {
+  console.log("[blim] sink v3 — OPFS first");
+  const staged = await openOpfsSink(filename);
+  if (staged) {
+    console.log("[blim] tier: OPFS staging");
+    return staged;
+  }
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "Binary SlimShadey project", accept: { "application/octet-stream": [".blim"] } }]
+      });
+      const stream = await handle.createWritable({ keepExistingData: true });
+      await stream.truncate(0);
+      console.log("[blim] tier: FS-API picker");
+      return { write: (bytes) => stream.write(bytes), close: () => stream.close() };
+    } catch (err) {
+      if (err && err.name === "AbortError") return null;
+      console.warn("[blim] FS-API tier failed:", err);
+    }
+  }
+  const streamed = await openStreamSink(filename);
+  if (streamed) {
+    console.log("[blim] tier: service-worker stream");
+    return streamed;
+  }
+  console.log("[blim] tier: Blob fallback");
+  const parts = [];
+  return {
+    write: (bytes) => parts.push(bytes),
+    close: () => downloadFile(filename, parts, "application/octet-stream")
+  };
+}
+// MSB-first bit writer for .blim planes. Accumulates fixed-width codes and emits
+// whole-byte chunks (~1 MiB) via emit(Uint8Array). flush() is called at each plane
+// boundary: the final partial byte is zero-padded in its low bits (spec §3).
+// Codes are ≤16 bits (colordict cap), so the accumulator never exceeds 23 live
+// bits — safely inside JS's 32-bit bitwise range.
+function makeBitWriter(emit, chunkBytes = 1 << 20) {
+  let buf = new Uint8Array(chunkBytes);
+  let used = 0; // whole bytes filled in buf
+  let acc = 0; // bit accumulator
+  let accBits = 0; // live bits in acc
+  return {
+    write(code, bits) {
+      acc = (acc << bits) | (code & ((1 << bits) - 1)); // append MSB-first
+      accBits += bits;
+      while (accBits >= 8) {
+        accBits -= 8;
+        buf[used++] = (acc >>> accBits) & 0xff;
+        if (used === buf.length) {
+          emit(buf);
+          buf = new Uint8Array(chunkBytes);
+          used = 0;
+        }
+      }
+      acc &= (1 << accBits) - 1; // drop emitted high bits
+    },
+    flush() {
+      if (accBits > 0) {
+        buf[used++] = (acc << (8 - accBits)) & 0xff;
+        acc = 0;
+        accBits = 0;
+      }
+      if (used > 0) {
+        emit(used === buf.length ? buf : buf.slice(0, used));
+        buf = new Uint8Array(chunkBytes);
+        used = 0;
+      }
+    }
+  };
+}
+
+// ---------- .blim (binary slim) loader — spec: blim-spec v1.2 ----------
+
+// fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
+// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 → 7 + 16 ≤ 24
+function blimCodeAt(bytes, i, bits) {
+  const bit = i * bits;
+  const byte = bit >> 3;
+  const shift = bit & 7;
+  const win = (bytes[byte] << 16) | ((bytes[byte + 1] || 0) << 8) | (bytes[byte + 2] || 0);
+  return (win >>> (24 - shift - bits)) & ((1 << bits) - 1);
+}
+
+// Parses a .blim File/Blob in one streaming pass; memory stays flat (one row's
+// planes live at a time). Returns { meta, annotations, records, consensusBaked }.
+async function parseBlimStream(file, onProgress) {
+  const reader = file.stream().getReader();
+  let chunks = [];
+  let buffered = 0;
+  let done = false;
+  let offset = 0;
+
+  const fill = async () => {
+    const { value, done: d } = await reader.read();
+    if (d) {
+      done = true;
+      return;
+    }
+    chunks.push(value);
+    buffered += value.length;
+  };
+
+  // once, up top of parseBlimStream — alongside need/readLine
+  const gcYield = (() => {
+    const ch = new MessageChannel();
+    return () =>
+      new Promise((r) => {
+        ch.port1.onmessage = r;
+        ch.port2.postMessage(0);
+      });
+  })();
+
+  // consume exactly n bytes as one contiguous Uint8Array
+  const need = async (n) => {
+    while (buffered < n && !done) await fill();
+    if (buffered < n) throw new Error("Unexpected end of .blim file");
+    const out = new Uint8Array(n);
+    let o = 0;
+    while (o < n) {
+      const head = chunks[0];
+      const take = Math.min(head.length, n - o);
+      out.set(head.subarray(0, take), o);
+      o += take;
+      offset += take;
+      if (take === head.length) chunks.shift();
+      else chunks[0] = head.subarray(take);
+      buffered -= take;
+    }
+    return out;
+  };
+
+  const dec = new TextDecoder();
+  const readLine = async () => {
+    for (;;) {
+      let scanned = 0;
+      for (const ch of chunks) {
+        const idx = ch.indexOf(10);
+        if (idx !== -1) {
+          const bytes = await need(scanned + idx);
+          await need(1); // the \n itself
+          let s = dec.decode(bytes);
+          if (s.endsWith("\r")) s = s.slice(0, -1);
+          return s;
+        }
+        scanned += ch.length;
+      }
+      if (done) {
+        if (buffered === 0) return null; // clean EOF
+        return dec.decode(await need(buffered)); // final line, no newline
+      }
+      await fill();
+    }
+  };
+
+  const readU32 = async () => {
+    const b = await need(4);
+    return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+  };
+  const readDiffRecords = async (n) => {
+    // -> flat [col, dictIdx, col, dictIdx, ...]
+    const b = await need(n * 6);
+    const out = new Array(n * 2);
+    for (let i = 0, j = 0; i < n; i++, j += 6) {
+      out[i * 2] = (b[j] | (b[j + 1] << 8) | (b[j + 2] << 16) | (b[j + 3] << 24)) >>> 0;
+      out[i * 2 + 1] = b[j + 4] | (b[j + 5] << 8);
+    }
+    return out;
+  };
+
+  // ---- header ----
+  const magic = await readLine();
+  if (magic !== ".blim" && magic !== ".bcmm") throw new Error("Not a .blim file");
+  const isBcmm = magic === ".bcmm"; // subtype only changes $sequence_data (spec §4)
+  const meta = { fontSize: 18, luminance: 0.5, alphabet: "protein" };
+  let columns = 0,
+    annoCount = 0,
+    seqCount = 0,
+    charBits = 0,
+    colorBits = 0;
+  let charCodes = [],
+    colorList = [];
+  let section = null;
+  const fieldRe = /^\$([a-z]+)((?:\{[^}]*\})+)$/;
+  for (;;) {
+    const line = await readLine();
+    if (line === null) throw new Error(".blim ended in the header");
+    if (line === "$annotation_data{" || line === "$sequence_data{" || line === "$consensus_data{") {
+      section = line.slice(1, -1);
+      break;
+    }
+    const m = line.match(fieldRe);
+    if (!m) throw new Error("Bad .blim header line: " + line);
+    const vals = [];
+    const vm = /\{([^}]*)\}/g;
+    let v;
+    while ((v = vm.exec(m[2])) !== null) vals.push(v[1]);
+    const key = m[1];
+    if (key === "version") {
+      if (+vals[0] !== 1) throw new Error("Unsupported .blim version: " + vals[0]);
+    } else if (key === "columns") columns = +vals[0];
+    else if (key === "rows") {
+      annoCount = +vals[0];
+      seqCount = +vals[1];
+    } else if (key === "chardict") {
+      charBits = +vals[0];
+      charCodes = vals[1].split(",").map(Number);
+    } else if (key === "colordict") {
+      colorBits = +vals[0];
+      colorList = vals[1] ? vals[1].split(",") : [];
+    } else if (key === "fontsize") meta.fontSize = +vals[0];
+    else if (key === "luminance") meta.luminance = +vals[0];
+    else if (key === "alphabetdef") meta.alphabet = vals[0] === "Nucleotide" ? "nucleotide" : "protein";
+  }
+  if (!columns || !charBits || !colorBits) throw new Error(".blim header missing columns/dictionaries");
+
+  // file color index -> app palette index (paletteIndexFor is the global palette store)
+  const paletteMap = new Uint16Array(colorList.length + 1);
+  colorList.forEach((hex, i) => (paletteMap[i + 1] = paletteIndexFor(hex)));
+
+  const rowCharBytes = Math.ceil((columns * charBits) / 8);
+  const rowColorBytes = Math.ceil((columns * colorBits) / 8);
+
+  const readRow = async () => {
+    const name = await readLine();
+    if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+    const cplane = await need(rowCharBytes);
+    const kplane = await need(rowColorBytes);
+    const nl = await need(1); // framing checkpoint (spec §3)
+    if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
+    return { name: name.slice(1), cplane, kplane };
+  };
+
+  const scratch = new Uint16Array(columns);
+  const decodeCharCodes = (plane, target) => {
+    for (let c = 0; c < columns; c++) target[c] = charCodes[blimCodeAt(plane, c, charBits)];
+    return target;
+  };
+  const codesToString = (arr) => {
+    let s = "";
+    for (let off = 0; off < columns; off += 8192) s += String.fromCharCode.apply(null, arr.subarray(off, off + 8192));
+    return s;
+  };
+  const decodeChars = (plane) => codesToString(decodeCharCodes(plane, scratch));
+
+  const annotations = [];
+  const records = [];
+  let consensusBaked = null;
+
+  for (;;) {
+    if (section === "annotation_data") {
+      for (let i = 0; i < annoCount; i++) {
+        const { name, cplane, kplane } = await readRow();
+        const ann = { name, data: decodeChars(cplane), colors: {} };
+        for (let c = 0; c < columns; c++) {
+          const fi = blimCodeAt(kplane, c, colorBits);
+          if (fi !== 0) ann.colors[c] = colorList[fi - 1];
+        }
+        annotations.push(ann);
+        if (onProgress) onProgress(offset, file.size);
+      }
+    } else if (section === "sequence_data") {
+      let refCharCodes = null; // .bcmm reference row: decoded UTF-16 code units
+      let refFileColors = null; // .bcmm reference row: file color indices (0 = white)
+      for (let i = 0; i < seqCount; i++) {
+        const name = await readLine();
+        if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+
+        if (isBcmm && i > 0) {
+          const tag = (await need(1))[0];
+          if (tag === 1) {
+            // diff row: copy the reference vectors, apply records (spec §4)
+            if (!refCharCodes) throw new Error(".bcmm diff row before reference row");
+            const cd = await readDiffRecords(await readU32());
+            const kd = await readDiffRecords(await readU32());
+            const nl = await need(1);
+            if (nl[0] !== 10) throw new Error(".bcmm framing error at sequence row " + i);
+            const codes = refCharCodes.slice(); // fresh copies — never alias the reference,
+            const kcol = refFileColors.slice(); // or edits would propagate across rows
+            for (let j = 0; j < cd.length; j += 2) {
+              const col = cd[j],
+                ci = cd[j + 1];
+              if (col >= columns || ci >= charCodes.length)
+                throw new Error(".bcmm char diff out of range, sequence row " + i);
+              codes[col] = charCodes[ci];
+            }
+            for (let j = 0; j < kd.length; j += 2) {
+              const col = kd[j],
+                ki = kd[j + 1];
+              if (col >= columns || ki > colorList.length)
+                throw new Error(".bcmm color diff out of range, sequence row " + i);
+              kcol[col] = ki; // index 0 = white is a legal explicit value here
+            }
+            const rec = { id: i, header: name.slice(1).replace(/^>+/, ""), seq: codesToString(codes) };
+            let colorIdx = null;
+            for (let c = 0; c < columns; c++) {
+              const fi = kcol[c];
+              if (fi !== 0) {
+                if (!colorIdx) colorIdx = new Uint16Array(columns);
+                colorIdx[c] = paletteMap[fi];
+              }
+            }
+            if (colorIdx) rec.colorIdx = colorIdx;
+            records.push(rec);
+            if (onProgress) onProgress(offset, file.size);
+            await gcYield(); // GC window between rows
+            continue;
+          }
+          if (tag !== 0) throw new Error("Bad .bcmm row tag " + tag + " at sequence row " + i);
+          // tag 0x00: full planes follow, base-format shape
+        }
+
+        const cplane = await need(rowCharBytes);
+        const kplane = await need(rowColorBytes);
+        const nl = await need(1); // framing checkpoint (spec §3)
+        if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
+        const keepRef = isBcmm && i === 0;
+        const codes = keepRef ? decodeCharCodes(cplane, new Uint16Array(columns)) : null;
+        const kcol = keepRef ? new Uint16Array(columns) : null;
+        const rec = {
+          id: i,
+          header: name.slice(1).replace(/^>+/, ""),
+          seq: codes ? codesToString(codes) : decodeChars(cplane)
+        };
+        let colorIdx = null;
+        for (let c = 0; c < columns; c++) {
+          const fi = blimCodeAt(kplane, c, colorBits);
+          if (kcol) kcol[c] = fi;
+          if (fi !== 0) {
+            if (!colorIdx) colorIdx = new Uint16Array(columns);
+            colorIdx[c] = paletteMap[fi];
+          }
+        }
+        if (colorIdx) rec.colorIdx = colorIdx;
+        if (keepRef) {
+          refCharCodes = codes;
+          refFileColors = kcol;
+        }
+        records.push(rec);
+        if (onProgress) onProgress(offset, file.size);
+        await gcYield(); // GC window between rows
+      }
+    } else if (section === "consensus_data") {
+      const { cplane, kplane } = await readRow(); // the single %consensus row
+      const chars = new Uint16Array(columns);
+      const colors = new Uint16Array(columns);
+      for (let c = 0; c < columns; c++) chars[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+      for (let c = 0; c < columns; c++) {
+        const fi = blimCodeAt(kplane, c, colorBits);
+        if (fi !== 0) colors[c] = paletteMap[fi];
+      }
+      consensusBaked = { chars, colors }; // 0 = "no baked value" sentinel
+    }
+    if ((await readLine()) !== "}") throw new Error("Expected } closing $" + section);
+    const next = await readLine();
+    if (next === null) break;
+    if (next === "$annotation_data{" || next === "$sequence_data{" || next === "$consensus_data{") {
+      section = next.slice(1, -1);
+    } else {
+      throw new Error("Unknown .blim section: " + next);
+    }
+  }
+  return { meta, annotations, records, consensusBaked };
+}
+
+async function withTextSink(filename, mime, ext, produce, estBytes) {
+  const sink = await openTextSink(filename, mime, ext, estBytes);
+  if (!sink) {
+    alert("Save canceled.");
+    return;
+  }
+  try {
+    await produce(sink);
+  } finally {
+    await sink.close();
+  }
+}
+
+// Streamed-download sink: same {write, close} contract as openTextSink, but
+// the bytes flow page -> service worker -> Chrome's download manager -> disk.
+// No File System Access API, no .crswap, no commit step, no size ceiling.
+// Returns null when no service worker is available (callers fall back).
+// Streamed-download sink: same {write, close} contract as openTextSink, but
+// the bytes flow page -> service worker -> Chrome's download manager -> disk.
+// No File System Access API, no .crswap, no commit step, no size ceiling.
+// Returns null when the streamed path isn't available (callers fall back).
+async function openStreamSink(filename) {
+  if (!("serviceWorker" in navigator)) return null;
+  let reg;
+  try {
+    reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("sw timeout")), 3000))
+    ]);
+  } catch (err) {
+    return null;
+  }
+  if (!reg || !reg.active) return null;
+  if (!navigator.serviceWorker.controller) return null; // page not controlled yet — fall back
+
+  const encoder = new TextEncoder();
+  const url = new URL("stream-download-" + Math.random().toString(36).slice(2), location.href).href;
+  const channel = new MessageChannel();
+
+  reg.active.postMessage({ url, filename }, [channel.port2]);
+
+  // handshake: click only after the SW confirms it registered the URL,
+  // otherwise the fetch can race ahead and hit the real server as a 404
+  try {
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("sw ack timeout")), 3000);
+      channel.port1.onmessage = (e) => {
+        if (e.data && e.data.registered) {
+          clearTimeout(t);
+          resolve();
+        }
+      };
+    });
+  } catch (err) {
+    return null;
+  }
+
+  // navigate a hidden iframe — deliberately NO download attribute. A plain
+  // navigation is what the service worker intercepts; its Content-Disposition:
+  // attachment response header is what turns it into a download. Anchor clicks
+  // with a download attribute can bypass the SW and 404 against the real server.
+  const iframe = document.createElement("iframe");
+  iframe.style.display = "none";
+  iframe.src = url;
+  document.body.appendChild(iframe);
+
+  // pull protocol: one {next} from the SW unlocks exactly one write;
+  // a credit that never arrives (dead/blocked download) throws instead of hanging
+  let cancelled = false;
+  let credit = false;
+  let onCredit = null;
+  channel.port1.onmessage = (e) => {
+    const msg = e.data || {};
+    if (msg.cancelled) cancelled = true;
+    if (msg.next) credit = true;
+    if (onCredit) {
+      onCredit();
+      onCredit = null;
+    }
+  };
+  const nextCredit = () => {
+    if (credit) {
+      credit = false;
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        onCredit = null;
+        reject(
+          new Error(
+            "The download never started. Check Chrome's address bar for a blocked " +
+              '"automatic downloads" icon (allow it for this site), then retry.'
+          )
+        );
+      }, 15000); // 15s is an eternity for a local download to start — fail loud, not silent
+      onCredit = () => {
+        clearTimeout(t);
+        credit = false;
+        resolve();
+      };
+    });
+  };
+  return {
+    write: async (s) => {
+      await nextCredit();
+      if (cancelled) throw new Error("Download cancelled");
+      channel.port1.postMessage({ chunk: typeof s === "string" ? encoder.encode(s) : s });
+    },
+    close: async () => {
+      await nextCredit();
+      channel.port1.postMessage({ done: true });
+      setTimeout(() => iframe.remove(), 5000);
+    }
+  };
+}
+
+// OPFS staging sink for huge exports: write into the origin-private file system
+// (nothing external can invalidate it), then download the result as a
+// file-backed blob — no service worker, no ~5-minute ceiling, streams from disk.
+async function openOpfsSink(filename) {
+  if (!navigator.storage || !navigator.storage.getDirectory) return null;
+  let handle, writable;
+  let written = 0;
+  try {
+    try {
+      await navigator.storage.persist();
+    } catch (err) {}
+    const root = await navigator.storage.getDirectory();
+    try {
+      await root.removeEntry("slimshadey-export.staging");
+    } catch (err) {}
+    handle = await root.getFileHandle("slimshadey-export.staging", { create: true });
+    writable = await handle.createWritable();
+  } catch (err) {
+    console.warn("[blim] OPFS staging unavailable:", err);
+    return null;
+  }
+  return {
+    write: (s) => {
+      written += s.length || s.byteLength || 0;
+      return writable.write(s);
+    },
+    close: async () => {
+      await writable.close();
+      const file = await handle.getFile();
+      console.log("[blim] staged:", file.size, "bytes (handed to OPFS:", written + ")");
+      const url = URL.createObjectURL(file);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      console.log("[blim] blob download started:", filename);
+      setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
+    }
+  };
+}
+
+// foreground color is a pure function of the background hex — cache it
+function makeFgCache(luminance) {
+  const m = new Map();
+  return (bgHex) => {
+    let v = m.get(bgHex);
+    if (v === undefined) {
+      v = decideForegroundHex(bgHex, luminance);
+      m.set(bgHex, v);
+    }
+    return v;
+  };
+}
+
+function showProgressOverlay(title) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>${title}</h3>`;
+
+  // compositor-driven spinner: transform animations run off the main thread,
+  // so this keeps spinning even while a synchronous chunk of work is executing
+  if (!document.getElementById("ssSpinStyle")) {
+    const st = document.createElement("style");
+    st.id = "ssSpinStyle";
+    st.textContent = "@keyframes ssSpin{to{transform:rotate(360deg)}}";
+    document.head.appendChild(st);
+  }
+  const spinner = document.createElement("div");
+  spinner.style.cssText =
+    "width:22px;height:22px;border:3px solid #444;border-top-color:#ccc;border-radius:50%;animation:ssSpin 0.8s linear infinite;margin:0 auto 8px;";
+  box.appendChild(spinner);
+
+  const barOuter = document.createElement("div");
+  barOuter.className = "hmmer-progress-outer";
+  const barInner = document.createElement("div");
+  barInner.className = "hmmer-progress-inner";
+  barOuter.appendChild(barInner);
+  box.appendChild(barOuter);
+  const statusText = document.createElement("div");
+  statusText.className = "shade-row";
+  statusText.textContent = "Preparing...";
+  box.appendChild(statusText);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  let labelText = "";
+  return {
+    setProgress(done, total) {
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      barInner.style.width = `${Math.min(100, pct)}%`;
+      statusText.textContent = labelText || `${done} / ${total}`;
+    },
+    setLabel(t) {
+      labelText = t;
+      statusText.textContent = t;
+    },
+    close: () => overlay.remove()
+  };
+}
+// FASTA export: streams each record's sequence in ~1MB slices
+async function exportFastaStreaming(records, filename) {
+  const prog = showProgressOverlay("Exporting FASTA");
+  try {
+    await withTextSink(filename, "text/plain", ".fasta", async (sink) => {
+      const tick = () => new Promise((r) => setTimeout(r, 0));
+      let buf = "";
+      const flush = async (force) => {
+        if (buf.length > 4000000 || (force && buf.length)) {
+          await sink.write(buf);
+          buf = "";
+          await tick();
+        }
+      };
+      for (let r = 0; r < records.length; r++) {
+        const rec = records[r];
+        buf += (r > 0 ? "\n" : "") + ">" + rec.header + "\n";
+        for (let off = 0; off < rec.seq.length; off += 1000000) {
+          buf += rec.seq.slice(off, off + 1000000);
+          await flush(false);
+        }
+        prog.setProgress(r + 1, records.length);
+        await flush(false);
+      }
+      await flush(true);
+    });
+  } catch (err) {
+    console.error("FASTA export failed:", err);
+    alert("FASTA export failed: " + err.message);
+  } finally {
+    prog.close();
+  }
+}
+
+//  File export helpers
 function downloadFile(filename, content, mime) {
-  const blob = new Blob([content], { type: mime });
+  const blob = content instanceof Blob ? content : new Blob([].concat(content), { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -1919,7 +2864,18 @@ function padIndexRight(indexNum, width, show) {
   return s.length > width ? s.slice(-width) : s.padStart(width, " ");
 }
 
-function generateRtfV2(tabState, colCount, resolveSeqColor, resolveAnnoColor, resolveConsensus, opts) {
+async function generateRtfV2(
+  tabState,
+  colCount,
+  resolveSeqColor,
+  resolveAnnoColor,
+  resolveConsensus,
+  opts,
+  sink,
+  prog
+) {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const fgOf = makeFgCache(tabState.luminance);
   const { fontSize, maxNameCharsCap, showAnnotations, showNumbering } = opts;
   const CHARS_PER_ROW_STD = 80;
   const DEFAULT_FONTSIZE_RTF = 10;
@@ -1942,39 +2898,58 @@ function generateRtfV2(tabState, colCount, resolveSeqColor, resolveAnnoColor, re
   const WHITE_INDEX = colorIndexFor("#FFFFFF");
   const BLACK_INDEX = colorIndexFor("#000000");
 
-  const annoCells = tabState.annotations.map((ann, r) => {
-    const cells = [];
-    for (let c = 0; c < colCount; c++) {
-      const ch = ann.data[c] || " ";
-      const bgHex = resolveAnnoColor(r, c, ch);
-      const fgHex = decideForegroundHex(bgHex, tabState.luminance);
-      colorIndexFor(bgHex);
-      colorIndexFor(fgHex);
-      cells.push({ ch, bgHex, fgHex });
+  // rows are described lazily — no per-cell objects are materialized.
+  // bgAt() is the cheap scan form (no char, no object); cellAt() is the emit form.
+  const rows = [];
+  tabState.annotations.forEach((ann, r) => {
+    rows.push({
+      show: showAnnotations,
+      name: ann.name,
+      bgAt: (c) => resolveAnnoColor(r, c, ann.data[c] || " "),
+      cellAt: (c) => {
+        const ch = ann.data[c] || " ";
+        const bgHex = resolveAnnoColor(r, c, ch);
+        return { ch, bgHex, fgHex: fgOf(bgHex) };
+      }
+    });
+  });
+  tabState.records.forEach((rec, r) => {
+    rows.push({
+      show: true,
+      name: rec.header,
+      bgAt: (c) => resolveSeqColor(r, c, rec.seq[c] || "-"),
+      cellAt: (c) => {
+        const ch = rec.seq[c] || "-";
+        const bgHex = resolveSeqColor(r, c, ch);
+        return { ch, bgHex, fgHex: fgOf(bgHex) };
+      }
+    });
+  });
+  rows.push({
+    show: true,
+    name: "Consensus",
+    bgAt: (c) => resolveConsensus(c).bgHex,
+    cellAt: (c) => {
+      const { ch, bgHex } = resolveConsensus(c);
+      return { ch, bgHex, fgHex: fgOf(bgHex) };
     }
-    return { name: ann.name, cells };
   });
 
-  const seqCells = tabState.records.map((rec, r) => {
-    const cells = [];
+  // pass 1: discover every color, so the colortbl (which precedes the body) is complete
+  const visibleRowCount = rows.filter((row) => row.show).length;
+  const scanTotal = visibleRowCount * colCount;
+  let scan = 0;
+  for (const row of rows) {
+    if (!row.show) continue;
     for (let c = 0; c < colCount; c++) {
-      const ch = rec.seq[c] || "-";
-      const bgHex = resolveSeqColor(r, c, ch);
-      const fgHex = decideForegroundHex(bgHex, tabState.luminance);
+      const bgHex = row.bgAt(c);
       colorIndexFor(bgHex);
-      colorIndexFor(fgHex);
-      cells.push({ ch, bgHex, fgHex });
+      colorIndexFor(fgOf(bgHex));
+      if (++scan % 262144 === 0) {
+        if (prog) prog.setProgress(scan, scanTotal);
+        await tick();
+      }
     }
-    return { name: rec.header, cells };
-  });
-
-  const consCells = [];
-  for (let c = 0; c < colCount; c++) {
-    const { ch, bgHex } = resolveConsensus(c);
-    const fgHex = decideForegroundHex(bgHex, tabState.luminance);
-    colorIndexFor(bgHex);
-    colorIndexFor(fgHex);
-    consCells.push({ ch, bgHex, fgHex });
   }
 
   let maxNameChars = 0;
@@ -1986,234 +2961,510 @@ function generateRtfV2(tabState, colCount, resolveSeqColor, resolveAnnoColor, re
   });
   maxNameChars = Math.min(maxNameChars, maxNameCharsCap);
 
-  const annoLabels = annoCells.map((a) => padOrTruncate(a.name, maxNameChars));
-  const seqLabels = seqCells.map((s) => padOrTruncate(s.name, maxNameChars));
-  const consensusLabel = padOrTruncate("Consensus", maxNameChars);
+  const rowLabels = rows.map((row) => padOrTruncate(row.name, maxNameChars));
 
   function rowHeader(label, indexNum) {
     return label + SPACER + padIndexRight(indexNum, MAX_INDEX_CHARS, showNumbering) + SPACER;
   }
-  function emitRow(lines, label, cellsRow) {
-    lines.push(`\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} ${label}`);
-    cellsRow.forEach((cell) => {
-      lines.push(`\\highlight${colorIndexFor(cell.bgHex)}\\cf${colorIndexFor(cell.fgHex)} ${cell.ch}`);
-    });
-    lines.push(`\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} \\line`);
+
+  // output buffer: appended per row, flushed to the sink in ~2MB chunks
+  let outBuf = "";
+  async function flushOut(force) {
+    if (outBuf.length > 2000000 || (force && outBuf.length)) {
+      await sink.write(outBuf);
+      outBuf = "";
+    }
+  }
+
+  function emitRow(label, cellAt, lo, hi) {
+    outBuf += `\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} ${label}`;
+    for (let c = lo; c < hi; c++) {
+      const cell = cellAt(c);
+      outBuf += `\\highlight${colorIndexFor(cell.bgHex)}\\cf${colorIndexFor(cell.fgHex)} ${cell.ch}`;
+    }
+    outBuf += `\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} \\line\n`;
   }
 
   const setsOfRows = Math.max(1, Math.ceil(colCount / charsPerRow));
 
-  const lines = [];
-  lines.push("{\\rtf1\\ansi\\deff0");
-  lines.push("{\\fonttbl{\\f0\\fmodern Courier New;}}");
-  lines.push("{\\info{\\author SlimShadey}}");
-  lines.push("{\\colortbl");
-  dictionary.forEach((entry) => lines.push(entry));
-  lines.push("}");
+  // header / preamble (tiny) — written once, up front
   const inset = "650";
-  lines.push(`\\paperw11880\\paperh16820\\margl${inset}\\margr${inset}`);
-  lines.push(`\\margt${inset}\\margb${inset}\\sectd\\cols1\\pard\\plain`);
-  lines.push(`\\fs${fontSize * 2}`);
+  await sink.write(
+    [
+      "{\\rtf1\\ansi\\deff0",
+      "{\\fonttbl{\\f0\\fmodern Courier New;}}",
+      "{\\info{\\author SlimShadey}}",
+      "{\\colortbl",
+      ...dictionary,
+      "}",
+      `\\paperw11880\\paperh16820\\margl${inset}\\margr${inset}`,
+      `\\margt${inset}\\margb${inset}\\sectd\\cols1\\pard\\plain`,
+      `\\fs${fontSize * 2}`
+    ].join("")
+  );
 
   let trueIndex = tabState.firstIndex || 1;
+  const progressStride = Math.max(1, Math.floor(setsOfRows / 500)); // ≤500 UI updates, per-set on small runs
   for (let k = 0; k < setsOfRows; k++) {
     const lo = k * charsPerRow;
     const hi = Math.min(colCount, lo + charsPerRow);
-    if (showAnnotations) {
-      annoCells.forEach((a, j) => emitRow(lines, rowHeader(annoLabels[j], trueIndex), a.cells.slice(lo, hi)));
+    for (let j = 0; j < rows.length; j++) {
+      if (!rows[j].show) continue;
+      emitRow(rowHeader(rowLabels[j], trueIndex), rows[j].cellAt, lo, hi);
     }
-    seqCells.forEach((s, j) => emitRow(lines, rowHeader(seqLabels[j], trueIndex), s.cells.slice(lo, hi)));
-    emitRow(lines, rowHeader(consensusLabel, trueIndex), consCells.slice(lo, hi));
-    lines.push(`\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} \\line`);
+    outBuf += `\\highlight${WHITE_INDEX}\\cf${BLACK_INDEX} \\line\n`; // blank line between block-sets
     trueIndex += charsPerRow;
+    if (prog && k % progressStride === 0) prog.setProgress(k + 1, setsOfRows);
+    if (outBuf.length > 2000000) await flushOut(false);
+    if (k % progressStride === 0) await tick(); // yields are what make the bar repaint
   }
 
-  lines.push("}");
-  return lines.join("\n");
+  await flushOut(true);
+  await sink.write("}");
 }
+
 function parseSlimTriplet(line) {
   return { ch: line.charAt(0), bgHex: line.substring(2, 9), fgHex: line.substring(10) };
 }
 
-function renderAlignmentPng(tabState, colCount, resolveSeqColor, resolveAnnoColor, resolveConsensus, opts) {
-  const {
-    columnsPerRow = 60,
-    fontSize = 14,
-    maxNameCharsCap = 30,
-    numberingSpacing = 5,
-    showAnnotations = true,
-    showNumbering = true,
-    showConsensus = true
-  } = opts;
+function renderAlignmentPng(
+  tabState,
+  colCount,
+  resolveSeqColor,
+  resolveAnnoColor,
+  resolveConsensus,
+  opts,
+  page,
+  vectorOnly
+) {
+  page = page || 0;
+  const columnsPerRow = opts.columnsPerRow;
+  const fontSize = opts.fontSize;
+  const maxNameChars = opts.maxNameCharsCap;
+  const showAnnotations = opts.showAnnotations;
+  const showNumbering = opts.showNumbering;
+  const showConsensus = opts.showConsensus;
+  const numberingSpacing = opts.numberingSpacing || 5;
+  const dpr = 1; // keep bitmap memory bounded at genome scale
 
-  const scale = 2;
-  const cellW = Math.max(4, Math.round(fontSize * 0.62));
-  const cellH = Math.max(6, Math.round(fontSize * 1.3));
-  const margin = 10;
-  const INDEX_CHARS = 6;
-  const nameChars = Math.max(4, maxNameCharsCap);
-  const leftChars = nameChars + 2 + INDEX_CHARS + 2;
-  const rightChars = 2 + INDEX_CHARS;
-  const rowChars = leftChars + columnsPerRow + rightChars;
+  const { w: CW, h: CH } = cellDimsFor(fontSize);
+  // measure the actual name font so the gutter always fits the clipped names
+  const measureCtx = document.createElement("canvas").getContext("2d");
+  measureCtx.font = `${fontSize}px Consolas, monospace`;
+  const nameCharW = measureCtx.measureText("M").width;
+  const nameW = Math.ceil(maxNameChars * nameCharW) + 4; // small padding before the alignment
+  const blockW = nameW + columnsPerRow * CW;
+  const anns = showAnnotations ? tabState.annotations : [];
+  const seqRows = tabState.records.length;
 
-  const annotations = tabState.annotations;
-  const seqNum = tabState.records.length;
-  const setsOfRows = Math.max(1, Math.ceil(colCount / columnsPerRow));
+  const MAXDIM = 16000; // stay under the browser's 16384px canvas edge cap
+  const PAGE_PX_BUDGET = 128000000; // ~512MB of bitmap per page, max
 
-  // Browser canvas bitmap floors: 32,767px per edge (Firefox/old Chrome),
-  // ~268M px total area (Chrome/desktop Safari). Chunks split by height,
-  // so width must always fit on its own; the row cap enforces both limits.
-  const MAX_DIM = 32767;
-  const MAX_AREA = 268435456;
-  const logicalW = rowChars * cellW + margin * 2;
-  if (logicalW * scale > MAX_DIM) return null; // too wide; caller alerts
-  const maxBitmapHeight = Math.min(MAX_DIM, Math.floor(MAX_AREA / (logicalW * scale)));
-  const maxRowsPerCanvas = Math.max(1, Math.floor((maxBitmapHeight / scale - margin * 2) / cellH));
+  const BLOCK_GAP = CH; // empty line between consecutive blocks
 
-  function blockRowCount(lo, hi) {
-    let n = (showNumbering ? 1 : 0) + seqNum + (showConsensus ? 1 : 0) + 1;
-    if (showAnnotations) {
-      annotations.forEach((ann) => {
-        for (let c = lo; c <= hi; c++) {
-          if ((ann.data[c] || " ") !== " ") {
-            n++;
-            break;
-          }
+  if (!vectorOnly && blockW > MAXDIM) return null; // vector (SVG) export has no canvas dimension cap
+
+  const totalBlocks = Math.max(1, Math.ceil(colCount / columnsPerRow));
+
+  // Per-block layout: annotation rows with no content in this block are omitted,
+  // so block heights vary and packing must be computed from actual heights.
+  const blockInfo = new Array(totalBlocks);
+  for (let b = 0; b < totalBlocks; b++) {
+    const c0 = b * columnsPerRow;
+    const c1 = Math.min(colCount, c0 + columnsPerRow);
+    const used = [];
+    for (let r = 0; r < anns.length; r++) {
+      const data = anns[r].data || "";
+      for (let c = c0; c < c1; c++) {
+        const ch = data[c];
+        if (ch && ch !== " ") {
+          used.push(r);
+          break;
         }
-      });
+      }
     }
-    return n;
+    const rows = used.length + (showNumbering ? 1 : 0) + seqRows + (showConsensus ? 1 : 0);
+    blockInfo[b] = { c0, c1, used, h: rows * CH };
+    if (!vectorOnly && blockInfo[b].h > MAXDIM) return null; // raster-only limit; SVG can be any height
   }
 
-  // Group blocks into chunks that each fit one canvas
-  const chunks = [];
-  let chunk = [];
-  let chunkRows = 0;
-  for (let k = 0; k < setsOfRows; k++) {
-    const lo = k * columnsPerRow;
-    const hi = Math.min(colCount, lo + columnsPerRow) - 1;
-    const n = blockRowCount(lo, hi);
-    if (n > maxRowsPerCanvas) return null; // a single block won't fit; caller alerts
-    if (chunkRows + n > maxRowsPerCanvas && chunk.length > 0) {
-      chunks.push({ blocks: chunk, rows: chunkRows });
-      chunk = [];
-      chunkRows = 0;
+  // Pack blocks into canvases (<= MAXDIM tall) and canvases into pages (pixel budget).
+  // vectorOnly (SVG export without preview): a single unbounded page holding all blocks.
+  let pages;
+  if (vectorOnly) {
+    const allBlocks = [];
+    let totalH = 0;
+    for (let b = 0; b < totalBlocks; b++) {
+      totalH += (allBlocks.length ? BLOCK_GAP : 0) + blockInfo[b].h;
+      allBlocks.push(b);
     }
-    chunk.push(k);
-    chunkRows += n;
+    pages = [{ canvases: [{ blocks: allBlocks, h: totalH }], area: 0 }];
+  } else {
+    pages = [];
+    let pg = { canvases: [], area: 0 };
+    let cv = { blocks: [], h: 0 };
+    const closeCanvas = () => {
+      if (!cv.blocks.length) return;
+      const area = blockW * cv.h;
+      if (pg.canvases.length && pg.area + area > PAGE_PX_BUDGET) {
+        pages.push(pg);
+        pg = { canvases: [], area: 0 };
+      }
+      pg.canvases.push(cv);
+      pg.area += area;
+      cv = { blocks: [], h: 0 };
+    };
+    for (let b = 0; b < totalBlocks; b++) {
+      const addH = (cv.blocks.length ? BLOCK_GAP : 0) + blockInfo[b].h; // gap before every block except a canvas's first
+      if (cv.blocks.length && cv.h + addH > MAXDIM) closeCanvas();
+      cv.blocks.push(b);
+      cv.h += addH;
+    }
+    closeCanvas();
+    if (pg.canvases.length) pages.push(pg);
   }
-  if (chunk.length) chunks.push({ blocks: chunk, rows: chunkRows });
+
+  const totalPages = pages.length;
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const thePage = pages[safePage];
+  const firstBlock = thePage.canvases[0].blocks[0];
+  const lastCv = thePage.canvases[thePage.canvases.length - 1];
+  const lastBlock = lastCv.blocks[lastCv.blocks.length - 1];
+  const startCol = blockInfo[firstBlock].c0;
+  const endCol = blockInfo[lastBlock].c1;
+
+  const normCache = new Map();
+  function norm(hex) {
+    let v = normCache.get(hex);
+    if (!v) {
+      v = (hex[0] === "#" ? hex.slice(1) : hex).toUpperCase();
+      normCache.set(hex, v);
+    }
+    return v;
+  }
+
+  // Same foreground rule as the GL shader: white text below the luminance threshold.
+  function linearize(c) {
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  const textColorCache = new Map();
+  const lumThreshold = tabState.luminance;
+  function textColorFor(hex) {
+    let v = textColorCache.get(hex);
+    if (v) return v;
+    const rgb = hexToRgbFloat(hex);
+    const L = 0.2126 * linearize(rgb[0]) + 0.7152 * linearize(rgb[1]) + 0.0722 * linearize(rgb[2]);
+    v = L < lumThreshold ? "#FFFFFF" : "#000000";
+    textColorCache.set(hex, v);
+    return v;
+  }
+
+  function drawRow(ctx, colors, charAt, c0, c1, x0, y) {
+    let runStart = c0,
+      runHex = colors[0];
+    for (let i = 1; i <= colors.length; i++) {
+      const hex = i < colors.length ? colors[i] : null;
+      if (hex !== runHex) {
+        if (runHex && runHex !== "FFFFFF") {
+          ctx.fillStyle = "#" + runHex;
+          ctx.fillRect(x0 + (runStart - c0) * CW, y, (c0 + i - runStart) * CW, CH);
+        }
+        runStart = c0 + i;
+        runHex = hex;
+      }
+    }
+    let lastTc = null;
+    for (let c = c0; c < c1; c++) {
+      const ch = charAt(c);
+      if (!ch || ch === " ") continue;
+      const tc = textColorFor(colors[c - c0] || "FFFFFF");
+      if (tc !== lastTc) {
+        ctx.fillStyle = tc;
+        lastTc = tc;
+      }
+      ctx.fillText(ch, x0 + (c - c0) * CW + CW / 2, y + CH / 2);
+    }
+  }
 
   const canvases = [];
-  let trueIndex = tabState.firstIndex || 1;
-
-  chunks.forEach(({ blocks, rows }) => {
-    const logicalH = rows * cellH + margin * 2;
+  for (const canvasInfo of vectorOnly ? [] : thePage.canvases) {
+    // no raster painting in vector mode
     const canvas = document.createElement("canvas");
-    canvas.width = logicalW * scale;
-    canvas.height = logicalH * scale;
-    canvas.style.width = logicalW + "px";
-    canvas.style.height = logicalH + "px";
-    canvas.style.display = "block";
+    canvas.width = blockW * dpr;
+    canvas.height = canvasInfo.h * dpr;
+    canvas.style.display = "block"; // canvases are inline by default and would flow side by side
     canvas.style.marginBottom = "8px";
     const ctx = canvas.getContext("2d");
-    ctx.setTransform(scale, 0, 0, scale, 0, 0);
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, logicalW, logicalH);
     ctx.font = `${fontSize}px Consolas, monospace`;
     ctx.textBaseline = "middle";
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, blockW, canvasInfo.h);
 
-    const nameX = margin;
-    const indexX = margin + (nameChars + 2) * cellW;
-    const gridX = margin + leftChars * cellW;
-    const rightIndexX = gridX + columnsPerRow * cellW + 2 * cellW;
+    let baseY = 0;
+    for (const b of canvasInfo.blocks) {
+      const info = blockInfo[b];
+      const { c0, c1, used } = info;
 
-    function drawRow(name, indexNum, cells, y) {
-      ctx.fillStyle = "#000000";
+      // names gutter (only rows actually drawn)
       ctx.textAlign = "left";
-      ctx.fillText(name.slice(0, nameChars), nameX, y + cellH / 2);
-      if (indexNum !== null) {
-        ctx.textAlign = "right";
-        ctx.fillText(String(indexNum), indexX + INDEX_CHARS * cellW, y + cellH / 2);
-      }
-      cells.forEach((cell, i) => {
-        const x = gridX + i * cellW;
-        const bg = cell.bgHex.replace("#", "");
-        ctx.fillStyle = "#" + bg;
-        ctx.fillRect(x, y, cellW, cellH);
-        const fg = decideForegroundHex(bg, tabState.luminance).replace("#", "");
-        ctx.fillStyle = "#" + fg;
-        ctx.textAlign = "center";
-        ctx.fillText(cell.ch, x + cellW / 2, y + cellH / 2);
+      ctx.fillStyle = "#000000";
+      const clip = (s) => (s.length > maxNameChars ? s.slice(0, maxNameChars) : s);
+      let labelY = baseY;
+      used.forEach((r) => {
+        ctx.fillText(clip(anns[r].name), 2, labelY + CH / 2);
+        labelY += CH;
       });
-      if (indexNum !== null) {
-        ctx.fillStyle = "#000000";
+      if (showNumbering) {
+        ctx.fillText("Position", 2, labelY + CH / 2);
+        labelY += CH;
+      }
+      for (let r = 0; r < seqRows; r++) {
+        ctx.fillText(clip(tabState.records[r].header), 2, labelY + CH / 2);
+        labelY += CH;
+      }
+      if (showConsensus) ctx.fillText("Consensus", 2, labelY + CH / 2);
+
+      let y = baseY;
+      // annotation rows (only those with content in this block)
+      for (const r of used) {
+        const colors = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) colors[c - c0] = norm(resolveAnnoColor(r, c));
+        ctx.textAlign = "center";
+        drawRow(ctx, colors, (c) => anns[r].data[c] || " ", c0, c1, nameW, y);
+        y += CH;
+      }
+      // numbering row (right-aligned so the last label never clips)
+      if (showNumbering) {
         ctx.textAlign = "right";
-        ctx.fillText(String(indexNum + cells.length - 1), rightIndexX + INDEX_CHARS * cellW, y + cellH / 2);
+        ctx.fillStyle = "#000000";
+        for (let c = c0; c < c1; c++) {
+          if ((c + 1) % numberingSpacing === 0) {
+            ctx.fillText(String(c + 1), nameW + (c - c0 + 1) * CW - 1, y + CH / 2);
+          }
+        }
+        y += CH;
+      }
+      // sequence rows — each cell's color resolved exactly once
+      for (let r = 0; r < seqRows; r++, y += CH) {
+        const rec = tabState.records[r];
+        const colors = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) colors[c - c0] = norm(resolveSeqColor(r, c, rec.seq[c] || "-"));
+        ctx.textAlign = "center";
+        drawRow(ctx, colors, (c) => rec.seq[c] || "-", c0, c1, nameW, y);
+      }
+      // consensus row — resolve each column once, reused for color and char
+      if (showConsensus) {
+        const consRow = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) consRow[c - c0] = resolveConsensus(c);
+        ctx.textAlign = "center";
+        drawRow(
+          ctx,
+          consRow.map((x) => norm(x.bgHex)),
+          (c) => consRow[c - c0].ch,
+          c0,
+          c1,
+          nameW,
+          y
+        );
+      }
+      baseY += info.h + BLOCK_GAP;
+    }
+    canvases.push(canvas);
+  }
+  return {
+    canvases,
+    page: safePage,
+    totalPages,
+    startCol,
+    endCol,
+    colCount,
+    layout: {
+      CW,
+      CH,
+      nameW,
+      blockW,
+      fontSize,
+      maxNameChars,
+      numberingSpacing,
+      showNumbering,
+      showConsensus,
+      blockGap: BLOCK_GAP,
+      seqRows,
+      blockInfo,
+      canvasInfos: thePage.canvases
+    }
+  };
+}
+
+// Vector export of a print-preview page: consumes the layout embedded in the
+// object returned by renderAlignmentPng, so page boundaries always match the preview.
+function svgForPrintPage(result, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus) {
+  const L = result.layout;
+  const {
+    CW,
+    CH,
+    nameW,
+    blockW,
+    fontSize,
+    maxNameChars,
+    numberingSpacing,
+    showNumbering,
+    showConsensus,
+    seqRows,
+    blockInfo,
+    canvasInfos
+  } = L;
+  const anns = tabState.annotations;
+
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const clip = (s) => (s.length > maxNameChars ? s.slice(0, maxNameChars) : s);
+  const f2 = (n) => Math.round(n * 100) / 100;
+
+  const normCache = new Map();
+  function norm(hex) {
+    let v = normCache.get(hex);
+    if (!v) {
+      v = (hex[0] === "#" ? hex.slice(1) : hex).toUpperCase();
+      normCache.set(hex, v);
+    }
+    return v;
+  }
+  function linearize(c) {
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  const textColorCache = new Map();
+  const lumThreshold = tabState.luminance;
+  function textColorFor(hex) {
+    let v = textColorCache.get(hex);
+    if (v) return v;
+    const rgb = hexToRgbFloat(hex);
+    const lum = 0.2126 * linearize(rgb[0]) + 0.7152 * linearize(rgb[1]) + 0.0722 * linearize(rgb[2]);
+    v = lum < lumThreshold ? "#FFFFFF" : "#000000";
+    textColorCache.set(hex, v);
+    return v;
+  }
+
+  const CANVAS_GAP = 8; // matches preview spacing and PNG stitching
+  const totalH = canvasInfos.reduce((s, ci) => s + ci.h, 0) + CANVAS_GAP * Math.max(0, canvasInfos.length - 1);
+
+  const out = [];
+  out.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${blockW}" height="${totalH}" viewBox="0 0 ${blockW} ${totalH}" font-family="Consolas, monospace" font-size="${fontSize}">`
+  );
+  out.push(`<rect x="0" y="0" width="${blockW}" height="${totalH}" fill="#FFFFFF"/>`);
+
+  // Per-glyph absolute x positions: no textLength, so nothing accumulates and
+  // every character sits exactly in its cell regardless of the viewer's font.
+  function emitText(str, fromCol, nCols, color, y) {
+    if (!str || !str.trim()) return;
+    const xs = new Array(str.length);
+    for (let i = 0; i < str.length; i++) {
+      xs[i] = f2(nameW + (fromCol + i) * CW + CW * 0.18);
+    }
+    out.push(
+      `<text x="${xs.join(" ")}" y="${f2(y + CH / 2)}" fill="${color}" dominant-baseline="central" xml:space="preserve">${esc(str)}</text>`
+    );
+  }
+
+  function emitRow(colors, chars, y) {
+    // background runs (skip white)
+    let runStart = 0;
+    for (let i = 1; i <= colors.length; i++) {
+      if (i === colors.length || colors[i] !== colors[runStart]) {
+        const hex = colors[runStart];
+        if (hex !== "FFFFFF") {
+          out.push(
+            `<rect x="${f2(nameW + runStart * CW)}" y="${f2(y)}" width="${f2((i - runStart) * CW)}" height="${f2(CH)}" fill="#${hex}"/>`
+          );
+        }
+        runStart = i;
       }
     }
-
-    let y = margin;
-    blocks.forEach((k) => {
-      const lo = k * columnsPerRow;
-      const hi = Math.min(colCount, lo + columnsPerRow) - 1;
-      const nCols = hi - lo + 1;
-
-      if (showNumbering) {
-        ctx.fillStyle = "#000000";
-        ctx.textAlign = "left";
-        for (let c = 0; c < nCols; c++) {
-          if ((c + 1) % numberingSpacing === 0) {
-            ctx.fillText(String(trueIndex + c), gridX + c * cellW, y + cellH / 2);
-          }
-        }
-        y += cellH;
+    // text runs, split only when the foreground color changes
+    let tFrom = 0;
+    let tColor = textColorFor(colors[0] || "FFFFFF");
+    for (let i = 1; i <= chars.length; i++) {
+      const tc = i < chars.length ? textColorFor(colors[i] || "FFFFFF") : null;
+      if (tc !== tColor) {
+        emitText(chars.slice(tFrom, i).join(""), tFrom, i - tFrom, tColor, y);
+        tFrom = i;
+        tColor = tc;
       }
+    }
+  }
+  let canvasY = 0;
+  for (const ci of canvasInfos) {
+    let baseY = canvasY;
+    for (const b of ci.blocks) {
+      const info = blockInfo[b];
+      const { c0, c1, used } = info;
 
-      if (showAnnotations) {
-        annotations.forEach((ann, r) => {
-          const cells = [];
-          let empty = true;
-          for (let c = lo; c <= hi; c++) {
-            const ch = ann.data[c] || " ";
-            if (ch !== " ") empty = false;
-            cells.push({ ch, bgHex: resolveAnnoColor(r, c) });
-          }
-          if (!empty) {
-            drawRow(ann.name, null, cells, y);
-            y += cellH;
-          }
-        });
-      }
-
-      tabState.records.forEach((rec, r) => {
-        const cells = [];
-        for (let c = lo; c <= hi; c++) {
-          const ch = rec.seq[c] || "-";
-          cells.push({ ch, bgHex: resolveSeqColor(r, c, ch) });
-        }
-        drawRow(rec.header, trueIndex, cells, y);
-        y += cellH;
+      let labelY = baseY;
+      const label = (s, ly) =>
+        out.push(
+          `<text x="2" y="${f2(ly + CH / 2)}" fill="#000000" dominant-baseline="central">${esc(clip(s))}</text>`
+        );
+      used.forEach((r) => {
+        label(anns[r].name, labelY);
+        labelY += CH;
       });
-
-      if (showConsensus) {
-        const cells = [];
-        for (let c = lo; c <= hi; c++) {
-          const { ch, bgHex } = resolveConsensus(c);
-          cells.push({ ch, bgHex });
-        }
-        drawRow("Consensus", trueIndex, cells, y);
-        y += cellH;
+      if (showNumbering) {
+        label("Position", labelY);
+        labelY += CH;
       }
+      for (let r = 0; r < seqRows; r++) {
+        label(tabState.records[r].header, labelY);
+        labelY += CH;
+      }
+      if (showConsensus) label("Consensus", labelY);
 
-      y += cellH; // spacer row
-      trueIndex += nCols;
-    });
-
-    canvases.push(canvas);
-  });
-
-  return canvases;
+      let y = baseY;
+      for (const r of used) {
+        const colors = new Array(c1 - c0);
+        const chars = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) {
+          colors[c - c0] = norm(resolveAnnoColor(r, c));
+          chars[c - c0] = anns[r].data[c] || " ";
+        }
+        emitRow(colors, chars, y);
+        y += CH;
+      }
+      if (showNumbering) {
+        for (let c = c0; c < c1; c++) {
+          if ((c + 1) % numberingSpacing === 0) {
+            out.push(
+              `<text x="${f2(nameW + (c - c0 + 1) * CW - 1)}" y="${f2(y + CH / 2)}" fill="#000000" text-anchor="end" dominant-baseline="central">${c + 1}</text>`
+            );
+          }
+        }
+        y += CH;
+      }
+      for (let r = 0; r < seqRows; r++, y += CH) {
+        const rec = tabState.records[r];
+        const colors = new Array(c1 - c0);
+        const chars = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) {
+          colors[c - c0] = norm(resolveSeqColor(r, c, rec.seq[c] || "-"));
+          chars[c - c0] = rec.seq[c] || "-";
+        }
+        emitRow(colors, chars, y);
+      }
+      if (showConsensus) {
+        const colors = new Array(c1 - c0);
+        const chars = new Array(c1 - c0);
+        for (let c = c0; c < c1; c++) {
+          const cons = resolveConsensus(c);
+          colors[c - c0] = norm(cons.bgHex);
+          chars[c - c0] = cons.ch;
+        }
+        emitRow(colors, chars, y);
+      }
+      baseY += info.h + L.blockGap;
+    }
+    canvasY += ci.h + CANVAS_GAP;
+  }
+  out.push(`</svg>`);
+  return out.join("\n");
 }
 
 function decideForegroundHex(bgHex, luminanceThreshold) {
@@ -2223,7 +3474,7 @@ function decideForegroundHex(bgHex, luminanceThreshold) {
   return L > luminanceThreshold ? "#000000" : "#FFFFFF";
 }
 
-function parseSlim(text) {
+async function parseSlim(text, onProgress) {
   const lines = text.split(/\r?\n/);
   if (lines[0] !== ".slim") return null;
 
@@ -2241,6 +3492,17 @@ function parseSlim(text) {
   let consensusChars = "";
   const consensusColors = {};
   const getLineData = (line) => line.substring(line.indexOf("{") + 1, line.indexOf("}"));
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const totalLines = lines.length;
+  let lastYield = 0;
+  const maybeYield = async (i) => {
+    if (i - lastYield >= 262144) {
+      lastYield = i;
+      if (onProgress) onProgress(i, totalLines);
+      await tick();
+    }
+  };
 
   let i = 1;
   while (i < lines.length) {
@@ -2291,6 +3553,7 @@ function parseSlim(text) {
           colors[col] = bgHex;
           col++;
           i++;
+          if ((col & 65535) === 0) await maybeYield(i);
         }
         annotations.push({ name, data: chars.join(""), colors });
       }
@@ -2309,6 +3572,7 @@ function parseSlim(text) {
           colors[col] = bgHex;
           col++;
           i++;
+          if ((col & 65535) === 0) await maybeYield(i);
         }
         records.push({ header, seq: chars.join(""), charColors: colors });
       }
@@ -2323,6 +3587,7 @@ function parseSlim(text) {
         consensusColors[col] = bgHex;
         col++;
         i++;
+        if ((col & 65535) === 0) await maybeYield(i);
       }
       consensusChars = chars.join("");
       i++;
@@ -2337,52 +3602,367 @@ function parseSlim(text) {
   const consensusOverrides = {};
   for (let c = 0; c < consensusChars.length; c++) consensusOverrides[c] = consensusChars[c];
 
+  if (onProgress) onProgress(totalLines, totalLines);
   return { records, annotations, consensusOverrides, consensusColors, ...meta };
 }
 
-function generateSlim(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus) {
-  const lines = [];
-  lines.push(".slim");
-  lines.push(`$fontsize{${tabState.fontSize}}`);
-  lines.push(`$firstindex{${tabState.firstIndex || 1}}`);
-  lines.push(`$luminance{${tabState.luminance}}`);
-  lines.push(`$alphabet_def{${tabState.alphabet === "nucleotide" ? "Nucleotide" : "Protein"}}`);
-  lines.push(`$collapse{${tabState.collapse ? "true" : "false"}}`);
-  lines.push(`$livehover{${tabState.liveHover === false ? "false" : "true"}}`);
-  lines.push(`$refreshdelay{${tabState.refreshDelay || 0}}`);
+// .blim (binary slim) exporter — spec: blim-spec v1.2.
+// Two phases: (1) a read-only sweep building the char/color dictionaries,
+// (2) the streaming write. Per row the cell callback fires ONCE; color indices
+// are stashed in a scratch array so the color plane writes right after the char
+// plane without re-running shading math.
+// .blim (binary slim) exporter — spec: blim-spec v1.2.
+// The sink opens BEFORE the dictionary sweep: both the SW-streamed download and
+// the FS-API picker require the click's transient user activation, and the sweep
+// would let it expire. Routing uses a cheap upper bound (≤4 bytes/cell).
+async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
+  const prog = showProgressOverlay("Saving project");
+  let sink = null;
+  try {
+    const enc = new TextEncoder();
+    const normHex = (h) => (h[0] === "#" ? h : "#" + h).toUpperCase();
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    let lastBeat = performance.now();
+    const beat = async () => {
+      const now = performance.now();
+      if (now - lastBeat > 50) {
+        await tick(); // watchdog-proofing for chromosome-scale rows
+        lastBeat = performance.now();
+      }
+    };
 
-  lines.push("$annotation_data{");
-  tabState.annotations.forEach((ann, r) => {
-    lines.push(`%${ann.name}`);
-    for (let c = 0; c < colCount; c++) {
-      const ch = ann.data[c] || " ";
-      const bgHex = getAnnoBgHex(r, c, ch);
-      lines.push(`${ch}.${bgHex}.${decideForegroundHex(bgHex, tabState.luminance)}`);
+    // unified {ch, bg} cell shape; consensus uses the same two-plane grammar as
+    // every other row (spec §3). id tags the sequence section for .bcmm (§4).
+    const sections = [
+      {
+        id: "anno",
+        open: "$annotation_data{\n",
+        rows: tabState.annotations,
+        name: (r) => "%" + tabState.annotations[r].name,
+        cell: (r, c) => {
+          const ann = tabState.annotations[r];
+          const ch = ann.data[c] || " ";
+          return { ch, bg: getAnnoBgHex(r, c, ch) };
+        }
+      },
+      {
+        id: "seq",
+        open: "$sequence_data{\n",
+        rows: tabState.records,
+        name: (r) => "%>" + tabState.records[r].header,
+        cell: (r, c) => {
+          const rec = tabState.records[r];
+          const ch = rec.seq[c] || "-";
+          return { ch, bg: getSeqBgHex(r, c, ch) };
+        }
+      },
+      {
+        id: "cons",
+        open: "$consensus_data{\n",
+        rows: [null], // exactly one row
+        name: () => "%consensus",
+        cell: (r, c) => {
+          const { ch, bgHex } = getConsensus(c);
+          return { ch, bg: bgHex };
+        }
+      }
+    ];
+    const totalRows = sections.reduce((n, s) => n + s.rows.length, 0);
+    const seqCount = tabState.records.length;
+
+    // sink first, while the click is still warm. Upper-bound estimate for routing:
+    // 4 bytes/cell (16-bit chardict + 16-bit colordict ceiling) + line overhead
+    const estBytes = 4096 + totalRows * (colCount * 4 + 32);
+    console.log("[blim] opening sink, est", estBytes, "bytes");
+    sink = await openByteSink(filename, estBytes);
+    if (!sink) {
+      alert("Save canceled.");
+      return;
     }
-  });
-  lines.push("}");
+    console.log("[blim] sink acquired");
 
-  lines.push("$sequence_data{");
-  tabState.records.forEach((rec, r) => {
-    lines.push(`%${rec.header}`);
-    for (let c = 0; c < colCount; c++) {
-      const ch = rec.seq[c] || "-";
-      const bgHex = getSeqBgHex(r, c, ch);
-      lines.push(`${ch}.${bgHex}.${decideForegroundHex(bgHex, tabState.luminance)}`);
+    // ---- phase 1: dictionary sweep (+ .bcmm reference capture & diff counts) ----
+    const charIndex = new Map();
+    const colorIndex = new Map(); // index 0 reserved = #FFFFFF; listed colors start at 1
+    // .bcmm reference = row 0. Chars come from the resident string (no copy);
+    // colors are captured during the sweep as compact dictionary indices.
+    const refSeq = seqCount > 1 ? tabState.records[0].seq : null;
+    const refColorIdx = seqCount > 1 ? new Uint16Array(colCount) : null;
+    const charDiffs = new Uint32Array(seqCount);
+    const colorDiffs = new Uint32Array(seqCount);
+    let done = 0;
+    for (const s of sections) {
+      const isSeq = s.id === "seq";
+      for (let r = 0; r < s.rows.length; r++) {
+        for (let c = 0; c < colCount; c++) {
+          const { ch, bg } = s.cell(r, c);
+          if (!charIndex.has(ch)) charIndex.set(ch, charIndex.size);
+          const n = normHex(bg);
+          if (n !== "#FFFFFF" && !colorIndex.has(n)) colorIndex.set(n, colorIndex.size + 1);
+          if (isSeq && refColorIdx) {
+            const ci = colorIndex.get(n) || 0; // assigned just above; indices are stable
+            if (r === 0) {
+              refColorIdx[c] = ci;
+            } else {
+              if (ch !== (refSeq[c] || "-")) charDiffs[r]++;
+              if (ci !== refColorIdx[c]) colorDiffs[r]++;
+            }
+          }
+          if ((c & 8191) === 0) await beat();
+        }
+        prog.setProgress(++done, totalRows * 2);
+      }
     }
-  });
-  lines.push("}");
+    if (colorIndex.size > 65535) {
+      throw new Error("Too many distinct colors for .blim v1 (" + colorIndex.size + " > 65535)");
+    }
 
-  lines.push("$consensus_data{");
-  for (let c = 0; c < colCount; c++) {
-    const { ch, bgHex } = getConsensus(c);
-    lines.push(`${ch}.${bgHex}.${decideForegroundHex(bgHex, tabState.luminance)}`);
+    const charBits = Math.max(1, Math.ceil(Math.log2(Math.max(2, charIndex.size))));
+    const colorBits = Math.max(1, Math.ceil(Math.log2(colorIndex.size + 1)));
+    const colorList = new Array(colorIndex.size);
+    colorIndex.forEach((i, hex) => (colorList[i - 1] = hex));
+    const charList = Array.from(charIndex.keys())
+      .map((ch) => ch.charCodeAt(0))
+      .join(",");
+    console.log(
+      "[blim] sweep done:",
+      charIndex.size,
+      "chars @",
+      charBits,
+      "b,",
+      colorIndex.size,
+      "colors @",
+      colorBits,
+      "b"
+    );
+
+    // .bcmm auto-select (spec §4): reference row + per-row diffs, when cheaper.
+    // Every non-reference row costs 1 tag byte + min(diff records, full planes).
+    const rowCharBytes = Math.ceil((colCount * charBits) / 8);
+    const rowColorBytes = Math.ceil((colCount * colorBits) / 8);
+    const rowBytes = rowCharBytes + rowColorBytes;
+    let useBcmm = false;
+    if (seqCount > 1) {
+      let bcmmTotal = rowBytes; // reference row carries no tag
+      for (let r = 1; r < seqCount; r++) {
+        bcmmTotal += 1 + Math.min(8 + 6 * (charDiffs[r] + colorDiffs[r]), rowBytes);
+      }
+      useBcmm = bcmmTotal < seqCount * rowBytes;
+      console.log(
+        "[blim] subtype:",
+        useBcmm ? ".bcmm" : ".blim",
+        "(" + bcmmTotal + " vs " + seqCount * rowBytes + " row bytes)"
+      );
+    }
+
+    const header =
+      (useBcmm ? ".bcmm\n" : ".blim\n") +
+      "$version{1}\n" +
+      `$fontsize{${tabState.fontSize}}\n` +
+      `$luminance{${tabState.luminance}}\n` +
+      `$alphabetdef{${tabState.alphabet === "nucleotide" ? "Nucleotide" : "Protein"}}\n` +
+      `$columns{${colCount}}\n` +
+      `$rows{${tabState.annotations.length}}{${tabState.records.length}}\n` +
+      `$chardict{${charBits}}{${charList}}\n` +
+      `$colordict{${colorBits}}{${colorList.join(",")}}\n`;
+
+    // ---- phase 2: the write ----
+    const u32le = (n) => {
+      const b = new Uint8Array(4);
+      b[0] = n & 0xff;
+      b[1] = (n >>> 8) & 0xff;
+      b[2] = (n >>> 16) & 0xff;
+      b[3] = (n >>> 24) & 0xff;
+      return b;
+    };
+    const diffRecords = (pairs) => {
+      // flat [col, dictIdx, col, dictIdx, ...] -> 6 B/record
+      const b = new Uint8Array(pairs.length * 3);
+      for (let i = 0, j = 0; i < pairs.length; i += 2, j += 6) {
+        const col = pairs[i],
+          idx = pairs[i + 1];
+        b[j] = col & 0xff;
+        b[j + 1] = (col >>> 8) & 0xff;
+        b[j + 2] = (col >>> 16) & 0xff;
+        b[j + 3] = (col >>> 24) & 0xff;
+        b[j + 4] = idx & 0xff;
+        b[j + 5] = (idx >>> 8) & 0xff;
+      }
+      return b;
+    };
+
+    await sink.write(enc.encode(header));
+    const colorScratch = new Uint16Array(colCount);
+    for (const s of sections) {
+      await sink.write(enc.encode(s.open));
+      const bcmmRows = useBcmm && s.id === "seq";
+      for (let r = 0; r < s.rows.length; r++) {
+        await sink.write(enc.encode(s.name(r).replace(/[\r\n]+/g, " ") + "\n"));
+        const pending = [];
+        const emit = (chunk) => pending.push(sink.write(chunk));
+
+        if (bcmmRows && r > 0) {
+          const diffBytes = 8 + 6 * (charDiffs[r] + colorDiffs[r]);
+          if (diffBytes < rowBytes) {
+            emit(new Uint8Array([1])); // tag 0x01: diff row (spec §4)
+            const cd = [],
+              kd = [];
+            for (let c = 0; c < colCount; c++) {
+              const { ch, bg } = s.cell(r, c);
+              if (ch !== (refSeq[c] || "-")) cd.push(c, charIndex.get(ch));
+              const ci = colorIndex.get(normHex(bg)) || 0;
+              if (ci !== refColorIdx[c]) kd.push(c, ci);
+              if ((c & 8191) === 0) await beat();
+            }
+            emit(u32le(cd.length / 2));
+            emit(diffRecords(cd));
+            emit(u32le(kd.length / 2));
+            emit(diffRecords(kd));
+            await Promise.all(pending.splice(0)); // sink backpressure, per row
+            await sink.write(enc.encode("\n")); // framing checkpoint
+            prog.setProgress(++done, totalRows * 2);
+            continue;
+          }
+          emit(new Uint8Array([0])); // tag 0x00: full row, planes follow
+        }
+
+        const w = makeBitWriter(emit);
+        for (let c = 0; c < colCount; c++) {
+          const { ch, bg } = s.cell(r, c);
+          w.write(charIndex.get(ch), charBits);
+          colorScratch[c] = colorIndex.get(normHex(bg)) || 0;
+          if ((c & 8191) === 0) await beat();
+        }
+        w.flush(); // char plane boundary (spec §3)
+        for (let c = 0; c < colCount; c++) {
+          w.write(colorScratch[c], colorBits);
+          if ((c & 8191) === 0) await beat();
+        }
+        w.flush(); // color plane boundary
+        await Promise.all(pending.splice(0)); // sink backpressure, per row
+        await sink.write(enc.encode("\n")); // framing checkpoint
+        prog.setProgress(++done, totalRows * 2);
+      }
+      await sink.write(enc.encode("}\n"));
+    }
+    console.log("[blim] all rows written — closing sink");
+    await sink.close();
+    console.log("[blim] sink closed");
+  } catch (err) {
+    console.error("Blim export failed:", err);
+    if (sink) {
+      try {
+        await sink.close(); // terminate any open download/staging cleanly
+      } catch (e) {}
+    }
+    alert("Project export failed: " + err.message);
+  } finally {
+    // consensus caches exist for the UI's repeated reads; the export sweep reads
+    // each column exactly once, so what they accumulated is dead weight
+    tabState.consensusCols = [];
+    if (typeof consensusCache !== "undefined" && consensusCache.clear) consensusCache.clear();
+    prog.close();
   }
-  lines.push("}");
-
-  return lines.join("\n");
 }
-// ---------- Color scheme modal ----------
+
+async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
+  const prog = showProgressOverlay("Saving project");
+  try {
+    // rough .slim size: every cell becomes one "<char>.#RRGGBB.#RRGGBB\n" (~17 bytes).
+    // above 1GB, openTextSink routes this export through OPFS staging instead of
+    // the service-worker stream (which Chrome kills after ~5 minutes)
+    const estBytes = (tabState.records.length + tabState.annotations.length + 1) * (colCount + 2) * 17;
+    await withTextSink(
+      filename,
+      "text/plain",
+      ".slim",
+      async (sink) => {
+        const fgOf = makeFgCache(tabState.luminance);
+        const tick = () => new Promise((r) => setTimeout(r, 0));
+        let buf = "";
+        const flushIfBig = async (force) => {
+          if (force || buf.length > 4000000) {
+            await sink.write(buf);
+            buf = "";
+            await tick();
+          }
+        };
+        buf += ".slim\n";
+        buf += `$fontsize{${tabState.fontSize}}\n`;
+        buf += `$firstindex{${tabState.firstIndex}}\n`;
+        buf += `$luminance{${tabState.luminance}}\n`;
+        buf += `$alphabetdef{${tabState.alphabet === "nucleotide" ? "Nucleotide" : "Protein"}}\n`;
+        buf += `$collapse{${tabState.collapse ? "true" : "false"}}\n`;
+        buf += `$livehover{${tabState.liveHover === false ? "false" : "true"}}\n`;
+        buf += `$refreshdelay{${tabState.refreshDelay || 0}}\n`;
+
+        const totalRows = tabState.annotations.length + tabState.records.length + 1;
+        let doneRows = 0;
+        // spec triplet: <char>.#RRGGBB.#RRGGBB — the "." separators and the "#" on the
+        // background color are load-bearing (parseSlimTriplet reads fixed positions)
+        const writeCells = async (cellAt) => {
+          let batch = [];
+          for (let c = 0; c < colCount; c++) {
+            const { ch, bgHex } = cellAt(c);
+            const bg = bgHex[0] === "#" ? bgHex : "#" + bgHex;
+            batch.push(`${ch}.${bg}.${fgOf(bg)}\n`);
+            if (batch.length >= 65536) {
+              buf += batch.join("");
+              batch = [];
+              await flushIfBig(false);
+            }
+          }
+          if (batch.length) buf += batch.join("");
+        };
+
+        buf += "$annotation_data{\n";
+        for (let r = 0; r < tabState.annotations.length; r++) {
+          const ann = tabState.annotations[r];
+          buf += `%${ann.name}\n`;
+          await writeCells((c) => {
+            const ch = ann.data[c] || " ";
+            return { ch, bgHex: getAnnoBgHex(r, c, ch) };
+          });
+          prog.setProgress(++doneRows, totalRows);
+          await flushIfBig(false);
+        }
+        buf += "}\n";
+        buf += "$sequence_data{\n";
+        for (let r = 0; r < tabState.records.length; r++) {
+          const rec = tabState.records[r];
+          buf += `%${rec.header}\n`;
+          await writeCells((c) => {
+            const ch = rec.seq[c] || "-";
+            return { ch, bgHex: getSeqBgHex(r, c, ch) };
+          });
+          prog.setProgress(++doneRows, totalRows);
+          await flushIfBig(false);
+        }
+        buf += "}\n";
+        buf += "$consensus_data{\n";
+        await writeCells((c) => getConsensus(c));
+        buf += "}\n";
+        prog.setProgress(++doneRows, totalRows);
+        await flushIfBig(true);
+      },
+      estBytes
+    );
+  } catch (err) {
+    console.error("Project export failed:", err);
+    if (err && err.name === "InvalidStateError") {
+      alert(
+        "Export failed because the destination file changed on disk while writing — sync tools " +
+          "(OneDrive/Dropbox), antivirus scans, or having the file open elsewhere are the usual causes. " +
+          "Export to a local, non-synced folder and leave the file untouched until it finishes."
+      );
+    } else {
+      alert("Project export failed: " + err.message);
+    }
+  } finally {
+    prog.close();
+  }
+}
+//  Color scheme modal
 function showColorSchemeModal(tabState, onColorsChanged) {
   const alphabetList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
   const title = tabState.alphabet === "nucleotide" ? "Nucleotide Color Scheme" : "Amino Acid Color Scheme";
@@ -2441,7 +4021,7 @@ function showColorSchemeModal(tabState, onColorsChanged) {
   document.body.appendChild(overlay);
 }
 
-// ---------- Shade unique modal ----------
+//  Shade unique modal
 function showUniqueShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.unique;
   const overlay = document.createElement("div");
@@ -2511,7 +4091,7 @@ function showUniqueShadeModal(tabState, ctx) {
   apply();
 }
 
-// ---------- Substitution matrix shading modal ----------
+//  Substitution matrix shading modal
 function showMatrixShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.matrix;
   if (cfg.mode !== "sequence" && cfg.mode !== "majority") cfg.mode = "sequence";
@@ -2673,7 +4253,7 @@ function showMatrixShadeModal(tabState, ctx) {
   apply();
 }
 
-// ---------- Sequence shading modal ----------
+//  Sequence shading modal
 function showSequenceShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.sequence;
   const overlay = document.createElement("div");
@@ -2809,12 +4389,59 @@ function showRtfExportModal(tabState, onExport) {
   execBtn.textContent = "Save to RTF";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
-    const fontSize = Number(fontSelect.value);
-    const maxNameCharsCap = nameInput.value === "" ? 20 : Number(nameInput.value);
-    overlay.remove();
-    onExport({ fontSize, maxNameCharsCap, showAnnotations: annoCheck.checked, showNumbering: numCheck.checked });
+    runWithLoading(execBtn, () => {
+      const fontSize = Number(fontSelect.value);
+      const maxNameCharsCap = nameInput.value === "" ? 20 : Number(nameInput.value);
+      overlay.remove();
+      onExport({ fontSize, maxNameCharsCap, showAnnotations: annoCheck.checked, showNumbering: numCheck.checked });
+    });
   });
   box.appendChild(execBtn);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+//  Print preview too large: offer direct SVG export
+function showPrintTooLargeModal(onExportSvg) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Print preview too large</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent =
+    "This alignment is too large to render as a PNG at these settings. Try fewer columns per row or a smaller font size.";
+  box.appendChild(msgRow);
+
+  const askRow = document.createElement("div");
+  askRow.className = "shade-row";
+  askRow.textContent = "Export to SVG without preview?";
+  box.appendChild(askRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const exportBtn = document.createElement("button");
+  exportBtn.textContent = "Export SVG";
+  exportBtn.className = "modal-close-btn";
+  exportBtn.addEventListener("click", () => {
+    overlay.remove();
+    onExportSvg();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.className = "modal-close-btn";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(exportBtn, cancelBtn);
+  box.appendChild(btnRow);
 
   overlay.appendChild(box);
   overlay.addEventListener("click", (e) => {
@@ -2868,24 +4495,63 @@ function showPrintPreviewModal(tabState, colCount, resolveSeqColor, resolveAnnoC
   execBtn.textContent = "Generate preview";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
-    const opts = {
-      columnsPerRow: Math.max(1, parseInt(colsInput.value, 10) || 60),
-      fontSize: Math.max(6, parseInt(fontInput.value, 10) || 14),
-      maxNameCharsCap: Math.max(4, parseInt(nameInput.value, 10) || 30),
-      numberingSpacing: Math.max(1, parseInt(spacingInput.value, 10) || 5),
-      showAnnotations: annoCheck.checked,
-      showNumbering: numCheck.checked,
-      showConsensus: consCheck.checked
-    };
-    const canvases = renderAlignmentPng(tabState, colCount, resolveSeqColor, resolveAnnoColor, resolveConsensus, opts);
-    if (!canvases) {
-      alert(
-        "This alignment is too large to render as a PNG at these settings. Try fewer columns per row or a smaller font size."
+    runWithLoading(execBtn, () => {
+      const opts = {
+        columnsPerRow: Math.max(1, parseInt(colsInput.value, 10) || 60),
+        fontSize: Math.max(6, parseInt(fontInput.value, 10) || 14),
+        maxNameCharsCap: Math.max(4, parseInt(nameInput.value, 10) || 30),
+        numberingSpacing: Math.max(1, parseInt(spacingInput.value, 10) || 5),
+        showAnnotations: annoCheck.checked,
+        showNumbering: numCheck.checked,
+        showConsensus: consCheck.checked
+      };
+      const first = renderAlignmentPng(
+        tabState,
+        colCount,
+        resolveSeqColor,
+        resolveAnnoColor,
+        resolveConsensus,
+        opts,
+        0
       );
-      return;
-    }
-    overlay.remove();
-    showPngPreviewWindow(canvases, baseName);
+      if (!first) {
+        showPrintTooLargeModal(() => {
+          overlay.remove(); // close the options modal as well
+          const prog = showProgressOverlay("Exporting SVG");
+          prog.setLabel("Generating SVG...");
+          setTimeout(() => {
+            // let the overlay paint before the (synchronous) generation
+            try {
+              const vec = renderAlignmentPng(
+                tabState,
+                colCount,
+                resolveSeqColor,
+                resolveAnnoColor,
+                resolveConsensus,
+                opts,
+                0,
+                true
+              );
+              const svg = svgForPrintPage(vec, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus);
+              downloadFile(baseName + ".svg", svg, "image/svg+xml");
+            } catch (err) {
+              console.error("SVG export failed:", err);
+              alert("SVG export failed: " + err.message);
+            } finally {
+              prog.close();
+            }
+          }, 50);
+        });
+        return;
+      }
+      overlay.remove();
+      showPngPreviewWindow(
+        first,
+        baseName,
+        (p) => renderAlignmentPng(tabState, colCount, resolveSeqColor, resolveAnnoColor, resolveConsensus, opts, p),
+        (resultObj) => svgForPrintPage(resultObj, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus)
+      );
+    });
   });
   box.appendChild(execBtn);
   overlay.appendChild(box);
@@ -2895,35 +4561,77 @@ function showPrintPreviewModal(tabState, colCount, resolveSeqColor, resolveAnnoC
   document.body.appendChild(overlay);
 }
 
-function showPngPreviewWindow(canvases, baseName) {
-  const MAX_EDGE = 32767;
-  const MAX_AREA = 268435456;
+function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
+  const MAXEDGE = 32767;
+  const MAXAREA = 268435456;
+  let current = result;
+
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   const box = document.createElement("div");
   box.className = "modal-box shade-modal seqlogo-modal";
   box.style.maxWidth = "90vw";
+  box.style.maxHeight = "90vh";
+  box.style.display = "flex";
+  box.style.flexDirection = "column";
   box.innerHTML = `<h3>Print preview</h3>`;
+
+  const pagerRow = document.createElement("div");
+  pagerRow.className = "shade-row";
+  pagerRow.style.flexShrink = "0";
+  const prevBtn = document.createElement("button");
+  prevBtn.textContent = "◀ Prev";
+  prevBtn.className = "modal-close-btn";
+  const pageLabel = document.createElement("span");
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "Next ▶";
+  nextBtn.className = "modal-close-btn";
+  pagerRow.append(prevBtn, pageLabel, nextBtn);
+  box.appendChild(pagerRow);
 
   const scrollWrap = document.createElement("div");
   scrollWrap.style.overflow = "auto";
   scrollWrap.style.maxWidth = "80vw";
-  scrollWrap.style.maxHeight = "70vh";
+  scrollWrap.style.flex = "1 1 auto";
+  scrollWrap.style.minHeight = "120px";
   scrollWrap.style.background = "#ffffff";
   scrollWrap.style.border = "1px solid #444";
-  canvases.forEach((c) => scrollWrap.appendChild(c));
   box.appendChild(scrollWrap);
+
+  function renderCurrent() {
+    scrollWrap.innerHTML = "";
+    current.canvases.forEach((c) => scrollWrap.appendChild(c));
+    pageLabel.textContent =
+      current.totalPages > 1
+        ? `Page ${current.page + 1} / ${current.totalPages} — columns ${current.startCol + 1}–${current.endCol} of ${current.colCount}`
+        : `${current.colCount} columns`;
+    prevBtn.disabled = current.page <= 0;
+    nextBtn.disabled = current.page >= current.totalPages - 1;
+    pagerRow.style.display = current.totalPages > 1 ? "" : "none";
+  }
+
+  prevBtn.addEventListener("click", () => {
+    if (current.page <= 0) return;
+    current = renderPage(current.page - 1);
+    renderCurrent();
+  });
+  nextBtn.addEventListener("click", () => {
+    if (current.page >= current.totalPages - 1) return;
+    current = renderPage(current.page + 1);
+    renderCurrent();
+  });
 
   const btnRow = document.createElement("div");
   btnRow.className = "shade-row";
   const saveBtn = document.createElement("button");
+  btnRow.style.flexShrink = "0";
   saveBtn.textContent = "Save as PNG";
+  saveBtn.className = "modal-close-btn";
   saveBtn.addEventListener("click", () => {
-    const gap = 8; // bitmap px between stitched chunks, matching the preview's marginBottom
-    const rawW = Math.max(...canvases.map((c) => c.width));
-    const rawH = canvases.reduce((sum, c) => sum + c.height, 0) + gap * (canvases.length - 1);
-    // if the stitch would exceed browser canvas limits, scale the whole sheet down
-    const f = Math.min(1, MAX_EDGE / rawW, MAX_EDGE / rawH, Math.sqrt(MAX_AREA / (rawW * rawH)));
+    const gap = 8; // matches the canvases' marginBottom
+    const rawW = Math.max(...current.canvases.map((c) => c.width));
+    const rawH = current.canvases.reduce((sum, c) => sum + c.height, 0) + gap * (current.canvases.length - 1);
+    const f = Math.min(1, MAXEDGE / rawW, MAXEDGE / rawH, Math.sqrt(MAXAREA / (rawW * rawH)));
     const combined = document.createElement("canvas");
     combined.width = Math.floor(rawW * f);
     combined.height = Math.floor(rawH * f);
@@ -2931,36 +4639,51 @@ function showPngPreviewWindow(canvases, baseName) {
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, combined.width, combined.height);
     let y = 0;
-    canvases.forEach((c) => {
+    current.canvases.forEach((c) => {
       ctx.drawImage(c, 0, Math.floor(y * f), Math.floor(c.width * f), Math.floor(c.height * f));
       y += c.height + gap;
     });
     combined.toBlob((blob) => {
       if (!blob) {
-        alert("Could not encode the combined PNG — the image exceeds this browser's canvas limits.");
+        alert("Could not encode the PNG — the image exceeds this browser's canvas limits.");
         return;
       }
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${baseName}.png`;
+      a.download = current.totalPages > 1 ? `${baseName}_p${current.page + 1}.png` : `${baseName}.png`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     }, "image/png");
+  });
+  const svgBtn = document.createElement("button");
+  svgBtn.textContent = "Save as SVG";
+  svgBtn.className = "modal-close-btn";
+  svgBtn.addEventListener("click", () => {
+    const svg = renderSvg(current);
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = current.totalPages > 1 ? `${baseName}_p${current.page + 1}.svg` : `${baseName}.svg`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
   });
   const closeBtn = document.createElement("button");
   closeBtn.textContent = "Close";
   closeBtn.className = "modal-close-btn";
   closeBtn.addEventListener("click", () => overlay.remove());
-  btnRow.append(saveBtn, closeBtn);
+  btnRow.append(saveBtn, svgBtn, closeBtn);
   box.appendChild(btnRow);
 
+  renderCurrent();
   overlay.appendChild(box);
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
   document.body.appendChild(overlay);
 }
+
 function showSeqLogoOptionsModal(tabState, onGenerate) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -3000,12 +4723,14 @@ function showSeqLogoOptionsModal(tabState, onGenerate) {
   execBtn.textContent = "Generate";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
-    const characterWidth = Number(widthInput.value) || 30;
-    const workingHeight = Number(heightInput.value) || 400;
-    const fontFamily = fontInput.value.trim() || "Consolas, monospace";
-    const useError = errCheck.checked;
-    overlay.remove();
-    onGenerate({ characterWidth, workingHeight, fontFamily, useError });
+    runWithLoading(execBtn, () => {
+      const characterWidth = Number(widthInput.value) || 30;
+      const workingHeight = Number(heightInput.value) || 400;
+      const fontFamily = fontInput.value.trim() || "Consolas, monospace";
+      const useError = errCheck.checked;
+      overlay.remove();
+      onGenerate({ characterWidth, workingHeight, fontFamily, useError });
+    });
   });
   box.appendChild(execBtn);
 
@@ -3015,6 +4740,101 @@ function showSeqLogoOptionsModal(tabState, onGenerate) {
   });
   document.body.appendChild(overlay);
 }
+
+//  Sequence logo SVG export
+function svgEscapeText(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// vector twin of the canvas logo: same geometry, same per-glyph ink-box scaling
+function buildSeqLogoSvg(tabState, colCount, opts) {
+  const { characterWidth, workingHeight, fontFamily, useError, colOffset = 0 } = opts;
+  const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
+  const alphabetKeys = alphaList.filter((e) => !e.degenerate).map((e) => e.code);
+  const alphabetSize = alphabetKeys.length;
+  const colorMap = {};
+  alphaList.forEach((entry) => {
+    const rgb = tabState.colors[tabState.alphabet][entry.code] || hexToRgbFloat(entry.hex);
+    colorMap[entry.code] = rgbFloatToHex(rgb);
+  });
+  const seqs = tabState.records.map((r) => r.seq.toUpperCase());
+  const geom = { ORIGINX: 45, ORIGINY: 15, AXISWIDTH: 2, characterWidth, workingHeight };
+  const width = geom.ORIGINX + colCount * characterWidth + 60;
+  const height = geom.ORIGINY + workingHeight + 100;
+  const maxBits = Math.max(1, Math.ceil(Math.log2(alphabetSize)));
+  const maxInfo = Math.log2(alphabetSize);
+  const actualWorkingHeight = (maxInfo / Math.ceil(maxInfo)) * workingHeight;
+  const f2 = (n) => Math.round(n * 100) / 100;
+  const font = svgEscapeText(fontFamily);
+
+  const out = [];
+  out.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`
+  );
+  out.push(`<rect x="0" y="0" width="${width}" height="${height}" fill="#FFFFFF"/>`);
+
+  const axis = (x, y, w, h) =>
+    out.push(`<rect x="${f2(x)}" y="${f2(y)}" width="${f2(w)}" height="${f2(h)}" fill="#000000"/>`);
+  const label = (s, x, y, anchor, baseline) =>
+    out.push(
+      `<text x="${f2(x)}" y="${f2(y)}" fill="#000000" font-family="${font}" font-size="12" font-weight="bold" text-anchor="${anchor}" dominant-baseline="${baseline || "central"}">${svgEscapeText(s)}</text>`
+    );
+
+  // axes (mirrors drawLogoAxes)
+  axis(geom.ORIGINX - geom.AXISWIDTH, geom.ORIGINY, geom.AXISWIDTH, geom.workingHeight + geom.AXISWIDTH);
+  axis(
+    geom.ORIGINX - geom.AXISWIDTH,
+    geom.ORIGINY + geom.workingHeight,
+    characterWidth * colCount + geom.AXISWIDTH,
+    geom.AXISWIDTH
+  );
+  for (let k = 0; k <= maxBits; k++) {
+    const ypos = (1 - k / maxBits) * workingHeight + geom.ORIGINY;
+    axis(geom.ORIGINX - 2 * geom.AXISWIDTH, ypos, geom.AXISWIDTH, geom.AXISWIDTH);
+    label(String(maxBits - k), geom.ORIGINX - 2 * geom.AXISWIDTH - 4, ypos, "end");
+  }
+  const bitsX = geom.ORIGINX - 26;
+  const bitsY = geom.ORIGINY + workingHeight / 2;
+  out.push(
+    `<text x="${f2(bitsX)}" y="${f2(bitsY)}" fill="#000000" font-family="${font}" font-size="12" font-weight="bold" text-anchor="middle" dominant-baseline="central" transform="rotate(-90 ${f2(bitsX)} ${f2(bitsY)})">bits</text>`
+  );
+  const xlabY = geom.ORIGINY + workingHeight + geom.AXISWIDTH + 4;
+  for (let k = 1; k <= colCount; k++) {
+    label(String(k), geom.ORIGINX + (k - 1) * characterWidth + characterWidth / 2, xlabY, "middle", "hanging");
+  }
+
+  // columns (mirrors drawLogoColumn, with the glyph's measured ink box mapped
+  // onto the cell — the same squeeze/stretch as drawScaledGlyph, but vector)
+  for (let index = 0; index < colCount; index++) {
+    const column = [];
+    for (const seq of seqs) column.push(seq[index + colOffset] || "-");
+    const { freq, infoContent } = computeColumnLogoInfo(column, alphabetKeys, alphabetSize, useError);
+    const columnWorkingHeight = maxInfo > 0 ? (infoContent / maxInfo) * actualWorkingHeight : 0;
+    const entries = alphabetKeys
+      .map((ch) => ({ ch, height: freq[ch] * columnWorkingHeight }))
+      .filter((e) => e.height > 0.05)
+      .sort((a, b) => a.height - b.height);
+    const xval = geom.ORIGINX + characterWidth * index;
+    let yval = geom.ORIGINY + workingHeight;
+    for (const e of entries) {
+      yval -= e.height;
+      const glyph = getGlyphBitmap(e.ch, fontFamily, "FFFFFF"); // shared key: color is irrelevant to the ink box
+      if (!glyph) continue;
+      const bbox = glyph.bbox || glyph.box;
+      const ix = bbox.x - GLYPH_BASELINE_X; // ink offset from the glyph origin, in 100px-font units
+      const iy = bbox.y - GLYPH_BASELINE_Y;
+      const sx = characterWidth / bbox.width;
+      const sy = e.height / bbox.height;
+      const color = colorMap[e.ch];
+      out.push(
+        `<text x="0" y="0" fill="${color}" font-family="${font}" font-weight="900" font-size="100" transform="translate(${f2(xval - ix * sx)} ${f2(yval - iy * sy)}) scale(${f2(sx)} ${f2(sy)})">${svgEscapeText(e.ch)}</text>`
+      );
+    }
+  }
+  out.push(`</svg>`);
+  return out.join("\n");
+}
+
 function showSequenceLogoWindow(tabState, colCount, opts) {
   const { characterWidth, workingHeight, fontFamily, useError, colOffset = 0 } = opts;
   const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
@@ -3084,11 +4904,24 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
       URL.revokeObjectURL(url);
     }, "image/png");
   });
+  const svgBtn = document.createElement("button");
+  svgBtn.textContent = "Save as SVG";
+  svgBtn.className = "modal-close-btn";
+  svgBtn.addEventListener("click", () => {
+    const svg = buildSeqLogoSvg(tabState, colCount, opts);
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "seqlogo.svg";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  });
   const closeBtn = document.createElement("button");
   closeBtn.textContent = "Close";
   closeBtn.className = "modal-close-btn";
   closeBtn.addEventListener("click", () => overlay.remove());
-  btnRow.append(saveBtn, closeBtn);
+  btnRow.append(saveBtn, svgBtn, closeBtn);
   box.appendChild(btnRow);
 
   overlay.appendChild(box);
@@ -3098,12 +4931,178 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
   document.body.appendChild(overlay);
 }
 
+//  Clustal X shading
+// Rules per https://www.jalview.org/help/html/colourSchemes/clustal.html
+// clause = { t: threshold %, group: residue letters, any: false → group combined, true → any single letter }
+const CLUSTALX_RULES = (() => {
+  const BLUE = { rgb: hexToRgbFloat("#80A0F0") };
+  const RED = { rgb: hexToRgbFloat("#F01505") };
+  const MAGENTA = { rgb: hexToRgbFloat("#C048C0") };
+  const GREEN = { rgb: hexToRgbFloat("#15C015") };
+  const PINK = { rgb: hexToRgbFloat("#F08080") };
+  const ORANGE = { rgb: hexToRgbFloat("#F09048") };
+  const YELLOW = { rgb: hexToRgbFloat("#C0C000") };
+  const CYAN = { rgb: hexToRgbFloat("#15A4A4") };
+  const rule = (rgb, clauses) => [{ rgb: rgb.rgb, clauses }];
+  const HYDRO = rule(BLUE, [{ t: 60, group: "WLVIMAFCYHP", any: false }]);
+  const POS = rule(RED, [
+    { t: 60, group: "KR", any: false },
+    { t: 85, group: "KRQ", any: true }
+  ]);
+  const E_RULE = rule(MAGENTA, [
+    { t: 60, group: "KR", any: false },
+    { t: 50, group: "QE", any: false },
+    { t: 50, group: "ED", any: false },
+    { t: 85, group: "EQD", any: true }
+  ]);
+  const D_RULE = rule(MAGENTA, [
+    { t: 60, group: "KR", any: false },
+    { t: 85, group: "DEN", any: true },
+    { t: 50, group: "ED", any: false }
+  ]);
+  const N_RULE = rule(GREEN, [
+    { t: 50, group: "N", any: false },
+    { t: 85, group: "ND", any: true }
+  ]);
+  const Q_RULE = rule(GREEN, [
+    { t: 60, group: "KR", any: false },
+    { t: 50, group: "QE", any: false },
+    { t: 85, group: "QTKR", any: true }
+  ]);
+  const ST_RULE = rule(GREEN, [
+    { t: 60, group: "WLVIMAFCYHP", any: false },
+    { t: 50, group: "TS", any: false },
+    { t: 85, group: "ST", any: true }
+  ]);
+  const C_RULE = [
+    { rgb: PINK.rgb, clauses: [{ t: 85, group: "C", any: false }] }, // cysteine pink wins over hydrophobic blue
+    { rgb: BLUE.rgb, clauses: [{ t: 60, group: "WLVIMAFCYHP", any: false }] }
+  ];
+  const G_RULE = rule(ORANGE, [{ t: 0, group: "G", any: false }]);
+  const P_RULE = rule(YELLOW, [{ t: 0, group: "P", any: false }]);
+  const HY_RULE = rule(CYAN, [
+    { t: 60, group: "WLVIMAFCYHP", any: false },
+    { t: 85, group: "WYACPQFHILMV", any: true }
+  ]);
+  return {
+    A: HYDRO,
+    I: HYDRO,
+    L: HYDRO,
+    M: HYDRO,
+    F: HYDRO,
+    W: HYDRO,
+    V: HYDRO,
+    C: C_RULE,
+    K: POS,
+    R: POS,
+    E: E_RULE,
+    D: D_RULE,
+    N: N_RULE,
+    Q: Q_RULE,
+    S: ST_RULE,
+    T: ST_RULE,
+    G: G_RULE,
+    P: P_RULE,
+    H: HY_RULE,
+    Y: HY_RULE
+  };
+})();
+
+function clustalClausePass(counts, clause, rows) {
+  if (rows === 0) return false;
+  if (clause.any) {
+    for (const ch of clause.group) {
+      if ((100 * (counts[ch] || 0)) / rows > clause.t) return true;
+    }
+    return false;
+  }
+  let sum = 0;
+  for (const ch of clause.group) sum += counts[ch] || 0;
+  return (100 * sum) / rows > clause.t;
+}
+
+function computeClustalXColumnColor(tabState, col) {
+  const records = tabState.records;
+  const rows = records.length;
+  const white = [1, 1, 1];
+  const counts = {};
+  for (let r = 0; r < rows; r++) {
+    const seq = records[r].seq;
+    const ch = col < seq.length ? seq[col].toUpperCase() : "-";
+    counts[ch] = (counts[ch] || 0) + 1;
+  }
+  const colColors = {};
+  for (const char in CLUSTALX_RULES) {
+    let color = white;
+    for (const rule of CLUSTALX_RULES[char]) {
+      if (rule.clauses.some((cl) => clustalClausePass(counts, cl, rows))) {
+        color = rule.rgb;
+        break; // first matching rule wins (rule order = priority)
+      }
+    }
+    colColors[char] = color;
+    const lower = char.toLowerCase();
+    if (lower !== char) colColors[lower] = color;
+  }
+  return colColors;
+}
+
+function computeClustalXShadeColor(tabState, col, ch) {
+  let cache = tabState.clustalXColors;
+  if (!cache || !cache.cols) cache = tabState.clustalXColors = { cols: {} };
+  let colMap = cache.cols[col];
+  if (!colMap) colMap = cache.cols[col] = computeClustalXColumnColor(tabState, col);
+  return colMap[ch] || [1, 1, 1];
+}
+
+//  Clustal consensus
+// ClustalW conservation groups: '*' identity, ':' strong, '.' weak
+const CLUSTAL_STRONG_GROUPS = ["STA", "NEQK", "NHQK", "NDEQ", "QHRK", "MILV", "MILF", "HY", "FYW"];
+const CLUSTAL_WEAK_GROUPS = ["CSA", "ATV", "SAG", "STNK", "STPA", "SGND", "SNDEQK", "NDEQHK", "NEQHRK", "FVLIM", "HFY"];
+const CLUSTAL_GROUP_THRESHOLD = 0.5; // fraction of the column a group must cover
+
+function computeClustalConsensus(tabState, colCount) {
+  const records = tabState.records;
+  const rows = records.length;
+  const result = [];
+  for (let c = 0; c < colCount; c++) {
+    if (rows === 0) {
+      result.push(" ");
+      continue;
+    }
+    const counts = {};
+    for (let r = 0; r < rows; r++) {
+      const seq = records[r].seq;
+      const ch = c < seq.length ? seq[c].toUpperCase() : "-";
+      if (ch !== "-" && ch !== ".") counts[ch] = (counts[ch] || 0) + 1;
+    }
+    const chars = Object.keys(counts);
+    let symbol = " ";
+    if (chars.length === 1 && counts[chars[0]] === rows) {
+      symbol = "*";
+    } else {
+      const groupCover = (groups) =>
+        groups.some((g) => {
+          let sum = 0;
+          for (const ch of g) sum += counts[ch] || 0;
+          return sum / rows > CLUSTAL_GROUP_THRESHOLD;
+        });
+      if (groupCover(CLUSTAL_STRONG_GROUPS)) symbol = ":";
+      else if (groupCover(CLUSTAL_WEAK_GROUPS)) symbol = ".";
+    }
+    result.push(symbol);
+  }
+  return result;
+}
+
 function computeShadeColorForMode(tabState, mode, row, col, ch) {
   switch (mode) {
     case "frequency": {
       const hit = computeFrequencyShadeColor(tabState, row, col, ch);
       return hit || [1, 1, 1];
     }
+    case "clustalx":
+      return computeClustalXShadeColor(tabState, col, ch);
     case "unique":
       return computeUniqueShadeColor(tabState, col, ch);
     case "matrix":
@@ -3126,6 +5125,7 @@ function computeShadeColorForMode(tabState, mode, row, col, ch) {
 }
 
 function getShadeColor(tabState, row, col, ch) {
+  if (tabState.shadeCleared) return [1, 1, 1];
   return computeShadeColorForMode(tabState, tabState.shadeMode, row, col, ch);
 }
 
@@ -3157,6 +5157,11 @@ function showRegexShadeModal(tabState, ctx) {
     patternInput.value = pattern;
     patternInput.style.flex = "1";
     patternInput.placeholder = "e.g. RGD|K[ST]C";
+    // editing a field clears a stale invalid tint
+    patternInput.addEventListener("input", () => {
+      patternInput.style.background = "";
+      patternInput.title = "";
+    });
 
     const colorInput = document.createElement("input");
     colorInput.type = "color";
@@ -3192,43 +5197,110 @@ function showRegexShadeModal(tabState, ctx) {
   const execBtn = document.createElement("button");
   execBtn.textContent = "Execute";
   execBtn.className = "modal-close-btn";
-  execBtn.addEventListener("click", () => {
-    cfg.patterns = rowEntries.map((e) => ({
-      pattern: e.patternInput.value,
-      colorHex: e.colorInput.value
-    }));
-    try {
-      computeRegexHits(tabState);
-      errorRow.style.display = "none";
-    } catch (err) {
-      errorRow.textContent = "Invalid regex: " + err.message;
-      errorRow.style.display = "block";
-      return;
-    }
-    if (tabState.shadeMode !== "regex") cfg.baseMode = tabState.shadeMode;
+  execBtn.addEventListener("click", async () => {
+    await runWithLoading(execBtn, async () => {
+      cfg.patterns = rowEntries.map((e) => ({
+        pattern: e.patternInput.value,
+        colorHex: e.colorInput.value
+      }));
 
-    if (!cfg.appliedHits) cfg.appliedHits = [];
-    const revert = cfg.appliedHits.map(({ row, col }) => ({
-      row,
-      col,
-      color: computeShadeColorForMode(
-        tabState,
-        cfg.baseMode || "standard",
-        row,
-        col,
-        tabState.records[row].seq[col] || "-"
-      )
-    }));
-    const newHits = [];
-    cfg.hitsByRow.forEach((colMap, row) => {
-      colMap.forEach((colorHex, col) => newHits.push({ row, col, color: hexToRgbFloat(colorHex) }));
+      // per-row validation: tint invalid patterns and let the valid ones shade
+      let invalidCount = 0;
+      rowEntries.forEach((e) => {
+        const bad = e.patternInput.value.trim() !== "" && !safeCompile(e.patternInput.value);
+        e.patternInput.style.background = bad ? "#ffd6d6" : "";
+        e.patternInput.title = bad ? "Invalid regular expression — skipped" : "";
+        if (bad) invalidCount++;
+      });
+
+      // time-based yield + progress reporter, shared by all three stages below
+      const breathe = async (last, done, total) => {
+        const now = performance.now();
+        if (now - last > 50) {
+          prog.setProgress(done, total);
+          await new Promise((r) => setTimeout(r, 0));
+          return performance.now();
+        }
+        return last;
+      };
+
+      const prog = showProgressOverlay("Searching alignment");
+      try {
+        try {
+          await computeRegexHits(tabState, (done, total) => prog.setProgress(done, total));
+        } catch (err) {
+          // defensive: unreachable once computeRegexHits has the per-pattern try/catch
+          errorRow.textContent = "Invalid regex: " + err.message;
+          errorRow.style.display = "block";
+          return; // the finally below still closes the overlay
+        }
+
+        if (invalidCount) {
+          errorRow.textContent = `${invalidCount} invalid pattern${invalidCount > 1 ? "s were" : " was"} skipped.`;
+          errorRow.style.display = "block";
+        } else {
+          errorRow.style.display = "none";
+        }
+
+        // sanity gate: a multi-million-cell hit set is usually a too-loose pattern,
+        // and painting it costs real time even chunked — let the user opt out
+        let totalHits = 0;
+        cfg.hitsByRow.forEach((m) => (totalHits += m.size));
+        if (totalHits > 3000000) {
+          const ok = confirm(
+            `These patterns match ${totalHits.toLocaleString()} cells. Painting that many overrides can take a while. Continue?`
+          );
+          if (!ok) return; // finally closes the overlay; previous shading is untouched
+        }
+
+        // Stage 2: revert the previous run's cells, in yielded batches.
+        // (the old `const revert = cfg.appliedHits.map(...)` was computed and never
+        // used — dead code, dropped here)
+        const prev = cfg.appliedHits || [];
+        let last = performance.now();
+        let revertBatch = [];
+        for (let i = 0; i < prev.length; i++) {
+          const { row, col } = prev[i];
+          const rec = tabState.records[row];
+          if (recordColorAt(rec, col) !== undefined) {
+            clearRecordColor(rec, col);
+            revertBatch.push({ row, col, color: getShadeColor(tabState, row, col, rec.seq[col] || "-") });
+          }
+          if (revertBatch.length >= 65536) {
+            ctx.applyColorOverrides(revertBatch);
+            revertBatch = [];
+          }
+          last = await breathe(last, i + 1, prev.length);
+        }
+        if (revertBatch.length) ctx.applyColorOverrides(revertBatch);
+
+        // Stage 3: paint the new hits, in yielded batches
+        const newHits = [];
+        let pending = [];
+        const rows = cfg.hitsByRow;
+        last = performance.now();
+        for (let r = 0; r < rows.length; r++) {
+          const rec = tabState.records[r];
+          rows[r].forEach((colorHex, col) => {
+            const hex = "#" + colorHex.replace("#", "");
+            setRecordColor(rec, col, hex);
+            const hit = { row: r, col, color: hexToRgbFloat(hex) };
+            newHits.push(hit);
+            pending.push(hit);
+          });
+          if (pending.length >= 65536) {
+            ctx.applyColorOverrides(pending);
+            pending = [];
+          }
+          last = await breathe(last, r + 1, rows.length);
+        }
+        if (pending.length) ctx.applyColorOverrides(pending);
+        cfg.appliedHits = newHits;
+      } finally {
+        prog.close(); // the overlay now survives all three stages and always closes
+      }
     });
-
-    ctx.applyColorOverrides([...revert, ...newHits]);
-    cfg.appliedHits = newHits;
-    tabState.shadeMode = "regex";
   });
-
   btnRow.append(addBtn, execBtn);
   box.appendChild(btnRow);
 
@@ -3239,7 +5311,7 @@ function showRegexShadeModal(tabState, ctx) {
   document.body.appendChild(overlay);
 }
 
-// ---------- Block shading modal ----------
+//  Block shading modal
 function showBlockShadingModal(lo, hi, sections, onClose) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -3315,7 +5387,91 @@ function showBlockShadingModal(lo, hi, sections, onClose) {
   document.body.appendChild(overlay);
 }
 
-// ---------- ScanProsite confirmation modal ----------
+// luminance warning acknowledgment: one per page load, shared by all tabs (not persisted)
+let luminanceAcked = false;
+
+//  Luminance warning modal
+function showLuminanceWarningModal(onProceed) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Luminance setting</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.innerHTML = `Don't change the default luminance unless you know what you're doing. To learn about the setting, see the <a href="https://slimshadey-manual.adsbio.net" target="_blank" rel="noopener noreferrer" style="color:#7db4ff;">manual</a>. Proceed to change?`;
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const proceedBtn = document.createElement("button");
+  proceedBtn.textContent = "Proceed";
+  proceedBtn.className = "modal-close-btn";
+  proceedBtn.addEventListener("click", () => {
+    overlay.remove();
+    onProceed();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.className = "modal-close-btn";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(proceedBtn, cancelBtn);
+  box.appendChild(btnRow);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+  });
+  document.body.appendChild(overlay);
+}
+
+//  Unaligned input warning modal
+function showUnalignedWarningModal(onProceed) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Unequal sequence lengths</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent =
+    "Your sequences are of unequal length and likely unaligned. Proceeding will pad the ends of sequences with gap characters to ensure uniform length.";
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const proceedBtn = document.createElement("button");
+  proceedBtn.textContent = "Proceed";
+  proceedBtn.className = "modal-close-btn";
+  proceedBtn.addEventListener("click", () => {
+    runWithLoading(proceedBtn, () => {
+      onProceed(); // pad + createTab run while the button shows "Loading..."
+      overlay.remove();
+    });
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.className = "modal-close-btn";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(proceedBtn, cancelBtn);
+  box.appendChild(btnRow);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+  });
+  document.body.appendChild(overlay);
+}
+
+//  ScanProsite confirmation modal
 function showScanPrositeConfirmModal(onContinue) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -3345,7 +5501,7 @@ function showScanPrositeConfirmModal(onContinue) {
   document.body.appendChild(overlay);
 }
 
-// ---------- Annotate selection modal ----------
+//  Annotate selection modal
 function showAnnotateSelectionModal(tabState, lo, hi, onApply, onClose) {
   const allowableLength = hi - lo + 1;
   const overlay = document.createElement("div");
@@ -3435,12 +5591,14 @@ function showAnnotateSelectionModal(tabState, lo, hi, onApply, onClose) {
   execBtn.textContent = "Annotate";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
-    const checked = procRow.querySelector(`input[name="${radioName}"]:checked`);
-    const procedure = checked ? checked.value : "right";
-    rowEntries.forEach(({ ann, input }) => annotate(ann, input.value, procedure));
-    onApply();
-    overlay.remove();
-    if (onClose) onClose();
+    runWithLoading(execBtn, () => {
+      const checked = procRow.querySelector(`input[name="${radioName}"]:checked`);
+      const procedure = checked ? checked.value : "right";
+      rowEntries.forEach(({ ann, input }) => annotate(ann, input.value, procedure));
+      onApply();
+      overlay.remove();
+      if (onClose) onClose();
+    });
   });
   box.appendChild(execBtn);
 
@@ -3459,40 +5617,26 @@ function showConsensusOptionsModal(tabState, onGenerate) {
   overlay.className = "modal-overlay";
   const box = document.createElement("div");
   box.className = "modal-box shade-modal";
-  box.innerHTML = `<h3>Consensus options</h3><div class="shade-row" style="color:#999;">Consensus types:</div>`;
-
   const radioName = `consensusmode_${Math.random().toString(36).slice(2)}`;
-  const optionsRow = document.createElement("div");
-  optionsRow.className = "shade-row";
-  optionsRow.style.flexDirection = "column";
-  optionsRow.style.alignItems = "flex-start";
-
-  const simpleWrap = document.createElement("div");
-  const simpleRadio = document.createElement("input");
-  simpleRadio.type = "radio";
-  simpleRadio.name = radioName;
-  simpleRadio.checked = true;
-  const simpleLabel = document.createElement("label");
-  simpleLabel.textContent = " Simple (default)";
-  simpleWrap.append(simpleRadio, simpleLabel);
-
-  const dotsWrap = document.createElement("div");
-  const dotsRadio = document.createElement("input");
-  dotsRadio.type = "radio";
-  dotsRadio.name = radioName;
-  const dotsLabel = document.createElement("label");
-  dotsLabel.textContent = " Dots and identity";
-  dotsWrap.append(dotsRadio, dotsLabel);
-
-  optionsRow.append(simpleWrap, dotsWrap);
-  box.appendChild(optionsRow);
+  const isNucleotide = tabState.alphabet === "nucleotide";
+  box.innerHTML = `
+    <h3>Consensus options</h3>
+    <div class="shade-row" style="color:#999;">Consensus types:</div>
+    <div class="shade-row" style="flex-direction:column; align-items:flex-start;">
+      <div><label><input type="radio" name="${radioName}" value="simple" checked> Simple (default)</label></div>
+      <div><label><input type="radio" name="${radioName}" value="dots"> Dots and identity</label></div>
+      <div><label style="${isNucleotide ? "color:#666;" : ""}"><input type="radio" name="${radioName}" value="clustal" ${isNucleotide ? "disabled" : ""}> Clustal (* : .)</label></div>
+    </div>`;
 
   const execBtn = document.createElement("button");
   execBtn.textContent = "Generate consensus";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
-    onGenerate(dotsRadio.checked ? "dots" : "simple");
-    overlay.remove();
+    runWithLoading(execBtn, () => {
+      const checked = box.querySelector(`input[name="${radioName}"]:checked`);
+      onGenerate(checked ? checked.value : "simple");
+      overlay.remove();
+    });
   });
   box.appendChild(execBtn);
 
@@ -3502,8 +5646,44 @@ function showConsensusOptionsModal(tabState, onGenerate) {
   });
   document.body.appendChild(overlay);
 }
+// Consensus computation ~ allocation-free counting (charCodeAt + typed array
+// instead of a Map + toUpperCase per cell). Runs ONCE per column ever, via the
+// memoized accessor below; panning recomputes nothing.
+function computeConsensusColumn(records, col) {
+  const counts = new Int32Array(256); // ASCII char codes; alignments are ASCII in practice
+  for (let i = 0; i < records.length; i++) {
+    const seq = records[i].seq;
+    let code = col < seq.length ? seq.charCodeAt(col) : 45; // 45 = "-"
+    if (code >= 97 && code <= 122) code -= 32; // uppercase a-z (what toUpperCase did)
+    if (code < 256) counts[code]++;
+  }
+  let bestCode = 45,
+    bestCount = -1;
+  for (let c = 0; c < 256; c++) {
+    if (counts[c] > bestCount) {
+      bestCount = counts[c];
+      bestCode = c;
+    }
+  }
+  return String.fromCharCode(bestCode);
+}
 
-// ---------- Consensus computation ----------
+// Memoized per-column consensus: computed once per column, cached on the tab,
+// invalidated per-column on cell edits and wholesale on import/column deletion.
+function consensusCharAt(tabState, col) {
+  let cache = tabState.consensusCols;
+  if (!cache) cache = tabState.consensusCols = [];
+  let ch = cache[col];
+  if (ch === undefined) {
+    ch = computeConsensusColumn(tabState.records, col);
+    // V8's fast-elements backing store dies near 2^27 entries (Chrome-specific;
+    // spec allows 2^32-1). Stay far under: beyond this, recompute instead of cache —
+    // sweeps never revisit columns, so nothing of value is lost.
+    if (col < 1 << 26) cache[col] = ch;
+  }
+  return ch;
+}
+
 function computeConsensus(records, colCount) {
   let result = "";
   for (let c = 0; c < colCount; c++) {
@@ -3731,7 +5911,73 @@ function drawLogoAxes(ctx, maxBits, len, geom, fontFamily) {
   }
 }
 
-// ---------- On-demand render scheduler ----------
+//  Freeze watchdog
+// Detects main-thread stalls ("the page froze") by measuring gaps between timer
+// ticks, and on Chromium also watches JS heap usage. The warning shows when the
+// page recovers, with a cooldown so it can't spam.
+const FREEZE_CHECK_MS = 1000; // tick interval
+const FREEZE_STALL_MS = 3000; // extra elapsed time beyond one tick that counts as a freeze
+const FREEZE_COOLDOWN_MS = 30000; // minimum time between warnings
+const HEAP_WARN_FRACTION = 0.9; // warn when JS heap exceeds 90% of the tab limit (Chromium only)
+let freezeLastBeat = performance.now();
+let freezeLastWarnAt = 0;
+
+function showFreezeWarningModal() {
+  if (document.getElementById("freeze-warning-overlay")) return; // already showing
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.id = "freeze-warning-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Performance warning</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent =
+    "You are quickly approaching the memory limits of this browser tab. Consider modifying your workflow.";
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+  const okBtn = document.createElement("button");
+  okBtn.textContent = "OK";
+  okBtn.className = "modal-close-btn";
+  okBtn.addEventListener("click", () => overlay.remove());
+  btnRow.appendChild(okBtn);
+  box.appendChild(btnRow);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+function freezeWatchdogTick() {
+  const now = performance.now();
+  const gap = now - freezeLastBeat;
+  freezeLastBeat = now;
+  if (document.hidden) return; // background-tab timer throttling isn't a freeze
+
+  let triggered = gap > FREEZE_CHECK_MS + FREEZE_STALL_MS;
+  if (!triggered && performance.memory) {
+    const m = performance.memory;
+    if (m.jsHeapSizeLimit > 0 && m.usedJSHeapSize / m.jsHeapSizeLimit > HEAP_WARN_FRACTION) triggered = true;
+  }
+  if (triggered && now - freezeLastWarnAt > FREEZE_COOLDOWN_MS) {
+    freezeLastWarnAt = now;
+    showFreezeWarningModal();
+  }
+}
+
+//setInterval(freezeWatchdogTick, FREEZE_CHECK_MS);
+
+// streamed-download service worker: powers .crswap-free exports
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {}); // preview iframes may refuse; exports fall back
+}
+
+//  On-demand render scheduler
 // Renderers never self-loop. They register a redraw via requestRender();
 // one shared rAF tick drains everything that went dirty this frame.
 const _dirtyRenderers = new Set();
@@ -3748,7 +5994,7 @@ function requestRender(renderFn) {
   });
 }
 
-// ---------- Simple fixed-row track renderer (annotation / numbering / consensus) ----------
+//  Simple fixed-row track renderer (annotation / numbering / consensus)
 function initTrackRenderer(canvas, wrapperEl, config) {
   const dpr = window.devicePixelRatio || 1;
   let { w: CELL_W, h: CELL_H } = config.getCellDims();
@@ -3764,41 +6010,126 @@ function initTrackRenderer(canvas, wrapperEl, config) {
 
   const gl = canvas.getContext("webgl2");
   if (!gl) {
-    alert("WebGL2 not supported");
+    if (!webglAlertShown) {
+      webglAlertShown = true;
+      alert("WebGL2 not supported");
+    }
     return {
       onScroll() {},
       onResize() {},
       rebuildBuffer() {},
       onRowCountChanged() {},
+      applyColorOverrides() {},
       setCellSize() {},
       setLuminance() {},
       setHoverCol() {},
-      setSelection() {}
+      setSelection() {},
+      suspend() {},
+      resume() {}
     };
   }
-
-  const { prog, vao, atlasTex, instBuf, uni } = compileMsaProgram(gl);
-  gl.useProgram(prog);
-  gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
-  gl.uniform2f(uni.scroll, 0, 0);
-  gl.uniform2f(uni.res, canvas.width, canvas.height);
-  gl.uniform1f(uni.luminance, config.getLuminance());
 
   let instData = null;
   let instanceCount = 0;
   let currentScrollX = 0;
   let hoveredKey = -1;
+  let prog, vao, atlasTex, instBuf, uni;
+  let glSuspended = false;
+  const loseExt = gl.getExtension("WEBGL_lose_context");
 
-  function rebuild() {
+  // full GL object (re)creation — runs on init and after every context restore
+  function setupGL() {
+    const compiled = compileMsaProgram(gl);
+    prog = compiled.prog;
+    vao = compiled.vao;
+    atlasTex = compiled.atlasTex;
+    instBuf = compiled.instBuf;
+    uni = compiled.uni;
+    gl.useProgram(prog);
+    gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
+    gl.uniform2f(uni.scroll, 0, 0); // window-relative; rebuildWindow() sets the real value
+    gl.uniform2f(uni.res, canvas.width, canvas.height);
+    gl.uniform1f(uni.luminance, config.getLuminance());
+  }
+  setupGL();
+
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault(); // required, or the context can never be restored
+    glSuspended = true;
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    hoveredKey = -1;
+    setupGL();
+    //rebuild(); // re-uploads instance data and schedules a redraw
+    rebuildWindow();
+    glSuspended = false;
+  });
+
+  // horizontal window: only the visible columns (plus margin) live in the buffer
+  let winColStart = 0,
+    winCols = 0;
+
+  function viewCols() {
+    return Math.ceil(canvas.width / (CELL_W * dpr)) + 1;
+  }
+
+  function setScrollUniform() {
+    gl.useProgram(prog);
+    gl.uniform2f(uni.scroll, currentScrollX - winColStart * CELL_W * dpr, 0);
+  }
+
+  let hoverColAbs = -1,
+    hoverCellColAbs = -1,
+    selLoAbs = -1,
+    selHiAbs = -1;
+
+  function setHighlightUniforms() {
+    gl.useProgram(prog);
+    gl.uniform1f(uni.hoverCol, hoverColAbs < 0 ? -1 : hoverColAbs - winColStart);
+    gl.uniform1f(uni.hoverCellCol, hoverCellColAbs < 0 ? -1 : hoverCellColAbs - winColStart);
+    gl.uniform1f(uni.selStart, selLoAbs < 0 ? -1 : selLoAbs - winColStart);
+    gl.uniform1f(uni.selEnd, selHiAbs < 0 ? -1 : selHiAbs - winColStart);
+  }
+
+  function rebuildWindow() {
     const rowCount = config.getRowCount();
     const colCount = config.getColCount();
-    instanceCount = rowCount * colCount;
-    instData = buildInstanceArray(rowCount, colCount, config.cellForFn);
+    const view = viewCols();
+    const firstCol = Math.max(0, Math.floor(currentScrollX / (CELL_W * dpr)));
+    const cs = Math.max(0, firstCol - view);
+    const ce = Math.min(colCount, firstCol + 2 * view);
+    winColStart = cs;
+    winCols = Math.max(0, ce - cs);
+    instanceCount = rowCount * winCols;
+    instData = new Float32Array(instanceCount * 6);
+    let idx = 0;
+    for (let r = 0; r < rowCount; r++) {
+      for (let c = cs; c < ce; c++) {
+        const { ch, color } = config.cellForFn(r, c);
+        instData.set([c - cs, r, color[0], color[1], color[2], glyphIndexFor(ch)], idx * 6);
+        idx++;
+      }
+    }
     gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
     gl.bufferData(gl.ARRAY_BUFFER, instData, gl.DYNAMIC_DRAW);
+    gl.useProgram(prog);
+    gl.uniform2f(uni.windowOrigin, winColStart, 0);
+    setScrollUniform();
+    setHighlightUniforms();
     markDirty();
   }
-  rebuild();
+
+  function windowNeedsRebuild() {
+    const colCount = config.getColCount();
+    const view = viewCols();
+    const firstCol = Math.max(0, Math.floor(currentScrollX / (CELL_W * dpr)));
+    const lastCol = Math.min(colCount, firstCol + view);
+    const half = view / 2;
+    if (winColStart > 0 && firstCol < winColStart + half) return true;
+    if (winColStart + winCols < colCount && lastCol > winColStart + winCols - half) return true;
+    return false;
+  }
+  rebuildWindow();
 
   function pick(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
@@ -3829,7 +6160,8 @@ function initTrackRenderer(canvas, wrapperEl, config) {
     if (newKey !== hoveredKey) {
       hoveredKey = newKey;
       gl.useProgram(prog);
-      gl.uniform1f(uni.hoverCellCol, cell ? cell.col : -1);
+      hoverCellColAbs = cell ? cell.col : -1;
+      gl.uniform1f(uni.hoverCellCol, hoverCellColAbs < 0 ? -1 : hoverCellColAbs - winColStart);
       gl.uniform1f(uni.hoverCellRow, cell ? cell.row : -1);
       markDirty();
     }
@@ -3842,12 +6174,14 @@ function initTrackRenderer(canvas, wrapperEl, config) {
       gl.useProgram(prog);
       gl.uniform1f(uni.hoverCellCol, -1);
       gl.uniform1f(uni.hoverCellRow, -1);
+      hoverCellColAbs = -1;
       markDirty();
     }
     if (config.onHoverEnd) config.onHoverEnd();
   });
 
   function render() {
+    if (glSuspended) return;
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(0.07, 0.07, 0.07, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -3864,32 +6198,38 @@ function initTrackRenderer(canvas, wrapperEl, config) {
 
   return {
     onScroll(scrollLeft) {
-      currentScrollX = scrollLeft * dpr;
-      gl.useProgram(prog);
-      gl.uniform2f(uni.scroll, currentScrollX, 0);
-      markDirty();
+      currentScrollX = scrollLeft * dpr; // keep your existing assignment line as-is
+      if (windowNeedsRebuild())
+        rebuildWindow(); // sets the scroll uniform and marks dirty
+      else {
+        setScrollUniform();
+        markDirty();
+      }
     },
     onResize() {
       sizeCanvas();
       gl.useProgram(prog);
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      markDirty();
+      // viewport outgrew the buffered window (same gate onScroll uses)
+      if (windowNeedsRebuild()) rebuildWindow();
+      else {
+        setScrollUniform();
+        markDirty();
+      }
     },
     rebuildBuffer() {
-      rebuild();
-      markDirty();
+      rebuildWindow();
     },
     onRowCountChanged() {
       sizeCanvas();
-      rebuild();
+      rebuildWindow();
       gl.useProgram(prog);
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      markDirty();
     },
     applyColorOverrides(hitList) {
-      const colCount = config.getColCount();
       hitList.forEach(({ row, col, ch, color }) => {
-        const idx = row * colCount + col;
+        if (col < winColStart || col >= winColStart + winCols) return; // off-window: model already updated; next rebuild picks it up
+        const idx = row * winCols + (col - winColStart);
         if (ch !== undefined) instData[idx * 6 + 5] = glyphIndexFor(ch);
         instData[idx * 6 + 2] = color[0];
         instData[idx * 6 + 3] = color[1];
@@ -3906,7 +6246,13 @@ function initTrackRenderer(canvas, wrapperEl, config) {
       gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
       sizeCanvas();
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      markDirty();
+      // cell data is unchanged by a resize/zoom — only rebuild if the
+      // viewport outgrew the buffered window (same gate onScroll uses)
+      if (windowNeedsRebuild()) rebuildWindow();
+      else {
+        setScrollUniform();
+        markDirty();
+      }
     },
     setLuminance(val) {
       gl.useProgram(prog);
@@ -3914,20 +6260,32 @@ function initTrackRenderer(canvas, wrapperEl, config) {
       markDirty();
     },
     setHoverCol(col) {
+      hoverColAbs = col;
       gl.useProgram(prog);
-      gl.uniform1f(uni.hoverCol, col);
+      gl.uniform1f(uni.hoverCol, col < 0 ? -1 : col - winColStart);
       markDirty();
     },
     setSelection(startCol, endCol) {
+      selLoAbs = startCol;
+      selHiAbs = endCol;
       gl.useProgram(prog);
-      gl.uniform1f(uni.selStart, startCol);
-      gl.uniform1f(uni.selEnd, endCol);
+      gl.uniform1f(uni.selStart, startCol - winColStart);
+      gl.uniform1f(uni.selEnd, endCol - winColStart);
       markDirty();
+    },
+    suspend() {
+      if (glSuspended || !loseExt) return;
+      glSuspended = true;
+      loseExt.loseContext();
+    },
+    resume() {
+      if (!glSuspended || !loseExt) return;
+      loseExt.restoreContext(); // the contextrestored handler rebuilds GL state
     }
   };
 }
 
-// ---------- Alignment (main scrollable) renderer ----------
+//  Alignment (main scrollable) renderer
 function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   const dpr = window.devicePixelRatio || 1;
   let { w: CELL_W, h: CELL_H } = config.getCellDims();
@@ -3935,35 +6293,66 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   let cols = config.getColCount();
 
   function sizeCanvasAndSpacer() {
+    spacer.style.width = cols * CELL_W + "px";
+    spacer.style.height = rows * CELL_H + "px";
     canvas.width = alignPanel.clientWidth * dpr;
     canvas.height = alignPanel.clientHeight * dpr;
     canvas.style.width = alignPanel.clientWidth + "px";
     canvas.style.height = alignPanel.clientHeight + "px";
-    spacer.style.width = `${cols * CELL_W}px`;
-    spacer.style.height = `${rows * CELL_H}px`;
   }
   sizeCanvasAndSpacer();
 
   const gl = canvas.getContext("webgl2");
   if (!gl) {
-    alert("WebGL2 not supported");
+    if (!webglAlertShown) {
+      webglAlertShown = true;
+      alert("WebGL2 not supported");
+    }
     return {
       onScroll() {},
       onResize() {},
       rebuildBuffer() {},
+      applyColorOverrides() {},
       setCellSize() {},
       setLuminance() {},
       setHoverCol() {},
-      setHoverRow() {}
+      setHoverRow() {},
+      clearSelection() {},
+      isSelecting: () => false,
+      suspend() {},
+      resume() {}
     };
   }
 
-  const { prog, vao, atlasTex, instBuf, uni } = compileMsaProgram(gl);
-  gl.useProgram(prog);
-  gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
-  gl.uniform2f(uni.scroll, 0, 0);
-  gl.uniform2f(uni.res, canvas.width, canvas.height);
-  gl.uniform1f(uni.luminance, config.getLuminance());
+  let prog, vao, atlasTex, instBuf, uni;
+  let glSuspended = false;
+  const loseExt = gl.getExtension("WEBGL_lose_context");
+
+  function setupGL() {
+    const compiled = compileMsaProgram(gl);
+    prog = compiled.prog;
+    vao = compiled.vao;
+    atlasTex = compiled.atlasTex;
+    instBuf = compiled.instBuf;
+    uni = compiled.uni;
+    gl.useProgram(prog);
+    gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
+    gl.uniform2f(uni.scroll, 0, 0); // window-relative; rebuildWindow() sets the real value
+    gl.uniform2f(uni.res, canvas.width, canvas.height);
+    gl.uniform1f(uni.luminance, config.getLuminance());
+  }
+
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    glSuspended = true;
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    hoveredKey = -1;
+    setupGL();
+    buildInstanceData(); // rebuilds the windowed buffer from the model
+    if (selStartCol >= 0) updateSelectionUniform();
+    glSuspended = false;
+  });
 
   let instData, instanceCount;
   let currentScrollX = 0,
@@ -3978,7 +6367,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   function cellForFn(r, c) {
     const rec = config.getRecords()[r];
     const ch = rec.seq[c] || "-";
-    const override = rec.charColors && rec.charColors[c];
+    const override = recordColorAt(rec, c);
     const color = override ? hexToRgbFloat(override) : config.getColor(r, c, ch);
     return { ch, color };
   }
@@ -3997,6 +6386,12 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (config.getShadeMode() === "matrix" && config.recomputeMatrixColors) {
       config.recomputeMatrixColors(cols);
     }
+    if (config.getShadeMode() === "clustalx" && config.recomputeClustalXColors) {
+      config.recomputeClustalXColors(cols);
+    }
+    if (config.getShadeMode() === "sequence" && config.recomputeSequenceColors) {
+      config.recomputeSequenceColors();
+    }
     rebuildWindow();
   }
 
@@ -4007,11 +6402,30 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     };
   }
 
+  function setScrollUniform() {
+    gl.useProgram(prog);
+    gl.uniform2f(uni.scroll, currentScrollX - winColStart * CELL_W * dpr, currentScrollY - winRowStart * CELL_H * dpr);
+  }
+
+  let hoverColAbs = -1,
+    hoverCellColAbs = -1,
+    selLoAbs = -1,
+    selHiAbs = -1;
+
+  // column highlight uniforms are window-relative; re-emitted on every window rebuild
+  function setHighlightUniforms() {
+    gl.useProgram(prog);
+    gl.uniform1f(uni.hoverCol, hoverColAbs < 0 ? -1 : hoverColAbs - winColStart);
+    gl.uniform1f(uni.hoverCellCol, hoverCellColAbs < 0 ? -1 : hoverCellColAbs - winColStart);
+    gl.uniform1f(uni.selStart, selLoAbs < 0 ? -1 : selLoAbs - winColStart);
+    gl.uniform1f(uni.selEnd, selHiAbs < 0 ? -1 : selHiAbs - winColStart);
+  }
+
   function rebuildWindow() {
     const view = viewCells();
     // window = viewport + one viewport of margin on each side
-    const firstRow = Math.max(0, Math.floor(currentScrollY / (CELL_H * dpr)));
-    const firstCol = Math.max(0, Math.floor(currentScrollX / (CELL_W * dpr)));
+    const firstRow = Math.min(Math.max(0, rows - 1), Math.max(0, Math.floor(currentScrollY / (CELL_H * dpr))));
+    const firstCol = Math.min(Math.max(0, cols - 1), Math.max(0, Math.floor(currentScrollX / (CELL_W * dpr))));
     const rs = Math.max(0, firstRow - view.rows);
     const re = Math.min(rows, firstRow + 2 * view.rows);
     const cs = Math.max(0, firstCol - view.cols);
@@ -4035,6 +6449,8 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     gl.bufferData(gl.ARRAY_BUFFER, instData, gl.DYNAMIC_DRAW);
     gl.useProgram(prog);
     gl.uniform2f(uni.windowOrigin, winColStart, winRowStart);
+    setScrollUniform();
+    setHighlightUniforms();
     markDirty();
   }
 
@@ -4054,6 +6470,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (winColStart + winCols < cols && lastCol > winColStart + winCols - halfC) return true;
     return false;
   }
+  setupGL();
   buildInstanceData();
 
   function pickCell(clientX, clientY) {
@@ -4075,14 +6492,20 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     gl.useProgram(prog);
     const lo = Math.min(selStartCol, selEndCol);
     const hi = Math.max(selStartCol, selEndCol);
-    gl.uniform1f(uni.selStart, lo);
-    gl.uniform1f(uni.selEnd, hi);
+    selLoAbs = lo;
+    selHiAbs = hi;
+    gl.uniform1f(uni.selStart, lo - winColStart);
+    gl.uniform1f(uni.selEnd, hi - winColStart);
     markDirty();
     if (config.onSelectionChange) config.onSelectionChange(lo, hi);
   }
+
   function clearSelection() {
+    if (selStartCol < 0 && selLoAbs < 0) return; // nothing to clear
     selStartCol = -1;
     selEndCol = -1;
+    selLoAbs = -1;
+    selHiAbs = -1;
     gl.useProgram(prog);
     gl.uniform1f(uni.selStart, -1);
     gl.uniform1f(uni.selEnd, -1);
@@ -4093,6 +6516,8 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   let selStartCol = -1,
     selEndCol = -1,
     colSelecting = false;
+
+  let selClearSuppressUntil = 0; // swallow async autoscroll scroll events delivered after mouseup
 
   const EDGE_ZONE = 30; // px from canvas edge that triggers auto-scroll
   const AUTO_SCROLL_SPEED = 12; // px per tick
@@ -4121,7 +6546,8 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (newKey !== hoveredKey) {
       hoveredKey = newKey;
       gl.useProgram(prog);
-      gl.uniform1f(uni.hoverCellCol, cell ? cell.col : -1);
+      hoverCellColAbs = cell ? cell.col : -1;
+      gl.uniform1f(uni.hoverCellCol, hoverCellColAbs < 0 ? -1 : hoverCellColAbs - winColStart);
       gl.uniform1f(uni.hoverCellRow, cell ? cell.row : -1);
       markDirty();
       if (cell && config.onHover) config.onHover(cell.row, cell.col);
@@ -4134,6 +6560,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       gl.useProgram(prog);
       gl.uniform1f(uni.hoverCellCol, -1);
       gl.uniform1f(uni.hoverCellRow, -1);
+      hoverCellColAbs = -1;
       markDirty();
     }
     if (config.onHoverEnd) config.onHoverEnd();
@@ -4147,10 +6574,10 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     const cellPos = pickCell(e.clientX, e.clientY);
     if (!cellPos) return;
     const record = config.getRecords()[cellPos.row];
-    if (!record.charColors) record.charColors = {};
+    //if (!record.charColors) record.charColors = {};
     const currentChar = record.seq[cellPos.col] || "-";
-    const overrideHex = record.charColors[cellPos.col];
-    const currentColorHex = overrideHex || "#FFFFFF";
+    const overrideHex = recordColorAt(record, cellPos.col);
+    const currentColorHex = overrideHex || rgbFloatToHex(config.getColor(cellPos.row, cellPos.col, currentChar));
     showCellEditPopup(
       e.clientX,
       e.clientY,
@@ -4160,12 +6587,12 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
         let seq = record.seq;
         if (seq.length <= cellPos.col) seq = seq.padEnd(cellPos.col + 1, "-");
         record.seq = seq.substring(0, cellPos.col) + newChar + seq.substring(cellPos.col + 1);
-        record.charColors[cellPos.col] = newColorHex;
+        setRecordColor(record, cellPos.col, newColorHex);
         applyColorOverrides([{ row: cellPos.row, col: cellPos.col, ch: newChar, color: hexToRgbFloat(newColorHex) }]);
         config.onDataChanged(cellPos.col);
       },
       () => {
-        delete record.charColors[cellPos.col];
+        clearRecordColor(record, cellPos.col);
         const ch = record.seq[cellPos.col] || "-";
         applyColorOverrides([
           { row: cellPos.row, col: cellPos.col, ch, color: config.getColor(cellPos.row, cellPos.col, ch) }
@@ -4176,6 +6603,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
 
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("mousedown", (e) => {
+    if (e.button === 0 && selStartCol >= 0) clearSelection();
     if (e.button !== 2) return;
     e.preventDefault();
     closeContextMenu();
@@ -4207,6 +6635,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (e.button !== 2 || !colSelecting) return;
     colSelecting = false;
     stopAutoScroll();
+    selClearSuppressUntil = performance.now() + 150;
     const lo = Math.min(selStartCol, selEndCol),
       hi = Math.max(selStartCol, selEndCol);
     showColumnContextMenu(
@@ -4223,6 +6652,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       (lo2, hi2, onModalClose) => config.onBlockShadeColumns(lo2, hi2, onModalClose),
       (lo2, hi2) => config.onGenerateLogo(lo2, hi2),
       (lo2, hi2) => config.onExportColumns(lo2, hi2),
+      (lo2, hi2) => config.onCopyColumns(lo2, hi2),
       clearSelection
     );
   });
@@ -4308,6 +6738,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (!touchSelActive) return;
     touchSelActive = false;
     stopTouchAutoScroll();
+    selClearSuppressUntil = performance.now() + 150;
     suppressNextClick = true; // a click fires after touchend — don't let it open the cell editor
     const t = e.changedTouches[0];
     const lo = Math.min(selStartCol, selEndCol);
@@ -4326,6 +6757,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       (lo2, hi2, onModalClose) => config.onBlockShadeColumns(lo2, hi2, onModalClose),
       (lo2, hi2) => config.onGenerateLogo(lo2, hi2),
       (lo2, hi2) => config.onExportColumns(lo2, hi2),
+      (lo2, hi2) => config.onCopyColumns(lo2, hi2),
       clearSelection
     );
   });
@@ -4371,16 +6803,23 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     onScroll(scrollTop, scrollLeft) {
       currentScrollY = scrollTop * dpr;
       currentScrollX = scrollLeft * dpr;
-      gl.useProgram(prog);
-      gl.uniform2f(uni.scroll, currentScrollX, currentScrollY);
-      if (windowNeedsRebuild()) rebuildWindow();
-      else markDirty();
+      if (windowNeedsRebuild())
+        rebuildWindow(); // sets the scroll uniform and marks dirty
+      else {
+        setScrollUniform();
+        markDirty();
+      }
     },
     onResize() {
       sizeCanvasAndSpacer();
       gl.useProgram(prog);
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      rebuildWindow(); // viewport size changed, so the window must too
+      // viewport outgrew the buffered window (same gate onScroll uses)
+      if (windowNeedsRebuild()) rebuildWindow();
+      else {
+        setScrollUniform();
+        markDirty();
+      } // viewport size changed, so the window must too
     },
     rebuildBuffer() {
       buildInstanceData();
@@ -4393,7 +6832,14 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       gl.useProgram(prog);
       gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
       sizeCanvasAndSpacer();
-      rebuildWindow();
+      gl.uniform2f(uni.res, canvas.width, canvas.height);
+      // cell data is unchanged by a resize/zoom — only rebuild if the
+      // viewport outgrew the buffered window (same gate onScroll uses)
+      if (windowNeedsRebuild()) rebuildWindow();
+      else {
+        setScrollUniform();
+        markDirty();
+      }
     },
     setLuminance(val) {
       gl.useProgram(prog);
@@ -4401,24 +6847,675 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       markDirty();
     },
     setHoverCol(col) {
+      hoverColAbs = col;
       gl.useProgram(prog);
-      gl.uniform1f(uni.hoverCol, col);
+      gl.uniform1f(uni.hoverCol, col < 0 ? -1 : col - winColStart);
       markDirty();
     },
+    clearSelection,
+    isSelecting: () => colSelecting || touchSelActive || performance.now() < selClearSuppressUntil,
     setHoverRow(row) {
       gl.useProgram(prog);
       gl.uniform1f(uni.hoverRow, row);
       markDirty();
+    },
+    suspend() {
+      if (glSuspended || !loseExt) return;
+      glSuspended = true;
+      loseExt.loseContext();
+    },
+    resume() {
+      if (!glSuspended || !loseExt) return;
+      loseExt.restoreContext(); // the contextrestored handler rebuilds GL state
     }
   };
 }
 
-// ---------- Tab management ----------
+// ---------- Per-column sequence logo strip (Jalview-style) ----------
+function initLogoStrip(cfg) {
+  const { tabState, stripEl, canvasEl, alignPanel, hScrollTrack, getColCount, getCellDims, realHScroll } = cfg;
+  const ctx = canvasEl.getContext("2d");
+  const FONT = "Consolas";
+  const ROW_SAMPLE = 1000; // cap rows sampled per column, for huge alignments
+  const PAD = 24;
+  let W = 0,
+    H = 0;
+  let img = null,
+    imgCols = 0,
+    imgColStart = 0,
+    blitScrollX = null,
+    imgCw = 0;
+  const colCache = new Map(); // col -> { stack, frac, colorMap }
+
+  function sizeCanvas() {
+    const w = stripEl.clientWidth,
+      h = stripEl.clientHeight;
+    if (w === W && h === H) return;
+    W = w;
+    H = h;
+    if (W && H) {
+      canvasEl.width = W;
+      canvasEl.height = H;
+      img = null;
+      draw(true);
+    }
+  }
+
+  function ensureImage() {
+    const cw = Math.max(1, getCellDims().w);
+    const viewCols = Math.ceil(W / cw) + 2 * PAD;
+    const needPx = viewCols * cw;
+    // keep the buffer only if it's wide enough in PIXELS for the current cell
+    // width — a buffer allocated at a smaller cw clips when zoomed in
+    if (img && img.width >= needPx && img.height === Math.max(1, H)) return;
+    imgCols = viewCols + PAD * 2;
+    img = document.createElement("canvas");
+    img.width = imgCols * cw;
+    img.height = Math.max(1, H);
+    blitScrollX = null;
+  }
+
+  function computeCol(col) {
+    const rows = tabState.records.length;
+    if (!rows) return null;
+    const stride = Math.max(1, Math.floor(rows / ROW_SAMPLE));
+    const column = [];
+    for (let r = 0; r < rows; r += stride) {
+      column.push((tabState.records[r].seq[col] || "-").toUpperCase());
+    }
+    const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
+    const keys = alphaList.map((e) => e.code).filter((k) => k !== "-");
+    const { freq, infoContent } = computeColumnLogoInfo(column, keys, keys.length, false);
+    const maxInfo = Math.log2(keys.length);
+    return {
+      stack: keys
+        .map((ch) => ({ ch, f: freq[ch] || 0 }))
+        .filter((e) => e.f > 0.001)
+        .sort((a, b) => a.f - b.f),
+      frac: maxInfo > 0 ? infoContent / maxInfo : 0,
+      colorMap: tabState.colors[tabState.alphabet]
+    };
+  }
+
+  function renderRange(c0, c1) {
+    const cw = Math.max(1, getCellDims().w);
+    const ictx = img.getContext("2d");
+    ictx.clearRect(0, 0, img.width, img.height);
+    const workH = H - 4;
+    for (let c = c0; c < c1; c++) {
+      let entry = colCache.get(c);
+      if (entry === undefined) {
+        entry = computeCol(c);
+        colCache.set(c, entry);
+      }
+      if (!entry) continue;
+      const colH = entry.frac * workH;
+      if (colH < 1) continue;
+      const x = (c - imgColStart) * cw;
+      let y = H - 2; // stack grows upward
+      for (const e of entry.stack) {
+        const h = e.f * colH;
+        y -= h;
+        if (h >= 1.5) {
+          const rgb = entry.colorMap[e.ch] || [1, 1, 1];
+          drawScaledGlyph(ictx, e.ch, x + 0.5, y, cw - 1, h, rgbFloatToHex(rgb), FONT);
+        }
+      }
+    }
+  }
+
+  function draw(force) {
+    if (!W || !H) return;
+    const cw = Math.max(1, getCellDims().w);
+    const sx = realHScroll();
+    const firstCol = Math.max(0, Math.floor(sx / cw) - PAD);
+    const lastCol = Math.min(getColCount() - 1, Math.ceil((sx + W) / cw) + PAD);
+    if (lastCol < firstCol) {
+      ctx.clearRect(0, 0, W, H);
+      return;
+    }
+    ensureImage();
+    const need = force || blitScrollX === null || imgColStart !== firstCol || imgCw !== cw;
+    if (need) {
+      imgColStart = firstCol;
+      imgCw = cw; // remember the cell width this buffer was rendered at
+      renderRange(firstCol, lastCol + 1);
+    }
+    const dx = imgColStart * cw - sx;
+    if (dx !== blitScrollX || need) {
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(img, dx, 0);
+      blitScrollX = dx;
+    }
+  }
+
+  const scheduleDraw = () => requestRender(() => draw(false));
+  alignPanel.addEventListener("scroll", scheduleDraw, { passive: true });
+  hScrollTrack.addEventListener("scroll", scheduleDraw, { passive: true });
+
+  // periodic draw for resize/layout self-heal only — the column cache is never
+  // cleared here; edits invalidate explicitly via invalidate()
+  const timer = setInterval(() => {
+    if (!cfg.isActive()) return;
+    sizeCanvas();
+    draw(false);
+  }, 400);
+
+  sizeCanvas();
+  draw(true);
+  return {
+    destroy: () => clearInterval(timer),
+    invalidate(col) {
+      if (col === undefined) colCache.clear();
+      else colCache.delete(col);
+      draw(true);
+    }
+  };
+}
+
+// ---------- Conservation bars (per visible column) ----------
+function initConservationStrip(cfg) {
+  const {
+    tabState,
+    stripEl,
+    canvasEl,
+    alignPanel,
+    hScrollTrack,
+    getColCount,
+    getCellDims,
+    realHScroll,
+    consensusCache
+  } = cfg;
+  const ctx = canvasEl.getContext("2d");
+  let W = 0,
+    H = 0;
+  let img = null,
+    imgCols = 0,
+    imgColStart = 0,
+    blitScrollX = null, // offscreen buffer state
+    imgCw = 0;
+  const PAD = 24; // extra columns of margin each side
+  let tipEl = null,
+    lastTipCol = -1;
+
+  function sizeCanvas() {
+    const w = stripEl.clientWidth,
+      h = stripEl.clientHeight;
+    if (w === W && h === H) return;
+    W = w;
+    H = h;
+    if (W && H) {
+      canvasEl.width = W;
+      canvasEl.height = H;
+      img = null;
+      draw(true);
+    }
+  }
+
+  function ensureImage() {
+    const cw = Math.max(1, getCellDims().w);
+    const viewCols = Math.ceil(W / cw) + 2 * PAD;
+    const needPx = viewCols * cw;
+    // keep the buffer only if it's wide enough in PIXELS for the current cell
+    // width — a buffer allocated at a smaller cw clips when zoomed in
+    if (img && img.width >= needPx && img.height === Math.max(1, H)) return;
+    imgCols = viewCols + PAD * 2;
+    img = document.createElement("canvas");
+    img.width = imgCols * cw;
+    img.height = Math.max(1, H);
+    blitScrollX = null;
+  }
+  // % identity of most common non-gap char in col; returns {ch, pct} or null
+  const statCache = new Map(); // col -> {ch, pct} | null — depends on data only, never on scroll or zoom
+
+  // identity of most common non-gap char in col — returns {ch, pct} or null
+  // identity of most common non-gap char in col — returns {ch, pct} or null.
+  // Row-sampled (same cap as the logo strip) and allocation-free: at 20k rows a
+  // full scan was 20k string allocations per column; now ≤1000 sampled reads.
+  const ROW_SAMPLE = 1000;
+  function colStats(col) {
+    if (statCache.has(col)) return statCache.get(col);
+    const rows = tabState.records.length;
+    let result = null;
+    if (rows) {
+      const stride = Math.max(1, Math.floor(rows / ROW_SAMPLE));
+      const counts = new Int32Array(256); // ASCII char codes
+      let sampled = 0;
+      let bestCode = -1,
+        bestCount = 0;
+      for (let r = 0; r < rows; r += stride) {
+        sampled++;
+        const seq = tabState.records[r].seq;
+        let code = col < seq.length ? seq.charCodeAt(col) : 45; // "-"
+        if (code >= 97 && code <= 122) code -= 32; // uppercase a-z
+        if (code === 45 || code === 46 || code >= 256) continue; // gaps don't count
+        counts[code]++;
+        if (counts[code] > bestCount) {
+          bestCount = counts[code];
+          bestCode = code;
+        }
+      }
+      if (bestCode >= 0) result = { ch: String.fromCharCode(bestCode), pct: (100 * bestCount) / sampled };
+    }
+    statCache.set(col, result);
+    return result;
+  }
+
+  function renderRange(c0, c1) {
+    const cw = getCellDims().w;
+    const ictx = img.getContext("2d");
+    ictx.clearRect(0, 0, img.width, img.height);
+    ictx.fillStyle = "#9aa3ad";
+    for (let c = c0; c < c1; c++) {
+      const s = colStats(c);
+      if (!s) continue;
+      const x = (c - imgColStart) * cw;
+      const h = Math.max(2, (s.pct / 100) * (H - 4));
+      ictx.fillRect(x + 1, H - 2 - h, cw - 2, h);
+    }
+  }
+
+  function draw(force) {
+    if (!W || !H) return;
+    const cw = Math.max(1, getCellDims().w);
+    const sx = realHScroll();
+    const firstCol = Math.max(0, Math.floor(sx / cw) - PAD);
+    const lastCol = Math.min(getColCount() - 1, Math.ceil((sx + W) / cw) + PAD);
+    if (lastCol < firstCol) {
+      ctx.clearRect(0, 0, W, H);
+      return;
+    }
+    ensureImage();
+    const need = force || blitScrollX === null || imgColStart !== firstCol || imgCw !== cw;
+    if (need) {
+      imgColStart = firstCol;
+      imgCw = cw; // remember the cell width this buffer was rendered at
+      renderRange(firstCol, lastCol + 1);
+    }
+    const dx = imgColStart * cw - sx;
+    if (dx !== blitScrollX || need) {
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(img, dx, 0);
+      blitScrollX = dx;
+    }
+  }
+
+  const scheduleDraw = () => requestRender(() => draw(false));
+  alignPanel.addEventListener("scroll", scheduleDraw, { passive: true });
+  hScrollTrack.addEventListener("scroll", scheduleDraw, { passive: true });
+
+  // mouseover readout
+  function ensureTip() {
+    if (!tipEl) {
+      tipEl = document.createElement("div");
+      tipEl.className = "conservation-tip";
+      document.body.appendChild(tipEl);
+    }
+  }
+  canvasEl.addEventListener("mousemove", (e) => {
+    const b = canvasEl.getBoundingClientRect();
+    const cw = Math.max(1, getCellDims().w);
+    const col = Math.floor((e.clientX - b.left + realHScroll()) / cw);
+    if (col !== lastTipCol) {
+      lastTipCol = col;
+      ensureTip();
+      const s = colStats(col);
+      tipEl.textContent = s ? `Col ${col + 1}: ${s.ch} · ${s.pct.toFixed(1)}%` : `Col ${col + 1}: —`;
+      tipEl.style.display = "block";
+    }
+    tipEl.style.left = e.clientX - 12 + "px";
+    tipEl.style.top = e.clientY - 12 + "px";
+  });
+  canvasEl.addEventListener("mouseleave", () => {
+    lastTipCol = -1;
+    if (tipEl) tipEl.style.display = "none";
+  });
+
+  // keep bars fresh when records/consensus change: re-render current window
+  // every 5th tick, drop cached column stats so edits self-heal
+  // (same cadence as the logo strip's colCache clear)
+  let tick = 0;
+  // periodic draw for resize/layout self-heal only — the stat cache is NEVER
+  // cleared here; edits invalidate explicitly via invalidate()
+  const timer = setInterval(() => {
+    if (!cfg.isActive()) return;
+    sizeCanvas();
+    draw(false);
+  }, 400);
+  sizeCanvas();
+  draw(true);
+  return {
+    destroy: () => {
+      clearInterval(timer);
+      if (tipEl) tipEl.remove();
+    },
+    invalidate(col) {
+      if (col === undefined) statCache.clear();
+      else statCache.delete(col);
+      draw(true);
+    }
+  };
+}
+
+// ---------- Bottom overview strip (birds-eye + viewport connectors) ----------
+function initOverviewStrip(cfg) {
+  const {
+    tabState,
+    stripEl,
+    canvasEl,
+    markerEl,
+    polygon,
+    contentColumnEl,
+    alignPanel,
+    hScrollTrack,
+    getColCount,
+    getCellDims,
+    realHScroll
+  } = cfg;
+  const ctx2d = canvasEl.getContext("2d");
+  let W = 0,
+    H = 0,
+    tick = 0,
+    dragging = false;
+
+  function sizeCanvas() {
+    const w = stripEl.clientWidth,
+      h = stripEl.clientHeight;
+    if (w === W && h === H) return;
+    W = w;
+    H = h;
+    if (W && H) {
+      canvasEl.width = W;
+      canvasEl.height = H;
+      renderImage();
+    }
+  }
+
+  function renderImage() {
+    const cols = getColCount(),
+      rows = tabState.records.length;
+    if (!W || !H) return;
+    if (!rows) {
+      ctx2d.clearRect(0, 0, W, H);
+      return;
+    }
+    const img = ctx2d.createImageData(W, H);
+    const d = img.data;
+    for (let py = 0; py < H; py++) {
+      const r = Math.min(rows - 1, Math.floor((py * rows) / H));
+      const rec = tabState.records[r];
+      for (let px = 0; px < W; px++) {
+        const c = Math.min(cols - 1, Math.floor((px * cols) / W));
+        const override = recordColorAt(rec, c);
+        const rgb = override ? hexToRgbFloat(override) : getShadeColor(tabState, r, c, rec.seq[c] || "-");
+        const i = (py * W + px) * 4;
+        d[i] = Math.round(rgb[0] * 255);
+        d[i + 1] = Math.round(rgb[1] * 255);
+        d[i + 2] = Math.round(rgb[2] * 255);
+        d[i + 3] = 255;
+      }
+    }
+    ctx2d.putImageData(img, 0, 0);
+  }
+
+  function trackFromReal(realX) {
+    if (cfg.getHScrollScale() === 1) return realX;
+    const maxSpacer = hScrollTrack.scrollWidth - hScrollTrack.clientWidth;
+    const maxReal = Math.max(0, getColCount() * getCellDims().w - alignPanel.clientWidth);
+    if (maxSpacer <= 0 || maxReal <= 0) return 0;
+    return (realX / maxReal) * maxSpacer;
+  }
+
+  function updateOverlay() {
+    if (!cfg.isActive() || !W || !H) return;
+    const cols = getColCount(),
+      rows = tabState.records.length;
+    const { w: cw, h: ch } = getCellDims();
+    const totalW = Math.max(1, cols * cw);
+    const totalH = Math.max(1, rows * ch);
+    const rw = Math.min(W, Math.max(6, (alignPanel.clientWidth / totalW) * W));
+    const rh = Math.min(H, Math.max(6, (alignPanel.clientHeight / totalH) * H));
+    const mx = Math.min(W - rw, Math.max(0, (realHScroll() / totalW) * W));
+    const my = Math.min(H - rh, Math.max(0, (alignPanel.scrollTop / totalH) * H));
+    markerEl.style.left = mx + "px";
+    markerEl.style.top = my + "px";
+    markerEl.style.width = rw + "px";
+    markerEl.style.height = rh + "px";
+    // trapezoid: alignment viewport bottom corners -> marker top corners
+    const panelL = alignPanel.offsetLeft;
+    const panelR = panelL + alignPanel.clientWidth;
+    const panelB = cfg.consensusContentEl.offsetTop + cfg.consensusContentEl.clientHeight;
+    const mL = stripEl.offsetLeft + mx,
+      mR = mL + rw;
+    const mT = stripEl.offsetTop + my;
+    cfg.connectorsSvg.setAttribute("viewBox", `0 0 ${contentColumnEl.clientWidth} ${contentColumnEl.clientHeight}`);
+    polygon.setAttribute("points", `${panelL},${panelB} ${panelR},${panelB} ${mR},${mT} ${mL},${mT}`);
+  }
+
+  const scheduleOverlay = () => requestRender(updateOverlay);
+  alignPanel.addEventListener("scroll", scheduleOverlay, { passive: true });
+  hScrollTrack.addEventListener("scroll", scheduleOverlay, { passive: true });
+
+  function jumpTo(clientX, clientY) {
+    const b = canvasEl.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (clientX - b.left) / b.width));
+    const fy = Math.min(1, Math.max(0, (clientY - b.top) / b.height));
+    const { w: cw, h: ch } = getCellDims();
+    const maxRealX = Math.max(0, getColCount() * cw - alignPanel.clientWidth);
+    const maxY = Math.max(0, tabState.records.length * ch - alignPanel.clientHeight);
+    hScrollTrack.scrollLeft = trackFromReal(
+      Math.min(maxRealX, Math.max(0, fx * getColCount() * cw - alignPanel.clientWidth / 2))
+    );
+    alignPanel.scrollTop = Math.min(maxY, Math.max(0, fy * tabState.records.length * ch - alignPanel.clientHeight / 2));
+    scheduleOverlay();
+  }
+
+  stripEl.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    stripEl.setPointerCapture(e.pointerId);
+    jumpTo(e.clientX, e.clientY);
+  });
+  stripEl.addEventListener("pointermove", (e) => {
+    if (dragging) jumpTo(e.clientX, e.clientY);
+  });
+  stripEl.addEventListener("pointerup", () => {
+    dragging = false;
+  });
+  stripEl.addEventListener("pointercancel", () => {
+    dragging = false;
+  });
+
+  let imgDirty = true;
+  const timer = setInterval(() => {
+    if (!cfg.isActive()) return;
+    sizeCanvas(); // also catches resizes and late layout
+    scheduleOverlay();
+    // re-sample when something changed, else once every ~4s as a backstop
+    // (was every ~1s: a full W×H shade-lookup storm landing mid-pan)
+    if (imgDirty || tick++ % 16 === 0) {
+      imgDirty = false;
+      renderImage();
+    }
+  }, 250);
+
+  sizeCanvas();
+  scheduleOverlay();
+  return {
+    destroy: () => clearInterval(timer),
+    invalidate() {
+      imgDirty = true;
+    }
+  };
+}
+
+//  Viewport (bird's-eye overview)
+function showViewportModal(tabState, vp) {
+  const rows0 = tabState.records.length;
+  if (rows0 === 0) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Viewport</h3>`;
+
+  const hintRow = document.createElement("div");
+  hintRow.className = "shade-row";
+  hintRow.style.color = "#999";
+  hintRow.textContent = "Click or drag the overview to move the visible area.";
+  box.appendChild(hintRow);
+
+  // miniature sized to the alignment's aspect ratio
+  const OW = 320;
+  const OH = Math.max(40, Math.min(200, Math.round((OW * rows0) / Math.max(1, vp.getColCount()))));
+  const wrap = document.createElement("div");
+  wrap.style.position = "relative";
+  wrap.style.width = `${OW}px`;
+  wrap.style.height = `${OH}px`;
+  wrap.style.border = "1px solid #444";
+  wrap.style.cursor = "crosshair";
+  wrap.style.touchAction = "none";
+
+  const canvas = document.createElement("canvas");
+  canvas.width = OW;
+  canvas.height = OH;
+  canvas.style.display = "block";
+  wrap.appendChild(canvas);
+
+  const rect = document.createElement("div");
+  rect.style.position = "absolute";
+  rect.style.border = "2px solid #ff3333";
+  rect.style.background = "rgba(255, 51, 51, 0.12)";
+  rect.style.boxSizing = "border-box";
+  rect.style.pointerEvents = "none";
+  wrap.appendChild(rect);
+  box.appendChild(wrap);
+
+  const ctx2d = canvas.getContext("2d");
+
+  function renderImage() {
+    const cols = vp.getColCount();
+    const rows = tabState.records.length;
+    const img = ctx2d.createImageData(OW, OH);
+    const d = img.data;
+    for (let py = 0; py < OH; py++) {
+      const r = Math.min(rows - 1, Math.floor((py * rows) / OH));
+      const rec = tabState.records[r];
+      for (let px = 0; px < OW; px++) {
+        const c = Math.min(cols - 1, Math.floor((px * cols) / OW));
+        const override = recordColorAt(rec, c);
+        const rgb = override ? hexToRgbFloat(override) : getShadeColor(tabState, r, c, rec.seq[c] || "-");
+        const i = (py * OW + px) * 4;
+        d[i] = Math.round(rgb[0] * 255);
+        d[i + 1] = Math.round(rgb[1] * 255);
+        d[i + 2] = Math.round(rgb[2] * 255);
+        d[i + 3] = 255;
+      }
+    }
+    ctx2d.putImageData(img, 0, 0);
+  }
+
+  function trackFromReal(realX) {
+    if (vp.getHScrollScale() === 1) return realX;
+    const maxSpacer = vp.hScrollTrack.scrollWidth - vp.hScrollTrack.clientWidth;
+    const maxReal = Math.max(0, vp.getColCount() * vp.getCellDims().w - vp.alignPanel.clientWidth);
+    if (maxSpacer <= 0 || maxReal <= 0) return 0;
+    return (realX / maxReal) * maxSpacer; // exact inverse of realHScroll()
+  }
+
+  function updateRect() {
+    const cols = vp.getColCount();
+    const rows = tabState.records.length;
+    const { w: cw, h: ch } = vp.getCellDims();
+    const totalW = Math.max(1, cols * cw);
+    const totalH = Math.max(1, rows * ch);
+    const x = (vp.realHScroll() / totalW) * OW;
+    const y = (vp.alignPanel.scrollTop / totalH) * OH;
+    const rw = Math.min(OW, Math.max(6, (vp.alignPanel.clientWidth / totalW) * OW));
+    const rh = Math.min(OH, Math.max(6, (vp.alignPanel.clientHeight / totalH) * OH));
+    rect.style.left = `${Math.min(OW - rw, Math.max(0, x))}px`;
+    rect.style.top = `${Math.min(OH - rh, Math.max(0, y))}px`;
+    rect.style.width = `${rw}px`;
+    rect.style.height = `${rh}px`;
+  }
+
+  let dragging = false;
+  function jumpTo(clientX, clientY) {
+    const b = canvas.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (clientX - b.left) / b.width));
+    const fy = Math.min(1, Math.max(0, (clientY - b.top) / b.height));
+    const { w: cw, h: ch } = vp.getCellDims();
+    const cols = vp.getColCount();
+    const rows = tabState.records.length;
+    const maxRealX = Math.max(0, cols * cw - vp.alignPanel.clientWidth);
+    const maxY = Math.max(0, rows * ch - vp.alignPanel.clientHeight);
+    const targetX = Math.min(maxRealX, Math.max(0, fx * cols * cw - vp.alignPanel.clientWidth / 2));
+    const targetY = Math.min(maxY, Math.max(0, fy * rows * ch - vp.alignPanel.clientHeight / 2));
+    vp.hScrollTrack.scrollLeft = trackFromReal(targetX); // its scroll listener syncs everything
+    vp.alignPanel.scrollTop = targetY;
+    updateRect();
+  }
+
+  function onMove(e) {
+    if (dragging) jumpTo(e.clientX, e.clientY);
+  }
+  function onUp() {
+    dragging = false;
+  }
+  wrap.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    jumpTo(e.clientX, e.clientY);
+  });
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+
+  // live: rectangle follows scrolling; miniature re-samples once a second
+  let tick = 0;
+  const timer = setInterval(() => {
+    updateRect();
+    if (tick++ % 4 === 0) renderImage();
+  }, 250);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "Close";
+  closeBtn.className = "modal-close-btn";
+  closeBtn.addEventListener("click", close);
+  btnRow.appendChild(closeBtn);
+  box.appendChild(btnRow);
+
+  function close() {
+    clearInterval(timer);
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    overlay.remove();
+  }
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  document.body.appendChild(overlay);
+
+  renderImage();
+  updateRect();
+}
+
+//  Tab management
 let tabCount = 0;
+const tabRenderers = new Map(); // tabId -> [annotationCtl, numberingCtl, alignmentCtl, consensusCtl]
 
 function createTab(name, records, presetState = null) {
   tabCount++;
   const tabId = `tab-${tabCount}`;
+
+  // every window-level listener this tab registers carries this signal,
+  // so closeTab can remove them all at once with ac.abort()
+  const ac = new AbortController();
+  const { signal } = ac;
 
   const tabState = {
     records,
@@ -4472,14 +7569,25 @@ function createTab(name, records, presetState = null) {
     firstIndex: (presetState && presetState.firstIndex) || 1,
     collapse: (presetState && presetState.collapse) || false,
     liveHover: presetState && presetState.liveHover !== undefined ? presetState.liveHover : true,
-    refreshDelay: (presetState && presetState.refreshDelay) || 0,
+    refreshDelay: presetState ? presetState.refreshDelay : 0,
+    shadeCleared: !!(presetState && presetState.shadeCleared), // .blim loads: colors are baked, base shading renders white
+    consensusBaked: (presetState && presetState.consensusBaked) || null, // baked consensus planes from .blim
     uniqueColCounts: [],
-    matrixCache: null
+    matrixCache: null,
+    clustalXColors: null
   };
 
+  tabState.records.forEach((rec) => {
+    if (rec.charColors && !rec.colorIdx) {
+      rec.colorIdx = colorIdxFromObject(rec.charColors, rec.seq.length);
+      delete rec.charColors;
+    }
+  });
+
   function setShadeMode(mode) {
+    tabState.shadeCleared = false;
     tabState.records.forEach((rec) => {
-      rec.charColors = {};
+      rec.colorIdx = null;
     });
     tabState.shadeMode = mode;
     scheduleRebuild();
@@ -4538,7 +7646,7 @@ function createTab(name, records, presetState = null) {
       <div class="setting-group shade-menu-group"><button class="shadeMenuBtn">Shade \u25BE</button></div>
       <div class="setting-group">
         <label>Font size</label>
-        <input type="range" class="fontSizeInput" min="8" max="28" value="14" step="1">
+        <input type="range" class="fontSizeInput" min="6" max="40" value="14" step="1">
         <span class="fontSizeLabel">14px</span>
       </div>
       <div class="setting-group">
@@ -4571,7 +7679,7 @@ function createTab(name, records, presetState = null) {
           <div class="scroll-spacer"></div>
         </div>
         <div class="track-content consensus-content"><canvas></canvas></div>
-        <div class="h-scrollbar-track"><div class="h-scrollbar-spacer"></div></div>
+        <div class="h-scrollbar-track"><div class="h-scrollbar-spacer"></div></div><div class="logo-strip"><canvas class="logo-canvas"></canvas></div><div class="conservation-strip"><canvas class="conservation-canvas"></canvas></div><div class="overview-strip"><canvas class="overview-canvas"></canvas><div class="overview-marker"></div></div><svg class="overview-connectors"><polygon class="overview-polygon" points=""/></svg></div></div>
       </div>
     </div>`;
   document.getElementById("tabPanels").appendChild(panel);
@@ -4595,6 +7703,16 @@ function createTab(name, records, presetState = null) {
   const hScrollTrack = panel.querySelector(".h-scrollbar-track");
   const hScrollSpacer = panel.querySelector(".h-scrollbar-spacer");
   const hoverInfoEl = panel.querySelector(".hoverInfo");
+  const contentColumnEl = panel.querySelector(".content-column");
+  const overviewStripEl = panel.querySelector(".overview-strip");
+  const overviewCanvas = overviewStripEl.querySelector(".overview-canvas");
+  const overviewMarker = overviewStripEl.querySelector(".overview-marker");
+  const overviewSvg = panel.querySelector(".overview-connectors");
+  const overviewPolygon = overviewSvg.querySelector(".overview-polygon");
+  const conservationStripEl = panel.querySelector(".conservation-strip");
+  const conservationCanvas = conservationStripEl.querySelector(".conservation-canvas");
+  const logoStripEl = panel.querySelector(".logo-strip");
+  const logoCanvas = logoStripEl.querySelector(".logo-canvas");
 
   function applyCssVars() {
     const { h } = getCellDims();
@@ -4612,9 +7730,102 @@ function createTab(name, records, presetState = null) {
   }
   applyFixedHeights();
 
+  let hScrollScale = 1; // <1 when content would exceed the browser's element-width cap
   function updateHScrollSpacer() {
     const { w } = getCellDims();
-    hScrollSpacer.style.width = `${getColCount() * w}px`;
+    const realWidth = getColCount() * w;
+    const MAX_SPAN = 30000000; // stay under the 2^25px (~33.5M) element-width limit
+    hScrollScale = realWidth > MAX_SPAN ? MAX_SPAN / realWidth : 1;
+    hScrollSpacer.style.width = `${realWidth * hScrollScale}px`;
+  }
+  // map the (possibly compressed) scrollbar position back to real content pixels
+  function realHScroll() {
+    if (hScrollScale === 1) return hScrollTrack.scrollLeft;
+    const maxSpacerScroll = hScrollTrack.scrollWidth - hScrollTrack.clientWidth;
+    if (maxSpacerScroll <= 0) return 0;
+    const maxRealScroll = Math.max(0, getColCount() * getCellDims().w - alignPanel.clientWidth);
+    return hScrollTrack.scrollLeft * (maxRealScroll / maxSpacerScroll);
+  }
+
+  // exact inverse of realHScroll(): put the scroller at a real-content pixel position
+  function setRealHScroll(realX) {
+    if (hScrollScale === 1) {
+      hScrollTrack.scrollLeft = Math.max(0, realX);
+      return;
+    }
+    const maxSpacer = hScrollTrack.scrollWidth - hScrollTrack.clientWidth;
+    const maxReal = Math.max(0, getColCount() * getCellDims().w - alignPanel.clientWidth);
+    hScrollTrack.scrollLeft = maxReal > 0 && maxSpacer > 0 ? (Math.max(0, realX) / maxReal) * maxSpacer : 0;
+  }
+
+  function scrollToCol(col) {
+    const { w } = getCellDims();
+    const cols = getColCount();
+    const target = Math.max(0, Math.min(cols - 1, col));
+    const realX = target * w - alignPanel.clientWidth / 2; // center the column
+    // exact inverse of realHScroll()
+    if (hScrollScale === 1) {
+      hScrollTrack.scrollLeft = Math.max(0, realX);
+    } else {
+      const maxSpacer = hScrollTrack.scrollWidth - hScrollTrack.clientWidth;
+      const maxReal = Math.max(0, cols * w - alignPanel.clientWidth);
+      hScrollTrack.scrollLeft = maxReal > 0 && maxSpacer > 0 ? (Math.max(0, realX) / maxReal) * maxSpacer : 0;
+    }
+    // setting scrollLeft fires the track's scroll listener, which syncs all four tracks
+  }
+
+  function showGotoColumnModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box shade-modal";
+    box.innerHTML = `<h3>Go to column</h3>`;
+
+    const row = document.createElement("div");
+    row.className = "shade-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.style.width = "90px";
+    const label = document.createElement("label");
+    label.textContent = `Column (1\u2013${getColCount()})`;
+    row.append(input, label);
+    box.appendChild(row);
+
+    const go = () => {
+      const n = parseInt(input.value, 10);
+      if (!Number.isNaN(n)) {
+        scrollToCol(n - 1); // UI is 1-based, internals are 0-based
+        overlay.remove();
+      }
+    };
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation(); // keep the panel's key handlers out of this
+      if (e.key === "Enter") {
+        e.preventDefault();
+        go();
+      }
+    });
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "shade-row";
+    const goBtn = document.createElement("button");
+    goBtn.textContent = "Go";
+    goBtn.className = "modal-close-btn";
+    goBtn.addEventListener("click", go);
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.className = "modal-close-btn";
+    cancelBtn.addEventListener("click", () => overlay.remove());
+    btnRow.append(goBtn, cancelBtn);
+    box.appendChild(btnRow);
+
+    overlay.appendChild(box);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+    input.focus();
   }
 
   function updateAlignmentHeight() {
@@ -4625,18 +7836,52 @@ function createTab(name, records, presetState = null) {
       annotationContentEl.offsetHeight +
       numberingContentEl.offsetHeight +
       consensusContentEl.offsetHeight +
-      hScrollTrack.offsetHeight;
+      hScrollTrack.offsetHeight +
+      logoStripEl.offsetHeight +
+      conservationStripEl.offsetHeight +
+      overviewStripEl.offsetHeight;
     const availableHeight = Math.max(h * 4, msaContainerEl.clientHeight - otherTracksHeight);
     const finalHeight = Math.min(naturalHeight, availableHeight);
     alignPanel.style.height = `${finalHeight}px`;
     namesPanel.style.height = `${finalHeight}px`;
+    if (namesPanel._vstate) renderNameWindow(namesPanel, tabState, refreshAfterRecordsChanged);
     if (typeof alignmentCtl !== "undefined") alignmentCtl.onResize();
   }
 
   // ---- Consensus ----
-  let consensusStr = computeConsensus(tabState.records, getColCount());
+  // consensus is computed per column on demand — windowed rendering means only
+  // visible columns are ever computed, so tab loading is O(1) in columns.
+  // The Proxy keeps every existing `consensusStr[c]` / `.length` read working.
+  const consensusCache = new Map();
+  const consensusStr = new Proxy(
+    {},
+    {
+      get: (t, prop) => {
+        if (typeof prop === "symbol") return undefined;
+        if (prop === "length") return getColCount();
+        const c = Number(prop);
+        if (!Number.isInteger(c)) return undefined;
+        const baked = tabState.consensusBaked;
+        if (baked && baked.chars[c]) return String.fromCharCode(baked.chars[c]);
+        let ch = consensusCache.get(c);
+        // temporary, in the Proxy get trap, around the consensusCharAt call:
+        if (ch === undefined) {
+          try {
+            ch = consensusCharAt(tabState, c);
+          } catch (e) {
+            console.error("consensusCharAt failed at column", c, JSON.stringify(tabState.records.map((r) => r.seq[c])));
+            throw e;
+          }
+          if (consensusCache.size < 1 << 22) consensusCache.set(c, ch);
+        }
+        return ch;
+      }
+    }
+  );
+
   function refreshConsensus() {
-    consensusStr = computeConsensus(tabState.records, getColCount());
+    consensusCache.clear(); // outer memo (the Proxy's Map)
+    tabState.consensusCols = null; // inner memo (consensusCharAt's array) — without this, stale chars survive
   }
 
   function exportColumnsAsNewTab(lo, hi) {
@@ -4646,7 +7891,7 @@ function createTab(name, records, presetState = null) {
       for (let c = lo; c <= hi; c++) {
         const ch = rec.seq[c] || "-";
         newSeq.push(ch);
-        const override = rec.charColors && rec.charColors[c];
+        const override = recordColorAt(rec, c);
         const bgHex = override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
         newCharColors[c - lo] = bgHex;
       }
@@ -4764,13 +8009,29 @@ function createTab(name, records, presetState = null) {
       const overrideChar = tabState.consensusOverrides[c];
       const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
       const overrideHex = tabState.consensusColors[c];
-      return { ch, color: overrideHex ? hexToRgbFloat(overrideHex) : [1, 1, 1] };
+      const bakedIdx = tabState.consensusBaked ? tabState.consensusBaked.colors[c] : 0;
+      const color = overrideHex
+        ? hexToRgbFloat(overrideHex)
+        : bakedIdx
+          ? hexToRgbFloat(paletteHex(bakedIdx))
+          : tabState.consensusTinted
+            ? getColorForChar(tabState, ch)
+            : [1, 1, 1];
+      return { ch, color };
     },
     onEdit: (r, c, clientX, clientY) => {
       const overrideChar = tabState.consensusOverrides[c];
       const current = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
       const overrideHex = tabState.consensusColors[c];
-      const currentColorHex = overrideHex || rgbFloatToHex(getColorForChar(tabState, current));
+      // mirror cellForFn exactly: override → baked COLOR plane → tinted/white
+      const bakedIdx = tabState.consensusBaked ? tabState.consensusBaked.colors[c] : 0; // .colors — not .chars!
+      const currentColorHex =
+        overrideHex ||
+        (bakedIdx
+          ? paletteHex(bakedIdx)
+          : tabState.consensusTinted
+            ? rgbFloatToHex(getColorForChar(tabState, current))
+            : "#FFFFFF");
       showCellEditPopup(
         clientX,
         clientY,
@@ -4793,22 +8054,33 @@ function createTab(name, records, presetState = null) {
     onHoverEnd: () => handleHoverEnd()
   });
 
-  const consensusNameLabel = panel.querySelector(".consensus-names .track-row-label");
-  consensusNameLabel.style.cursor = "pointer";
-  consensusNameLabel.title = "Click to generate consensus";
-  consensusNameLabel.addEventListener("click", () => {
+  function openConsensusOptions() {
     showConsensusOptionsModal(tabState, (algorithm) => {
       const colCount = getColCount();
       const chars =
-        algorithm === "dots"
-          ? computeDotsAndIdentityConsensus(tabState, colCount)
-          : computeSimpleConsensusJava(tabState, colCount);
+        algorithm === "clustal"
+          ? computeClustalConsensus(tabState, colCount)
+          : algorithm === "dots"
+            ? computeDotsAndIdentityConsensus(tabState, colCount)
+            : computeSimpleConsensusJava(tabState, colCount);
       tabState.consensusOverrides = {};
       chars.forEach((ch, c) => {
         tabState.consensusOverrides[c] = ch;
       });
       consensusCtl.rebuildBuffer();
     });
+  }
+
+  const consensusNameLabel = panel.querySelector(".consensus-names .track-row-label");
+  consensusNameLabel.style.cursor = "pointer";
+  consensusNameLabel.title = "Click to generate consensus";
+  consensusNameLabel.addEventListener("click", openConsensusOptions);
+
+  // right-click anywhere on the consensus row also opens the styles picker
+  // (left-click on a cell remains the per-cell editor)
+  consensusCanvas.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openConsensusOptions();
   });
 
   const alignmentCtl = initAlignmentRenderer(alignCanvas, alignPanel, spacer, {
@@ -4818,25 +8090,48 @@ function createTab(name, records, presetState = null) {
     getLuminance,
     getColor: (r, c, ch) => getShadeColor(tabState, r, c, ch),
     getShadeMode: () => tabState.shadeMode,
-    recomputeUniqueColors: (cols) => {
-      tabState.uniqueColCounts = computeUniqueColumnColors(tabState, cols);
+    recomputeUniqueColors: () => {
+      tabState.uniqueColCounts = null; // clear; columns recompute lazily on access
     },
-    recomputeMatrixColors: (cols) => {
-      tabState.matrixCache = computeMatrixShadeCache(tabState, cols);
+    recomputeMatrixColors: () => {
+      tabState.matrixCache = null;
+    },
+    recomputeClustalXColors: () => {
+      tabState.clustalXColors = null;
     },
     onDataChanged: (col) => {
-      refreshConsensus();
+      consensusCache.delete(col); // recompute this column on next read
+      if (tabState.consensusCols) tabState.consensusCols[col] = undefined; // inner memo layer too
       const ch =
         tabState.consensusOverrides[col] !== undefined ? tabState.consensusOverrides[col] : consensusStr[col] || "-";
       const overrideHex = tabState.consensusColors[col];
-      const color = overrideHex ? hexToRgbFloat(overrideHex) : [1, 1, 1];
+      // mirror the track's cellForFn coloring: tinted mode colors plain cells too
+      const color = overrideHex
+        ? hexToRgbFloat(overrideHex)
+        : tabState.consensusTinted
+          ? getColorForChar(tabState, ch)
+          : [1, 1, 1];
       consensusCtl.applyColorOverrides([{ row: 0, col, ch, color }]);
+      // strips: one column of stats went stale — invalidate just it
+      conservationStrip.invalidate(col);
+      logoStrip.invalidate(col);
+      overviewStrip.invalidate();
+      if (tabState.consensusBaked) {
+        tabState.consensusBaked.chars[col] = 0; // fall back to computed for this column
+        tabState.consensusBaked.colors[col] = 0;
+      }
       updateHScrollSpacer();
     },
     onDeleteColumns: (lo, hi) => {
       tabState.records.forEach((rec) => {
         if (rec.seq.length > lo) rec.seq = rec.seq.slice(0, lo) + rec.seq.slice(hi + 1);
         //if (rec.charColors) rec.charColors = reindexColumnMap(rec.charColors, lo, hi);
+        if (rec.colorIdx) {
+          const next = new Uint16Array(Math.max(0, rec.colorIdx.length - (hi - lo + 1)));
+          next.set(rec.colorIdx.subarray(0, lo), 0);
+          next.set(rec.colorIdx.subarray(hi + 1), lo);
+          rec.colorIdx = next;
+        }
       });
       tabState.annotations.forEach((entry) => {
         if (entry.data.length > lo) entry.data = entry.data.slice(0, lo) + entry.data.slice(hi + 1);
@@ -4844,14 +8139,16 @@ function createTab(name, records, presetState = null) {
       });
       tabState.consensusOverrides = reindexColumnMap(tabState.consensusOverrides, lo, hi);
       tabState.consensusColors = reindexColumnMap(tabState.consensusColors, lo, hi);
-      refreshConsensus();
+      refreshConsensus(); // clears both consensus cache layers
+      // column indexes shifted — strip caches are column-keyed, drop them wholesale
+      conservationStrip.invalidate();
+      logoStrip.invalidate();
+      overviewStrip.invalidate();
+      tabState.consensusBaked = null; // indexes shifted / rows changed — baked consensus is stale
       annotationCtl.rebuildBuffer();
       numberingCtl.rebuildBuffer();
       consensusCtl.rebuildBuffer();
       updateHScrollSpacer();
-    },
-    onAnnotateColumns: (lo, hi, onModalClose) => {
-      showAnnotateSelectionModal(tabState, lo, hi, () => annotationCtl.rebuildBuffer(), onModalClose);
     },
     onAnnotateColumns: (lo, hi, onModalClose) => {
       showAnnotateSelectionModal(tabState, lo, hi, () => annotationCtl.rebuildBuffer(), onModalClose);
@@ -4881,12 +8178,10 @@ function createTab(name, records, presetState = null) {
             getColor: (r, c) => {
               const rec = tabState.records[r];
               const ch = rec.seq[c] || "-";
-              return (rec.charColors && rec.charColors[c]) || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
+              return recordColorAt(rec, c) || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
             },
             setColor: (r, c, hex) => {
-              const rec = tabState.records[r];
-              if (!rec.charColors) rec.charColors = {};
-              rec.charColors[c] = hex;
+              setRecordColor(tabState.records[r], c, hex);
             },
             apply: (hits) => alignmentCtl.applyColorOverrides(hits)
           },
@@ -4910,7 +8205,33 @@ function createTab(name, records, presetState = null) {
     },
     onExportColumns: (lo, hi) => exportColumnsAsNewTab(lo, hi),
     onAutoScrollDelta: (delta) => {
-      hScrollTrack.scrollLeft += delta;
+      hScrollTrack.scrollLeft += delta * hScrollScale;
+    },
+    onCopyColumns: (lo, hi) => {
+      const text = tabState.records.map((rec) => ">" + rec.header + "\n" + rec.seq.slice(lo, hi + 1)).join("\n");
+      const done = () => {
+        hoverInfoEl.textContent = `Copied columns ${lo + 1}\u2013${hi + 1} (${tabState.records.length} sequences)`;
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => {
+          // iframe / non-secure-context fallback
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+          done();
+        });
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        done();
+      }
     },
     onSelectionChange: (lo, hi) => {
       annotationCtl.setSelection(lo, hi);
@@ -4919,12 +8240,110 @@ function createTab(name, records, presetState = null) {
     },
     onHover: (r, c) => handleHover("alignment", r, c),
     onHoverEnd: () => handleHoverEnd(),
-    recomputeFrequencyColumns: (cols) => {
-      tabState.frequencyColumns = computeFrequencyColumns(tabState, cols);
+    recomputeFrequencyColumns: () => {
+      tabState.frequencyColumns = null;
+    },
+    recomputeSequenceColors: () => {
+      tabState.sequenceCache = null;
     }
   });
 
+  // dismiss column selection AND its popup on any interaction outside the selection drag
+  panel.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.target.closest && e.target.closest(".context-menu, .cell-edit-popup, .modal-overlay")) return;
+      if (window._activeContextMenu && e.target !== alignCanvas) closeContextMenu();
+      if (e.button === 0 && e.target !== alignCanvas) alignmentCtl.clearSelection();
+    },
+    true
+  );
+  hScrollTrack.addEventListener(
+    "scroll",
+    () => {
+      if (alignmentCtl.isSelecting()) return;
+      if (window._activeContextMenu) closeContextMenu();
+      alignmentCtl.clearSelection();
+    },
+    { passive: true }
+  );
+  alignPanel.addEventListener(
+    "scroll",
+    () => {
+      if (alignmentCtl.isSelecting()) return;
+      if (window._activeContextMenu) closeContextMenu();
+      alignmentCtl.clearSelection();
+    },
+    { passive: true }
+  );
+
   const allTrackCtls = [annotationCtl, numberingCtl, alignmentCtl, consensusCtl];
+
+  // the strip initializers return destroy functions — hold on to them so
+  // closeTab can stop their interval timers instead of leaking them
+  // ---- Mini strips (overview / conservation / logo) ----
+  // created BEFORE the alignment renderer: its onDataChanged / onDeleteColumns
+  // closures call these strips' invalidate(), so the handles must exist by the
+  // time initAlignmentRenderer's config object is built
+  const overviewStrip = initOverviewStrip({
+    tabState,
+    stripEl: overviewStripEl,
+    canvasEl: overviewCanvas,
+    markerEl: overviewMarker,
+    connectorsSvg: overviewSvg,
+    polygon: overviewPolygon,
+    contentColumnEl,
+    alignPanel,
+    hScrollTrack,
+    consensusContentEl,
+    getColCount,
+    getCellDims,
+    realHScroll,
+    getHScrollScale: () => hScrollScale,
+    isActive: () => panel.classList.contains("active")
+  });
+  const conservationStrip = initConservationStrip({
+    tabState,
+    stripEl: conservationStripEl,
+    canvasEl: conservationCanvas,
+    alignPanel,
+    hScrollTrack,
+    getColCount,
+    getCellDims,
+    realHScroll,
+    consensusCache,
+    isActive: () => panel.classList.contains("active")
+  });
+  const logoStrip = initLogoStrip({
+    tabState,
+    stripEl: logoStripEl,
+    canvasEl: logoCanvas,
+    alignPanel,
+    hScrollTrack,
+    getColCount,
+    getCellDims,
+    realHScroll,
+    isActive: () => panel.classList.contains("active")
+  });
+  const stripDestroyers = [overviewStrip, conservationStrip, logoStrip];
+
+  const ro = new ResizeObserver(() => {
+    if (!panel.classList.contains("active")) return; // hidden panels are 0-sized; they re-sync on activation
+    updateAlignmentHeight();
+    allTrackCtls.forEach((ctl) => ctl.onResize());
+  });
+  ro.observe(alignPanel);
+
+  tabRenderers.set(tabId, {
+    ctls: allTrackCtls,
+    ac,
+    stripDestroyers,
+    ro,
+    onActivate: () => {
+      updateAlignmentHeight();
+      allTrackCtls.forEach((ctl) => ctl.onResize());
+    }
+  });
 
   let pendingRebuild = null;
   function scheduleRebuild() {
@@ -5023,16 +8442,17 @@ function createTab(name, records, presetState = null) {
       rebuildAnnotationNames();
       annotationCtl.rebuildBuffer();
     });
-    const deleteBtn = mkBtn("\u{1F5D1}", "Delete annotation row", () => {
+    const deleteBtn = mkBtn("🗑", "Delete annotation row", () => {
       if (tabState.annotations.length <= 1) {
-        alert("At least one annotation row is required.");
+        showLastRowModal("annotation");
         return;
       }
-      if (!confirm(`Delete "${ann.name}"? This cannot be undone.`)) return;
-      tabState.annotations.splice(index, 1);
-      rebuildAnnotationNames();
-      annotationCtl.onRowCountChanged();
-      updateAlignmentHeight();
+      showConfirmDeleteModal(`annotation row "${ann.name}"`, () => {
+        tabState.annotations.splice(index, 1);
+        rebuildAnnotationNames();
+        annotationCtl.onRowCountChanged();
+        updateAlignmentHeight();
+      });
     });
     deleteBtn.classList.add("delete-btn");
 
@@ -5042,9 +8462,83 @@ function createTab(name, records, presetState = null) {
   }
   rebuildAnnotationNames();
 
+  //  Confirm-delete modal
+  function showConfirmDeleteModal(label, onConfirm) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box shade-modal";
+    box.innerHTML = `<h3>Delete ${label}?</h3>`;
+
+    const msgRow = document.createElement("div");
+    msgRow.className = "shade-row";
+    msgRow.textContent = "This cannot be undone.";
+    box.appendChild(msgRow);
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "shade-row";
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.textContent = "Delete";
+    deleteBtn.className = "modal-close-btn";
+    deleteBtn.addEventListener("click", () => {
+      overlay.remove();
+      onConfirm();
+    });
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.className = "modal-close-btn";
+    cancelBtn.addEventListener("click", () => overlay.remove());
+
+    btnRow.append(deleteBtn, cancelBtn);
+    box.appendChild(btnRow);
+
+    overlay.appendChild(box);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+    });
+    document.body.appendChild(overlay);
+  }
+
+  //  Last-row delete rejection modal
+  function showLastRowModal(kind) {
+    const label = kind === "annotation" ? "annotation row" : "sequence";
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box shade-modal";
+    box.innerHTML = `<h3>Can't delete</h3>`;
+
+    const msgRow = document.createElement("div");
+    msgRow.className = "shade-row";
+    msgRow.textContent = `This is your last ${label}, and at least one is required. It can't be deleted.`;
+    box.appendChild(msgRow);
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "shade-row";
+    const okBtn = document.createElement("button");
+    okBtn.textContent = "OK";
+    okBtn.className = "modal-close-btn";
+    okBtn.addEventListener("click", () => overlay.remove());
+    btnRow.appendChild(okBtn);
+    box.appendChild(btnRow);
+
+    overlay.appendChild(box);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+  }
+
   // ---- Sequence names panel ----
   function refreshAfterRecordsChanged() {
-    refreshConsensus();
+    refreshConsensus(); // clears both consensus cache layers
+    // rows changed — every column's stats are stale
+    tabState.consensusBaked = null; // indexes shifted / rows changed — baked consensus is stale
+    conservationStrip.invalidate();
+    logoStrip.invalidate();
+    overviewStrip.invalidate();
     consensusCtl.rebuildBuffer();
     numberingCtl.rebuildBuffer();
     alignmentCtl.rebuildBuffer();
@@ -5060,17 +8554,17 @@ function createTab(name, records, presetState = null) {
     syncingV = true;
     alignPanel.scrollTop = namesPanel.scrollTop;
     syncingV = false;
-    alignmentCtl.onScroll(alignPanel.scrollTop, hScrollTrack.scrollLeft);
+    alignmentCtl.onScroll(alignPanel.scrollTop, realHScroll());
   });
   alignPanel.addEventListener("scroll", () => {
     if (syncingV) return;
     syncingV = true;
     namesPanel.scrollTop = alignPanel.scrollTop;
     syncingV = false;
-    alignmentCtl.onScroll(alignPanel.scrollTop, hScrollTrack.scrollLeft);
+    alignmentCtl.onScroll(alignPanel.scrollTop, realHScroll());
   });
   hScrollTrack.addEventListener("scroll", () => {
-    const left = hScrollTrack.scrollLeft;
+    const left = realHScroll();
     alignmentCtl.onScroll(alignPanel.scrollTop, left);
     annotationCtl.onScroll(left);
     numberingCtl.onScroll(left);
@@ -5080,13 +8574,39 @@ function createTab(name, records, presetState = null) {
   alignPanel.addEventListener(
     "wheel",
     (e) => {
-      console.log("wheel", e.deltaX, e.deltaY, e.shiftKey);
+      if (e.ctrlKey || e.metaKey) {
+        // Ctrl+wheel / trackpad pinch: font-size zoom anchored at the pointer,
+        // so the character under the mouse stays under the mouse
+        e.preventDefault();
+        const dir = e.deltaY < 0 ? 1 : -1;
+        const next = Math.max(6, Math.min(40, tabState.fontSize + dir));
+        if (next === tabState.fontSize) return;
+
+        // capture the fractional cell coordinate under the pointer, pre-zoom
+        const rect = alignPanel.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const dims = getCellDims();
+        const anchorCol = (realHScroll() + mx) / dims.w;
+        const anchorRow = (alignPanel.scrollTop + my) / dims.h;
+
+        tabState.fontSize = next;
+        fontSizeInput.value = next;
+        fontSizeLabel.textContent = `${next}px`;
+        applyFontSize(); // synchronous: geometry must be live before the anchor math below
+
+        // re-place the anchor point under the pointer, post-zoom
+        const d2 = getCellDims();
+        setRealHScroll(anchorCol * d2.w - mx);
+        alignPanel.scrollTop = Math.max(0, anchorRow * d2.h - my);
+        return;
+      }
       if (e.deltaX !== 0) {
         e.preventDefault();
-        hScrollTrack.scrollLeft += e.deltaX;
+        hScrollTrack.scrollLeft += e.deltaX * hScrollScale;
       } else if (e.shiftKey && e.deltaY !== 0) {
         e.preventDefault();
-        hScrollTrack.scrollLeft += e.deltaY;
+        hScrollTrack.scrollLeft += e.deltaY * hScrollScale;
       }
     },
     { passive: false }
@@ -5116,7 +8636,7 @@ function createTab(name, records, presetState = null) {
         touchDirection = Math.abs(dx) > Math.abs(dy) ? "h" : "v";
       }
       if (touchDirection === "h") {
-        hScrollTrack.scrollLeft = touchStartScrollLeft + dx;
+        hScrollTrack.scrollLeft = touchStartScrollLeft + dx * hScrollScale;
       } else {
         alignPanel.scrollTop = touchStartScrollTop + dy;
       }
@@ -5156,36 +8676,65 @@ function createTab(name, records, presetState = null) {
       namesColumn.style.width = `${newWidth}px`;
       e.preventDefault();
     },
-    { passive: false }
+    { passive: false, signal }
   );
 
-  window.addEventListener("touchend", () => {
-    if (dragging) {
-      dragging = false;
-      dividerEl.classList.remove("dragging");
-      allTrackCtls.forEach((ctl) => ctl.onResize());
-    }
-  });
+  window.addEventListener(
+    "touchend",
+    () => {
+      if (dragging) {
+        dragging = false;
+        dividerEl.classList.remove("dragging");
+        allTrackCtls.forEach((ctl) => ctl.onResize());
+      }
+    },
+    { signal }
+  );
   // ---- Window resize ----
-  window.addEventListener("resize", () => {
-    updateAlignmentHeight();
-    allTrackCtls.forEach((ctl) => ctl.onResize());
-  });
-
-  window.addEventListener("mousemove", (e) => {
-    if (!dragging) return;
-    const containerRect = panel.querySelector(".msa-container").getBoundingClientRect();
-    let newWidth = e.clientX - containerRect.left;
-    newWidth = Math.max(60, Math.min(newWidth, containerRect.width - 100));
-    namesColumn.style.width = `${newWidth}px`;
-  });
-  window.addEventListener("mouseup", () => {
-    if (dragging) {
-      dragging = false;
-      dividerEl.classList.remove("dragging");
+  window.addEventListener(
+    "resize",
+    () => {
+      if (!panel.classList.contains("active")) return; // hidden tabs have zero-size layout; they re-sync on activation
+      updateAlignmentHeight();
       allTrackCtls.forEach((ctl) => ctl.onResize());
-    }
-  });
+    },
+    { signal }
+  );
+
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "g") return;
+      if (!panel.classList.contains("active")) return;
+      if (e.target.closest && e.target.closest("input, textarea, [contenteditable]")) return;
+      e.preventDefault(); // suppress the browser's find-next
+      showGotoColumnModal();
+    },
+    { signal }
+  );
+
+  window.addEventListener(
+    "mousemove",
+    (e) => {
+      if (!dragging) return;
+      const containerRect = panel.querySelector(".msa-container").getBoundingClientRect();
+      let newWidth = e.clientX - containerRect.left;
+      newWidth = Math.max(60, Math.min(newWidth, containerRect.width - 100));
+      namesColumn.style.width = `${newWidth}px`;
+    },
+    { signal }
+  );
+  window.addEventListener(
+    "mouseup",
+    () => {
+      if (dragging) {
+        dragging = false;
+        dividerEl.classList.remove("dragging");
+        allTrackCtls.forEach((ctl) => ctl.onResize());
+      }
+    },
+    { signal }
+  );
 
   // ---- Settings wiring ----
   const fontSizeInput = panel.querySelector(".fontSizeInput");
@@ -5201,17 +8750,33 @@ function createTab(name, records, presetState = null) {
   luminanceInput.value = tabState.luminance;
   luminanceLabel.textContent = tabState.luminance.toFixed(3);
 
-  fontSizeInput.addEventListener("input", (e) => {
-    const size = Number(e.target.value);
-    fontSizeLabel.textContent = `${size}px`;
-    tabState.fontSize = size;
+  function applyFontSize() {
     const { w, h } = getCellDims();
     applyCssVars();
     applyFixedHeights();
     allTrackCtls.forEach((ctl) => ctl.setCellSize(w, h));
     updateHScrollSpacer();
     updateAlignmentHeight();
+  }
+
+  fontSizeInput.addEventListener("input", (e) => {
+    const size = Number(e.target.value);
+    fontSizeLabel.textContent = `${size}px`;
+    tabState.fontSize = size;
+    applyFontSize();
   });
+
+  // first-time luminance guard: warn before the slider can be dragged (once per page load)
+  const luminanceGuard = (e) => {
+    if (luminanceAcked) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showLuminanceWarningModal(() => {
+      luminanceAcked = true;
+    });
+  };
+  luminanceInput.addEventListener("pointerdown", luminanceGuard);
+  luminanceInput.addEventListener("keydown", luminanceGuard);
 
   luminanceInput.addEventListener("input", (e) => {
     const val = Number(e.target.value);
@@ -5239,47 +8804,85 @@ function createTab(name, records, presetState = null) {
     showDropdown(fileMenuBtn, [
       {
         label: "Export to FASTA",
-        onClick: () => {
-          const content = tabState.records.map((r) => `>${r.header}\n${r.seq}`).join("\n");
-          downloadFile(`${getTabDisplayName()}.fasta`, content, "text/plain");
-        }
+        onClick: () => exportFastaStreaming(tabState.records, getTabDisplayName() + ".fasta")
       },
       {
         label: "Save as project",
         onClick: () => {
           const colCount = getColCount();
-          const slimContent = generateSlim(
-            tabState,
-            colCount,
-            (r, c, ch) => rgbFloatToHex(getShadeColor(tabState, r, c, ch)),
-            (r, c) => {
-              const ann = tabState.annotations[r];
-              const override = ann.colors && ann.colors[c];
-              return override || rgbFloatToHex(ANNOTATION_BG);
-            },
-            (c) => {
-              const overrideChar = tabState.consensusOverrides[c];
-              const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
-              const overrideHex = tabState.consensusColors[c];
-              const bgHex = overrideHex || "#FFFFFF";
-              return { ch, bgHex };
-            }
-          );
-          downloadFile(`${getTabDisplayName()}.slim`, slimContent, "text/plain");
-        }
-      },
-      {
-        label: "Output to RTF",
-        onClick: () => {
-          showRtfExportModal(tabState, (opts) => {
-            try {
-              const colCount = getColCount();
-              const rtfContent = generateRtfV2(
+          const saveSlim = () =>
+            exportSlimStreaming(
+              tabState,
+              colCount,
+              (r, c, ch) => {
+                const rec = tabState.records[r];
+                const override = recordColorAt(rec, c);
+                return override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
+              },
+              (r, c) => {
+                const ann = tabState.annotations[r];
+                const override = ann.colors && ann.colors[c];
+                return override || rgbFloatToHex(ANNOTATION_BG);
+              },
+              (c) => {
+                const overrideChar = tabState.consensusOverrides[c];
+                const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
+                const overrideHex =
+                  tabState.consensusColors[c] !== undefined
+                    ? tabState.consensusColors[c]
+                    : tabState.consensusBaked && tabState.consensusBaked.colors[c]
+                      ? paletteHex(tabState.consensusBaked.colors[c])
+                      : undefined;
+                const bgHex = overrideHex || "#FFFFFF";
+                return { ch, bgHex };
+              },
+              getTabDisplayName() + ".slim"
+            );
+          showSaveProjectModal(
+            () =>
+              exportBlimStreaming(
                 tabState,
                 colCount,
                 (r, c, ch) => {
                   const rec = tabState.records[r];
-                  const override = rec.charColors && rec.charColors[c];
+                  const override = recordColorAt(rec, c);
+                  return override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
+                },
+                (r, c) => {
+                  const ann = tabState.annotations[r];
+                  const override = ann.colors && ann.colors[c];
+                  return override || rgbFloatToHex(ANNOTATION_BG);
+                },
+                (c) => {
+                  const overrideChar = tabState.consensusOverrides[c];
+                  const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
+                  const overrideHex =
+                    tabState.consensusColors[c] !== undefined
+                      ? tabState.consensusColors[c]
+                      : tabState.consensusBaked && tabState.consensusBaked.colors[c]
+                        ? paletteHex(tabState.consensusBaked.colors[c])
+                        : undefined;
+                  return { ch, bgHex: overrideHex || "#FFFFFF" };
+                },
+                getTabDisplayName() + ".blim"
+              ),
+            saveSlim
+          );
+        }
+      },
+      {
+        label: "Output to RTF",
+        onClick: () =>
+          showRtfExportModal(tabState, (opts) => {
+            const colCount = getColCount();
+            const prog = showProgressOverlay("Saving RTF");
+            withTextSink(getTabDisplayName() + ".rtf", "application/rtf", ".rtf", (sink) =>
+              generateRtfV2(
+                tabState,
+                colCount,
+                (r, c, ch) => {
+                  const rec = tabState.records[r];
+                  const override = recordColorAt(rec, c);
                   return override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
                 },
                 (r, c, ch) => {
@@ -5290,19 +8893,26 @@ function createTab(name, records, presetState = null) {
                 (c) => {
                   const overrideChar = tabState.consensusOverrides[c];
                   const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
-                  const overrideHex = tabState.consensusColors[c];
-                  const bgHex = overrideHex || "#FFFFFF";
+                  const overrideHex =
+                    tabState.consensusColors[c] !== undefined
+                      ? tabState.consensusColors[c]
+                      : tabState.consensusBaked && tabState.consensusBaked.colors[c]
+                        ? paletteHex(tabState.consensusBaked.colors[c])
+                        : undefined;
+                  const bgHex = overrideHex || "FFFFFF";
                   return { ch, bgHex };
                 },
-                opts
-              );
-              downloadFile(`${getTabDisplayName()}.rtf`, rtfContent, "application/rtf");
-            } catch (err) {
-              console.error("RTF export failed:", err);
-              alert(`RTF export failed: ${err.message}`);
-            }
-          });
-        }
+                opts,
+                sink,
+                prog
+              )
+            )
+              .catch((err) => {
+                console.error("RTF export failed:", err);
+                alert("RTF export failed: " + err.message);
+              })
+              .finally(() => prog.close());
+          })
       },
       {
         label: "Print preview",
@@ -5313,7 +8923,7 @@ function createTab(name, records, presetState = null) {
             colCount,
             (r, c, ch) => {
               const rec = tabState.records[r];
-              const override = rec.charColors && rec.charColors[c];
+              const override = recordColorAt(rec, c);
               return override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
             },
             (r, c) => {
@@ -5324,13 +8934,34 @@ function createTab(name, records, presetState = null) {
             (c) => {
               const overrideChar = tabState.consensusOverrides[c];
               const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
-              const overrideHex = tabState.consensusColors[c];
+              const overrideHex =
+                tabState.consensusColors[c] !== undefined
+                  ? tabState.consensusColors[c]
+                  : tabState.consensusBaked && tabState.consensusBaked.colors[c]
+                    ? paletteHex(tabState.consensusBaked.colors[c])
+                    : undefined;
               const bgHex = overrideHex || "#FFFFFF";
               return { ch, bgHex };
             },
             getTabDisplayName()
           );
         }
+      },
+      {
+        label: "Go to column",
+        onClick: showGotoColumnModal
+      },
+      {
+        label: "Viewport",
+        onClick: () =>
+          showViewportModal(tabState, {
+            getColCount,
+            getCellDims,
+            getHScrollScale: () => hScrollScale,
+            realHScroll,
+            hScrollTrack,
+            alignPanel
+          })
       }
     ]);
   });
@@ -5347,41 +8978,30 @@ function createTab(name, records, presetState = null) {
       setShadeMode,
       applyColorOverrides: alignmentCtl.applyColorOverrides
     };
-    const mark = (key) => (tabState.shadeMode === key ? "\u2713 " : "\u2003\u2002");
+    const mark = () => ""; // actions, not state — no checkmarks
+    const isNucleotide = tabState.alphabet === "nucleotide";
     showDropdown(shadeMenuBtn, [
       {
         label: "Clear shading",
         onClick: () => {
-          const rows = tabState.records.length;
-          const cols = getColCount();
-          const hits = [];
-          for (let r = 0; r < rows; r++) {
-            const rec = tabState.records[r];
-            if (!rec.charColors) rec.charColors = {};
-            for (let c = 0; c < cols; c++) {
-              rec.charColors[c] = "#FFFFFF";
-              hits.push({ row: r, col: c, color: [1, 1, 1] });
-            }
-          }
-          shadeCtx.applyColorOverrides(hits);
-
-          const consensusHits = [];
-          for (let c = 0; c < cols; c++) {
-            tabState.consensusColors[c] = "#FFFFFF";
-            consensusHits.push({ row: 0, col: c, color: [1, 1, 1] });
-          }
-          consensusCtl.applyColorOverrides(consensusHits);
-
-          const annotationHits = [];
-          for (let r = 0; r < tabState.annotations.length; r++) {
-            const ann = tabState.annotations[r];
-            if (!ann.colors) ann.colors = {};
-            for (let c = 0; c < cols; c++) {
-              ann.colors[c] = "#FFFFFF";
-              annotationHits.push({ row: r, col: c, color: [1, 1, 1] });
-            }
-          }
-          annotationCtl.applyColorOverrides(annotationHits);
+          tabState.consensusTinted = false;
+          tabState.shadeCleared = true; // sequences render white via getShadeColor
+          tabState.records.forEach((rec) => {
+            rec.colorIdx = null;
+          });
+          tabState.annotations.forEach((ann) => {
+            ann.colors = {};
+          });
+          tabState.consensusColors = {};
+          const sp = tabState.shadeConfig.scanprosite,
+            rx = tabState.shadeConfig.regex;
+          sp.hitsByRow = null;
+          sp.appliedHits = [];
+          rx.hitsByRow = null;
+          rx.appliedHits = [];
+          annotationCtl.rebuildBuffer();
+          consensusCtl.rebuildBuffer();
+          alignmentCtl.rebuildBuffer();
         }
       },
       "divider",
@@ -5398,17 +9018,16 @@ function createTab(name, records, presetState = null) {
       {
         label: mark("standard") + "Standard",
         onClick: () => {
+          tabState.consensusTinted = true;
           shadeCtx.setShadeMode("standard");
-          const cols = getColCount();
-          const hits = [];
-          for (let c = 0; c < cols; c++) {
-            const overrideChar = tabState.consensusOverrides[c];
-            const ch = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
-            const color = getColorForChar(tabState, ch);
-            tabState.consensusColors[c] = rgbFloatToHex(color);
-            hits.push({ row: 0, col: c, color });
-          }
-          consensusCtl.applyColorOverrides(hits);
+        }
+      },
+      {
+        label: mark("clustalx") + "ClustalX",
+        disabled: isNucleotide,
+        title: isNucleotide ? "Protein alignments only" : "",
+        onClick: () => {
+          shadeCtx.setShadeMode("clustalx");
         }
       },
       {
@@ -5425,6 +9044,8 @@ function createTab(name, records, presetState = null) {
       },
       {
         label: mark("matrix") + "Substitution matrix",
+        disabled: isNucleotide,
+        title: isNucleotide ? "Protein alignments only" : "",
         onClick: () => {
           showMatrixShadeModal(tabState, shadeCtx);
         }
@@ -5444,6 +9065,8 @@ function createTab(name, records, presetState = null) {
       },
       {
         label: mark("scanprosite") + "ScanProsite-based",
+        disabled: isNucleotide,
+        title: isNucleotide ? "Protein alignments only" : "",
         onClick: () => {
           showScanPrositeConfirmModal(() => {
             runScanPrositeShading(tabState, shadeCtx);
@@ -5460,18 +9083,44 @@ function createTab(name, records, presetState = null) {
 
   updateHScrollSpacer();
   updateAlignmentHeight();
+
+  return { refreshAfterRecordsChanged, tabState }; // tabState lets callers operate on the exact array the tab renders
 }
 
 function activateTab(tabId, btnEl) {
+  // free the outgoing tab's GL contexts before switching — browsers cap the
+  // number of live WebGL contexts per page and evict the oldest past it
+  const prevPanel = document.querySelector(".tab-panel.active");
+  if (prevPanel && prevPanel.id !== tabId) {
+    const prevEntry = tabRenderers.get(prevPanel.id);
+    if (prevEntry) prevEntry.ctls.forEach((ctl) => ctl.suspend());
+  }
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
   document.getElementById(tabId).classList.add("active");
   btnEl.classList.add("active");
+  const entry = tabRenderers.get(tabId);
+  if (entry) {
+    entry.ctls.forEach((ctl) => ctl.resume());
+    // the panel was display:none, so window resizes while it was hidden left
+    // its canvases stale or zero-sized — re-measure and repaint now that it's visible
+    entry.onActivate();
+  }
 }
 
 function closeTab(tabId, btnEl) {
   const panel = document.getElementById(tabId);
   const wasActive = btnEl.classList.contains("active");
+  const entry = tabRenderers.get(tabId);
+  if (entry) {
+    entry.ctls.forEach((ctl) => ctl.suspend());
+    if (entry.ac) entry.ac.abort();
+    (entry.stripDestroyers || []).forEach((d) => {
+      if (typeof d === "function") d();
+    });
+    if (entry.ro) entry.ro.disconnect();
+  }
+  tabRenderers.delete(tabId);
   btnEl.remove();
   panel.remove();
   if (wasActive) {
@@ -5492,16 +9141,53 @@ function reindexColumnMap(map, lo, hi) {
   return newMap;
 }
 
-// ---------- Sequence names panel: rename, reorder, delete ----------
+//  Sequence names panel (virtualized): only rows near the viewport exist in
+//  the DOM. A spacer provides the scroll range; a translated window holds the
+//  visible slice. Reordering is data-driven (by record id), so the DOM slice
+//  is disposable and re-rendered from tabState.records.
+
 function buildNamesPanel(namesPanel, tabState, onStructureChanged) {
-  namesPanel.innerHTML = "";
-  tabState.records.forEach((r) => namesPanel.appendChild(buildNameRow(r, namesPanel, tabState, onStructureChanged)));
+  if (!namesPanel._vstate) {
+    const spacer = document.createElement("div");
+    spacer.className = "names-spacer";
+    const win = document.createElement("div");
+    win.className = "names-window";
+    namesPanel.innerHTML = "";
+    namesPanel.appendChild(spacer);
+    namesPanel.appendChild(win);
+    namesPanel._vstate = { spacer, win, firstRow: -1, lastRow: -1, renderedH: 0 };
+    namesPanel.addEventListener("scroll", () => renderNameWindow(namesPanel, tabState, onStructureChanged), {
+      passive: true
+    });
+  }
+  renderNameWindow(namesPanel, tabState, onStructureChanged, true); // structure may have changed — always rebuild the slice
 }
 
-function buildNameRow(record, namesPanel, tabState, onStructureChanged) {
+function renderNameWindow(namesPanel, tabState, onStructureChanged, force) {
+  const st = namesPanel._vstate;
+  if (!st) return;
+  const h = cellDimsFor(tabState.fontSize).h;
+  const rows = tabState.records.length;
+  st.spacer.style.height = `${rows * h}px`;
+  const MARGIN = 8; // rows of buffer above and below the viewport
+  const first = Math.max(0, Math.floor(namesPanel.scrollTop / h) - MARGIN);
+  const last = Math.min(rows, Math.ceil((namesPanel.scrollTop + namesPanel.clientHeight) / h) + MARGIN);
+  if (!force && first === st.firstRow && last === st.lastRow && h === st.renderedH) return; // nothing moved
+  st.firstRow = first;
+  st.lastRow = last;
+  st.renderedH = h;
+  st.win.style.transform = `translateY(${first * h}px)`;
+  st.win.innerHTML = "";
+  for (let i = first; i < last; i++) {
+    st.win.appendChild(buildNameRow(tabState.records[i], tabState, onStructureChanged));
+  }
+}
+
+function buildNameRow(record, tabState, onStructureChanged) {
   const row = document.createElement("div");
   row.className = "name-row";
   row.dataset.id = record.id;
+  row.style.height = `${cellDimsFor(tabState.fontSize).h}px`; // fixed — the window math depends on it
 
   const text = document.createElement("span");
   text.className = "name-text";
@@ -5527,41 +9213,168 @@ function buildNameRow(record, namesPanel, tabState, onStructureChanged) {
   const btns = document.createElement("span");
   btns.className = "row-btns";
 
+  const idxOf = () => tabState.records.findIndex((r) => r.id === record.id);
+
   const upBtn = mkBtn("\u25B2", "Move up", () => {
-    const prev = row.previousElementSibling;
-    if (prev) namesPanel.insertBefore(row, prev);
-    syncOrder();
+    const i = idxOf();
+    if (i > 0) {
+      const tmp = tabState.records[i - 1];
+      tabState.records[i - 1] = tabState.records[i];
+      tabState.records[i] = tmp;
+      onStructureChanged();
+    }
   });
   const topBtn = mkBtn("\u2912", "Move to top", () => {
-    namesPanel.insertBefore(row, namesPanel.firstChild);
-    syncOrder();
+    const i = idxOf();
+    if (i > 0) {
+      const [item] = tabState.records.splice(i, 1);
+      tabState.records.unshift(item);
+      onStructureChanged();
+    }
   });
   const bottomBtn = mkBtn("\u2913", "Move to bottom", () => {
-    namesPanel.appendChild(row);
-    syncOrder();
+    const i = idxOf();
+    if (i >= 0 && i < tabState.records.length - 1) {
+      const [item] = tabState.records.splice(i, 1);
+      tabState.records.push(item);
+      onStructureChanged();
+    }
   });
-  const deleteBtn = mkBtn("\u{1F5D1}", "Delete sequence", () => {
-    if (!confirm(`Delete sequence "${record.header}"? This cannot be undone.`)) return;
-    row.remove();
-    const idx = tabState.records.findIndex((r) => r.id === record.id);
-    if (idx !== -1) tabState.records.splice(idx, 1);
-    onStructureChanged();
+  const deleteBtn = mkBtn("🗑", "Delete sequence", () => {
+    if (tabState.records.length <= 1) {
+      showLastRowModal("sequence");
+      return;
+    }
+    showConfirmDeleteModal(`sequence "${record.header}"`, () => {
+      const i = idxOf();
+      if (i !== -1) tabState.records.splice(i, 1);
+      onStructureChanged();
+    });
   });
   deleteBtn.classList.add("delete-btn");
 
   btns.append(upBtn, topBtn, bottomBtn, deleteBtn);
   row.append(text, btns);
-
-  function syncOrder() {
-    const idOrder = [...namesPanel.children].map((el) => Number(el.dataset.id));
-    const byId = new Map(tabState.records.map((r) => [r.id, r]));
-    const newOrder = idOrder.map((id) => byId.get(id));
-    tabState.records.length = 0;
-    tabState.records.push(...newOrder);
-    onStructureChanged();
-  }
-
   return row;
+}
+
+// Save-as-project format chooser: .blim (binary, memory-efficient) or
+// .slim (text, backwards-compatible with the original SlimShadey)
+function showSaveProjectModal(onBlim, onSlim) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = "<h3>Save project</h3>";
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent =
+    "Save as .blim (memory-efficient, new format) or .slim (backwards compatible with the original SlimShadey)?";
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const blimBtn = document.createElement("button");
+  blimBtn.textContent = ".blim";
+  blimBtn.className = "modal-close-btn";
+  blimBtn.title = "Binary format — far smaller files";
+  blimBtn.addEventListener("click", () => {
+    overlay.remove();
+    onBlim();
+  });
+
+  const slimBtn = document.createElement("button");
+  slimBtn.textContent = ".slim";
+  slimBtn.className = "modal-close-btn";
+  slimBtn.title = "Text format — readable by the original SlimShadey";
+  slimBtn.addEventListener("click", () => {
+    overlay.remove();
+    onSlim();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.className = "modal-close-btn";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(blimBtn, slimBtn, cancelBtn);
+  box.appendChild(btnRow);
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+  });
+  document.body.appendChild(overlay);
+}
+
+//  Confirm-delete modal
+function showConfirmDeleteModal(label, onConfirm) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Delete ${label}?</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent = "This cannot be undone.";
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.textContent = "Delete";
+  deleteBtn.className = "modal-close-btn";
+  deleteBtn.addEventListener("click", () => {
+    overlay.remove();
+    onConfirm();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.className = "modal-close-btn";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(deleteBtn, cancelBtn);
+  box.appendChild(btnRow);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+  });
+  document.body.appendChild(overlay);
+}
+
+//  Last-row delete rejection modal
+function showLastRowModal(kind) {
+  const label = kind === "annotation" ? "annotation row" : "sequence";
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Can't delete</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent = `This is your last ${label}, and at least one is required. It can't be deleted.`;
+  box.appendChild(msgRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+  const okBtn = document.createElement("button");
+  okBtn.textContent = "OK";
+  okBtn.className = "modal-close-btn";
+  okBtn.addEventListener("click", () => overlay.remove());
+  btnRow.appendChild(okBtn);
+  box.appendChild(btnRow);
+
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
 }
 
 function mkBtn(label, title, onClick) {
@@ -5578,6 +9391,60 @@ function mkBtn(label, title, onClick) {
 
 // sample data
 
+// ===== Examples: auto-discovered from GitHub repo =====
+const EXAMPLE_REPO = { owner: "as2654", repo: "SlimShadey-Examples", branch: "main" };
+const EXAMPLE_EXTS = [".blim", ".slim", ".mm", ".fasta", ".fa", ".faa", ".aln"];
+//const EXAMPLE_CACHE_KEY = "slimshadey.examples.v2";
+//const EXAMPLE_CACHE_TTL = 15 * 60 * 1000; // 15 min
+
+// Used if the API call fails (rate limit, offline) so the menu never comes up empty
+//const FALLBACK_EXAMPLES = ["100_Mitogenomes.slim", "16S_E_coli.slim", "HOXA1.mm"];
+
+function exampleRawUrl(file) {
+  return (
+    "https://raw.githubusercontent.com/" +
+    EXAMPLE_REPO.owner +
+    "/" +
+    EXAMPLE_REPO.repo +
+    "/" +
+    EXAMPLE_REPO.branch +
+    "/" +
+    encodeURIComponent(file)
+  );
+}
+
+let exampleListPromise = null; // in-memory only; cleared automatically on page reload
+
+function fetchExampleList() {
+  if (!exampleListPromise) {
+    exampleListPromise = (async () => {
+      try {
+        const res = await fetch(
+          `https://api.github.com/repos/${EXAMPLE_REPO.owner}/${EXAMPLE_REPO.repo}/contents?ref=${EXAMPLE_REPO.branch}`
+        );
+        if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+        const items = await res.json();
+        const list = items
+          .filter((it) => it.type === "file" && EXAMPLE_EXTS.some((ext) => it.name.toLowerCase().endsWith(ext)))
+          .map((it) => ({
+            label: it.name.replace(/\.[^.]+$/, ""),
+            file: it.name,
+            url: it.download_url || exampleRawUrl(it.name)
+          }));
+        if (!list.length) throw new Error("no example files in repo");
+        return list;
+      } catch (err) {
+        console.warn("[examples] repo listing failed, using fallback:", err);
+        return FALLBACK_EXAMPLES.map((f) => ({
+          label: f.replace(/\.[^.]+$/, ""),
+          file: f,
+          url: exampleRawUrl(f)
+        }));
+      }
+    })();
+  }
+  return exampleListPromise;
+}
 const EXAMPLES_BASE_URL =
   "https://raw.githubusercontent.com/shaha65/slim-shadey/22c7a80728456b87491b7946b0b80d4571779e6d/src/resources/examples";
 
@@ -5597,25 +9464,501 @@ const EXAMPLE_SETS = [
   { name: "RUNX1", fasta: "example_RUNX1.fasta", slim: "example_RUNX1_slim.mm" }
 ];
 
-function openFileContent(displayName, text) {
-  const firstLine = text.split(/\r?\n/, 1)[0];
-  if (firstLine === ".slim") {
-    const parsed = parseSlim(text);
-    if (!parsed) {
-      alert("Could not parse this .slim file.");
+async function parseFastaAsync(text, onProgress) {
+  const records = [];
+  let current = null;
+  const lines = text.split("\n");
+  const totalChars = Math.max(1, text.length);
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let consumed = 0;
+  let lastReport = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    consumed += raw.length + 1;
+    const line = raw.trim();
+    if (line) {
+      if (line.startsWith(">")) {
+        if (current) records.push(current);
+        current = { header: line.slice(1), seq: "" };
+      } else if (current) {
+        current.seq += line;
+      }
+    }
+    if (consumed - lastReport > 4000000) {
+      // report every ~4MB of input: smooth bar regardless of line wrapping
+      lastReport = consumed;
+      if (onProgress) onProgress(consumed, totalChars);
+      await tick();
+    }
+  }
+  if (current) records.push(current);
+  records.forEach((r, i) => (r.id = i));
+  return records;
+}
+//  Duplicate-sequence dereplication
+//  Duplicate-sequence dereplication
+function maybeOfferDereplication(tabApi) {
+  if (!tabApi || !tabApi.tabState) return;
+  const records = tabApi.tabState.records; // the exact array the tab renders from
+  if (records.length < 2) return;
+
+  const seen = new Set(); // sequence strings already claimed by a first occurrence
+  const dupeIndices = [];
+  for (let i = 0; i < records.length; i++) {
+    if (seen.has(records[i].seq)) dupeIndices.push(i);
+    else seen.add(records[i].seq);
+  }
+  if (dupeIndices.length === 0) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal-box shade-modal";
+  box.innerHTML = `<h3>Duplicate sequences</h3>`;
+
+  const msgRow = document.createElement("div");
+  msgRow.className = "shade-row";
+  msgRow.textContent = "Duplicate sequences detected. Declutter the UI by dereplicating these?";
+  box.appendChild(msgRow);
+
+  const detailRow = document.createElement("div");
+  detailRow.className = "shade-row";
+  detailRow.style.color = "#999";
+  detailRow.textContent = `${dupeIndices.length} of ${records.length} sequences are duplicates; each group keeps its first occurrence.`;
+  box.appendChild(detailRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "shade-row";
+
+  const yesBtn = document.createElement("button");
+  yesBtn.textContent = "Dereplicate";
+  yesBtn.className = "modal-close-btn";
+  yesBtn.addEventListener("click", () => {
+    overlay.remove();
+    console.log("[derep] before:", records.length, "removing", dupeIndices.length);
+    const dupeSet = new Set(dupeIndices);
+    const keep = records.filter((_, i) => !dupeSet.has(i));
+    records.length = 0; // same array object — identity preserved for the tab
+    records.push(...keep);
+    console.log("[derep] after splice:", records.length);
+    try {
+      tabApi.refreshAfterRecordsChanged();
+      console.log(
+        "[derep] refresh OK; name rows now:",
+        document.querySelector(".tab-panel.active .names-panel").childElementCount
+      );
+    } catch (err) {
+      console.error("[derep] refresh failed:", err);
+    }
+  });
+
+  const noBtn = document.createElement("button");
+  noBtn.textContent = "Keep all";
+  noBtn.className = "modal-close-btn";
+  noBtn.addEventListener("click", () => overlay.remove());
+
+  btnRow.append(yesBtn, noBtn);
+  box.appendChild(btnRow);
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+function readFileWithProgress(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
+// Streams a File as lines: bytes are decoded in chunks and the partial tail
+// line of one chunk is carried into the next — no giant single string is built.
+async function* readFileLines(file, onProgress) {
+  const decoder = new TextDecoder("utf-8");
+  const reader = file.stream().getReader();
+  let leftover = "";
+  let doneBytes = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    doneBytes += value.byteLength;
+    if (onProgress) onProgress(doneBytes, file.size);
+    const chunk = leftover + decoder.decode(value, { stream: true });
+    const lines = chunk.split("\n");
+    leftover = lines.pop(); // incomplete final line carries into the next chunk
+    for (const line of lines) yield line;
+  }
+  if (leftover) yield leftover;
+}
+
+// Same streamer, but yields arrays of lines — one promise per chunk instead of
+// one per line. On a 10GB .slim (~600M lines) this is the difference between
+// a snack and a weekend.
+async function* readFileLineBatches(file, onProgress) {
+  const decoder = new TextDecoder("utf-8");
+  const reader = file.stream().getReader();
+  let leftover = "";
+  let doneBytes = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    doneBytes += value.byteLength;
+    if (onProgress) onProgress(doneBytes, file.size);
+    const chunk = leftover + decoder.decode(value, { stream: true });
+    const lines = chunk.split("\n");
+    leftover = lines.pop();
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.charCodeAt(l.length - 1) === 13) lines[i] = l.slice(0, -1); // tolerate \r\n files
+    }
+    yield lines;
+  }
+  if (leftover) yield [leftover];
+}
+
+// FASTA parse straight off the file stream — peak memory is the records
+// themselves, not 2-3× the file size, and the 1.07B-char string ceiling is gone
+async function parseFastaStream(file, onProgress) {
+  const records = [];
+  let current = null;
+
+  const finishCurrent = () => {
+    if (!current) return;
+    current.seq = current.parts.join(""); // one flat string: no concat tree, no 250M-element array
+    delete current.parts;
+    records.push(current);
+  };
+
+  for await (const lines of readFileLineBatches(file, onProgress)) {
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith(">")) {
+        finishCurrent();
+        current = { header: line.slice(1).split("").join(""), parts: [] }; // headers are short — flatten is cheap
+      } else if (current) {
+        current.parts.push(line);
+      }
+    }
+  }
+  finishCurrent();
+  records.forEach((r, i) => (r.id = i));
+  return records;
+}
+
+// Streaming .slim parser: same state machine as parseSlim, but consumes lines
+// from readFileLines — a multi-GB project never becomes one giant string.
+// Cells whose saved background equals the alphabet default are not stored as
+// per-cell overrides, which is what keeps huge projects inside the heap.
+async function parseSlimStream(file, onProgress) {
+  const meta = {
+    fontSize: 14,
+    firstIndex: 1,
+    luminance: 0.179,
+    alphabet: "protein",
+    collapse: false,
+    liveHover: true,
+    refreshDelay: 0
+  };
+  const annotations = [];
+  const records = [];
+  const consensusColors = {};
+  const consensusChars = [];
+  const getLineData = (line) => line.substring(line.indexOf("{") + 1, line.indexOf("}"));
+
+  let defaultHex = null; // char -> default bg hex for the declared alphabet, built lazily
+  const defaults = () => {
+    if (!defaultHex) {
+      defaultHex = Object.create(null);
+      (meta.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET).forEach((e) => {
+        defaultHex[e.code] = e.hex.toUpperCase();
+      });
+    }
+    return defaultHex;
+  };
+
+  let section = null; // null | "annotation" | "sequence" | "consensus"
+  let cur = null; // row under construction: { key, chars, colors, pairs }
+  let col = 0;
+  let lineNo = 0;
+  let lastYield = 0;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  const finishRow = () => {
+    if (!cur) return;
+    if (section === "sequence") {
+      // pack the sparse (col, paletteIdx) pairs into a 2-bytes-per-cell array
+      let colorIdx = null;
+      if (cur.pairs.length) {
+        colorIdx = new Uint16Array(cur.chars.length);
+        for (let i = 0; i < cur.pairs.length; i += 2) colorIdx[cur.pairs[i]] = cur.pairs[i + 1];
+      }
+      records.push({ header: cur.key, seq: cur.chars.join(""), colorIdx });
+    } else if (section === "annotation") {
+      annotations.push({ name: cur.key, data: cur.chars.join(""), colors: cur.colors });
+    }
+    cur = null;
+  };
+
+  for await (const lines of readFileLineBatches(file, onProgress)) {
+    for (const line of lines) {
+      lineNo++;
+      if (lineNo - lastYield >= 131072) {
+        lastYield = lineNo;
+        await tick();
+      }
+
+      if (lineNo === 1) {
+        if (line !== ".slim") return null;
+        continue;
+      }
+
+      if (section === null) {
+        if (!line || line[0] !== "$") continue;
+        const fieldName = line.substring(1);
+        if (fieldName.includes("fontsize")) meta.fontSize = parseInt(getLineData(line), 10) || 14;
+        else if (fieldName.includes("firstindex")) meta.firstIndex = parseInt(getLineData(line), 10) || 1;
+        else if (fieldName.includes("collapse")) meta.collapse = getLineData(line) === "true";
+        else if (fieldName.includes("luminance")) {
+          meta.luminance = parseFloat(getLineData(line));
+          if (Number.isNaN(meta.luminance)) meta.luminance = 0.179;
+        } else if (fieldName.includes("livehover")) meta.liveHover = getLineData(line) === "true";
+        else if (fieldName.includes("refreshdelay")) meta.refreshDelay = parseInt(getLineData(line), 10) || 0;
+        else if (fieldName.includes("alphabet")) {
+          const alphaName = getLineData(line).toLowerCase();
+          meta.alphabet =
+            alphaName.includes("nucle") || alphaName.includes("dna") || alphaName.includes("rna")
+              ? "nucleotide"
+              : "protein";
+        } else if (fieldName.includes("annotation_data")) {
+          section = "annotation";
+          col = 0;
+        } else if (fieldName.includes("sequence_data")) {
+          section = "sequence";
+          col = 0;
+        } else if (fieldName.includes("consensus_data")) {
+          section = "consensus";
+          col = 0;
+        }
+        continue;
+      }
+
+      if (line === "}") {
+        finishRow();
+        section = null;
+        continue;
+      }
+      if (section !== "consensus" && line[0] === "%") {
+        finishRow();
+        // flat header copy — a substring slice would pin its 1MB read chunk
+        cur = { key: line.substring(1).split("").join(""), chars: [], colors: {}, pairs: [] };
+        col = 0;
+        continue;
+      }
+
+      const { ch, bgHex } = parseSlimTriplet(line); // bgHex is "#RRGGBB", # included
+      if (section === "consensus") {
+        consensusChars.push(ch);
+        consensusColors[col] = paletteHex(paletteIndexFor(bgHex)); // palette instance = flat string
+      } else if (section === "annotation") {
+        cur.chars.push(ch);
+        if (bgHex !== "#FFFFFF") cur.colors[col] = paletteHex(paletteIndexFor(bgHex)); // annotation default is white
+      } else {
+        cur.chars.push(ch);
+        const def = defaults()[ch.toUpperCase()] || "#FFFFFF";
+        if (bgHex !== def) cur.pairs.push(col, paletteIndexFor(bgHex)); // only genuine overrides are stored
+      }
+      col++; // per LINE — one column per cell line
+    }
+  }
+  finishRow(); // tolerate a missing final "}"
+
+  records.forEach((r, idx) => (r.id = idx));
+  const chars = consensusChars.join("");
+  const consensusOverrides = {};
+  for (let c = 0; c < chars.length; c++) consensusOverrides[c] = chars[c];
+  return { records, annotations, consensusOverrides, consensusColors, ...meta };
+}
+
+async function openFileContent(displayName, fileOrText) {
+  const prog = showProgressOverlay("Loading " + displayName);
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  try {
+    prog.setLabel("Reading file...");
+    prog.setProgress(0, 1);
+    await tick(); // paint the modal before any work
+
+    let text = null;
+    let records = null;
+
+    if (typeof fileOrText === "string") {
+      text = fileOrText.replace(/\r/g, "");
+    } else if (fileOrText.stream) {
+      const head = await fileOrText.slice(0, 5).text();
+      if (head === ".slim") {
+        // projects stream too — multi-GB .slim files never become one string
+        prog.setLabel("Parsing project...");
+        const parsed = await parseSlimStream(fileOrText, (done, total) =>
+          prog.setProgress(0.2 + (done / total) * 0.5, 1)
+        );
+        if (!parsed) {
+          alert("Could not parse this .slim file.");
+          return;
+        }
+        prog.setLabel("Building tab...");
+        prog.setProgress(0.75, 1);
+        await tick();
+        createTab(displayName.replace(/\.slim|\.mm?$/i, ""), parsed.records, parsed);
+        prog.setProgress(1, 1);
+        return;
+      } else if (head === ".blim" || head === ".bcmm") {
+        prog.setLabel("Parsing project...");
+        const parsed = await parseBlimStream(fileOrText, (doneBytes, total) =>
+          prog.setProgress(0.2 + (doneBytes / total) * 0.5, 1)
+        );
+        prog.setLabel("Building tab...");
+        prog.setProgress(0.75, 1);
+        await tick();
+        createTab(displayName.replace(/\.blim$/i, ""), parsed.records, {
+          annotations: parsed.annotations,
+          consensusOverrides: {},
+          consensusColors: {},
+          alphabet: parsed.meta.alphabet,
+          fontSize: parsed.meta.fontSize,
+          luminance: parsed.meta.luminance,
+          firstIndex: 1,
+          collapse: false,
+          liveHover: true,
+          refreshDelay: 0,
+          shadeCleared: true, // baked colors: white cells render white, everything else is an explicit override
+          consensusBaked: parsed.consensusBaked
+        });
+        prog.setProgress(1, 1);
+        return;
+      } else {
+        prog.setLabel("Parsing sequences...");
+        records = await parseFastaStream(fileOrText, (done, total) => prog.setProgress(0.2 + (done / total) * 0.5, 1));
+      }
+    } else {
+      // ancient browser without File.stream — whole-read fallback
+      text = await readFileWithProgress(fileOrText, (done, total) => prog.setProgress((done / total) * 0.2, 1));
+    }
+
+    if (records === null) {
+      // text is in hand: a project file or an example/pasted FASTA
+      const firstLine = text.split("\n", 1)[0];
+      if (firstLine === ".slim") {
+        prog.setLabel("Parsing project...");
+        const parsed = await parseSlim(text, (done, total) => prog.setProgress(0.2 + (done / total) * 0.5, 1));
+        if (!parsed) {
+          alert("Could not parse this .slim file.");
+          return;
+        }
+        prog.setLabel("Building tab...");
+        prog.setProgress(0.75, 1);
+        await tick();
+        createTab(displayName.replace(/\.slim|\.mm?$/i, ""), parsed.records, parsed);
+        prog.setProgress(1, 1);
+        return;
+      }
+      prog.setLabel("Parsing sequences...");
+      records = await parseFastaAsync(text, (done, total) => prog.setProgress(0.2 + (done / total) * 0.5, 1));
+    }
+
+    if (records.length === 0) {
+      prog.close();
+      alert(
+        "No sequences found in this file. It may be empty, or saved in an unsupported encoding " +
+          "(e.g. UTF-16). Re-save it as UTF-8 and try again."
+      );
       return;
     }
-    createTab(displayName.replace(/\.(slim|mm)$/i, ""), parsed.records, parsed);
-  } else {
-    const records = parseFasta(text);
-    createTab(displayName, records);
+
+    let maxLen = 0,
+      minLen = Infinity;
+    for (const r of records) {
+      if (r.seq.length > maxLen) maxLen = r.seq.length;
+      if (r.seq.length < minLen) minLen = r.seq.length;
+    }
+    if (minLen !== maxLen) {
+      prog.close();
+      showUnalignedWarningModal(async () => {
+        const prog2 = showProgressOverlay("Loading " + displayName);
+        try {
+          prog2.setLabel("Padding sequences...");
+          prog2.setProgress(0.25, 1);
+          await new Promise((r) => setTimeout(r, 0));
+          records.forEach((r) => {
+            if (r.seq.length < maxLen) r.seq = r.seq.padEnd(maxLen, "-");
+          });
+          prog2.setLabel("Building tab...");
+          prog2.setProgress(0.75, 1);
+          await new Promise((r) => setTimeout(r, 0));
+          const tabApi = createTab(displayName, records);
+          prog2.setProgress(1, 1);
+          setTimeout(() => maybeOfferDereplication(tabApi), 0);
+        } finally {
+          prog2.close();
+        }
+      });
+      return;
+    }
+
+    prog.setLabel("Building tab...");
+    prog.setProgress(0.75, 1);
+    await tick();
+    const tabApi = createTab(displayName, records);
+    prog.setProgress(1, 1);
+    setTimeout(() => maybeOfferDereplication(tabApi), 0);
+  } finally {
+    prog.close();
   }
 }
 
-async function loadExampleFile(filename) {
-  const url = `${EXAMPLES_BASE_URL}/${encodeURIComponent(filename)}`;
+async function fetchExampleList() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(EXAMPLE_CACHE_KEY) || "null");
+    if (cached && Array.isArray(cached.list) && Date.now() - cached.t < EXAMPLE_CACHE_TTL) return cached.list;
+  } catch (_) {}
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${EXAMPLE_REPO.owner}/${EXAMPLE_REPO.repo}/contents?ref=${EXAMPLE_REPO.branch}`
+    );
+    if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+    const items = await res.json();
+    const list = items
+      .filter((it) => it.type === "file" && EXAMPLE_EXTS.some((ext) => it.name.toLowerCase().endsWith(ext)))
+      .map((it) => ({
+        label: it.name.replace(/\.[^.]+$/, ""),
+        file: it.name,
+        url: it.download_url || exampleRawUrl(it.name)
+      }));
+    if (!list.length) throw new Error("no example files in repo");
+    try {
+      localStorage.setItem(EXAMPLE_CACHE_KEY, JSON.stringify({ t: Date.now(), list }));
+    } catch (_) {}
+    return list;
+  } catch (err) {
+    console.warn("[examples] repo listing failed, using fallback:", err);
+    return FALLBACK_EXAMPLES.map((f) => ({
+      label: f.replace(/\.[^.]+$/, ""),
+      file: f,
+      url: exampleRawUrl(f)
+    }));
+  }
+}
+
+async function loadExampleFile(url) {
+  console.log("[examples] fetching", url);
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${filename} (${res.status})`);
+  if (!res.ok) throw new Error(`Failed to fetch example (${res.status})`);
   return res.text();
 }
 
@@ -5631,48 +9974,12 @@ function showExamplesModal() {
   const table = document.createElement("table");
   table.className = "color-table examples-table";
   const thead = document.createElement("tr");
-  ["Example", /*"FASTA",*/ "SLIM"].forEach((h) => {
+  ["Example", "Load"].forEach((h) => {
     const th = document.createElement("th");
     th.textContent = h;
     thead.appendChild(th);
   });
   table.appendChild(thead);
-
-  EXAMPLE_SETS.forEach((ex) => {
-    const tr = document.createElement("tr");
-    const nameTd = document.createElement("td");
-    nameTd.textContent = ex.name;
-    tr.appendChild(nameTd);
-
-    function makeLoadBtn(filename) {
-      const td = document.createElement("td");
-      if (filename.endsWith(".fasta")) td.style.display = "none";
-      const btn = document.createElement("button");
-      btn.textContent = "Open";
-      btn.className = "examples-open-btn";
-      btn.addEventListener("click", async () => {
-        btn.disabled = true;
-        btn.textContent = "Loading...";
-        try {
-          const text = await loadExampleFile(filename);
-          openFileContent(filename, text);
-          overlay.remove();
-        } catch (err) {
-          console.error("Example load failed", err);
-          alert("Failed to load example: " + err.message);
-          btn.disabled = false;
-          btn.textContent = "Open";
-        }
-      });
-      td.appendChild(btn);
-      return td;
-    }
-
-    tr.appendChild(makeLoadBtn(ex.fasta));
-    tr.appendChild(makeLoadBtn(ex.slim));
-    table.appendChild(tr);
-  });
-
   box.appendChild(table);
 
   const closeBtn = document.createElement("button");
@@ -5686,16 +9993,224 @@ function showExamplesModal() {
     if (e.target === overlay) overlay.remove();
   });
   document.body.appendChild(overlay);
-}
 
-// ---------- File open flow ----------
+  const loadingTr = document.createElement("tr");
+  const loadingTd = document.createElement("td");
+  loadingTd.colSpan = 2;
+  loadingTd.textContent = "Loading example list…";
+  loadingTr.appendChild(loadingTd);
+  table.appendChild(loadingTr);
+
+  fetchExampleList().then((list) => {
+    loadingTr.remove();
+    list.forEach((ex) => {
+      const tr = document.createElement("tr");
+      const nameTd = document.createElement("td");
+      nameTd.textContent = ex.label;
+      tr.appendChild(nameTd);
+
+      const td = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.textContent = "Open";
+      btn.className = "examples-open-btn";
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Loading...";
+        try {
+          const text = await loadExampleFile(ex.url);
+          openFileContent(ex.file, text);
+          overlay.remove();
+        } catch (err) {
+          console.error("Example load failed", err);
+          alert("Failed to load example: " + err.message);
+          btn.disabled = false;
+          btn.textContent = "Open";
+        }
+      });
+      td.appendChild(btn);
+      tr.appendChild(td);
+      table.appendChild(tr);
+    });
+  });
+}
+//  File open flow
 document.getElementById("startBtn").onclick = () => document.getElementById("fileInput").click();
 document.getElementById("fileInput").onchange = (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => openFileContent(file.name, reader.result);
-  reader.readAsText(file);
+  openFileContent(file.name, file); // pass the File: read progress is shown in the loading modal
+  e.target.value = ""; // allow re-selecting the same file to fire change again
 };
 
 document.getElementById("useExamplesBtn").addEventListener("click", showExamplesModal);
+
+//  Startup flourish
+(() => {
+  const titleLink = document.getElementById("titleLink");
+  const halo = document.getElementById("clickMeHalo");
+
+  let flourishTimer = null;
+  let haloTimer = null;
+
+  function killFlourish() {
+    if (flourishTimer) clearTimeout(flourishTimer);
+    if (haloTimer) clearTimeout(haloTimer);
+    if (titleLink) titleLink.classList.remove("flourish");
+    if (halo) halo.remove();
+  }
+
+  if (titleLink) {
+    titleLink.classList.add("flourish");
+    flourishTimer = setTimeout(killFlourish, 4500);
+    titleLink.addEventListener("click", killFlourish); // first click ends the flourish early
+  }
+  if (halo) haloTimer = setTimeout(killFlourish, 4500);
+})();
+
+//  Title dropdown (GitHub / Manual)
+(() => {
+  const titleLink = document.getElementById("titleLink");
+  if (!titleLink) return;
+  titleLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    if (window._activeDropdown) {
+      // clicking the title again while open just closes it
+      closeDropdown();
+      return;
+    }
+    showDropdown(titleLink, [
+      {
+        label: "GitHub",
+        onClick: () => window.open("https://github.com/as2654/SlimShadey2.0", "_blank", "noopener")
+      },
+      {
+        label: "Manual",
+        onClick: () => window.open("https://slimshadey-manual.adsbio.net", "_blank", "noopener")
+      }
+    ]);
+  });
+})();
+
+// ---------- Color picker memory (recent colors, app-wide) ----------
+const RECENT_COLORS_MAX = 12;
+let recentColors = []; // in-memory only: per tab, cleared on reload
+
+let lastRemember = { input: null, t: 0 };
+
+function rememberColor(hex, input) {
+  hex = String(hex).toUpperCase();
+  if (!/^#[0-9A-F]{6}$/.test(hex)) return;
+  const now = Date.now();
+  // Mobile pickers emit a burst of change events for a single pick.
+  // Same input within a short window = same session: update slot 0 in place
+  // instead of consuming a new slot for every intermediate scrub position.
+  if (input && input === lastRemember.input && now - lastRemember.t < 1500 && recentColors.length) {
+    if (recentColors[0] !== hex) {
+      recentColors[0] = hex;
+      refreshColorMemoryStrips();
+    }
+  } else {
+    recentColors = [hex, ...recentColors.filter((c) => c !== hex)].slice(0, RECENT_COLORS_MAX);
+    refreshColorMemoryStrips();
+  }
+  lastRemember = { input, t: now };
+}
+
+// record every committed pick, anywhere in the app
+document.addEventListener(
+  "change",
+  (e) => {
+    if (e.target && e.target.type === "color") rememberColor(e.target.value, e.target);
+  },
+  true
+);
+
+function buildColorMemoryStrip(input) {
+  const strip = document.createElement("span");
+  strip.className = "color-memory-strip";
+  // keep outside-mousedown popup closers from firing before our click
+  const absorb = (e) => e.stopPropagation();
+  strip.addEventListener("pointerdown", absorb);
+  strip.addEventListener("mousedown", absorb);
+  strip.addEventListener("click", (e) => {
+    const sw = e.target.closest(".color-memory-swatch");
+    if (!sw) return;
+    e.preventDefault();
+    e.stopPropagation();
+    input.value = sw.dataset.hex;
+    input.dispatchEvent(new Event("input", { bubbles: true })); // live-apply modals (shade, regex, legend)
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    // cell editor applies on its Apply button — click it for one-swatch application
+    const popup = input.closest(".cell-edit-popup");
+    const applyBtn = popup && popup.querySelector(".cell-edit-apply-btn");
+    if (applyBtn) applyBtn.click();
+  });
+  return strip;
+}
+
+function refreshColorMemoryStrips() {
+  document.querySelectorAll(".color-memory-strip").forEach((strip) => {
+    strip.style.display = recentColors.length ? "" : "none";
+    strip.innerHTML = "";
+    recentColors.forEach((hex) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "color-memory-swatch";
+      b.dataset.hex = hex;
+      b.title = hex;
+      b.style.background = hex; // inline style also shields it from the global button-hover rule
+      strip.appendChild(b);
+    });
+  });
+}
+
+function armColorInputsIn(root) {
+  if (!root || root.nodeType !== 1) return;
+  if (root.closest && root.closest(".color-memory-strip")) return; // ignore our own swatch rebuilds
+  let armedAny = false;
+  const armOne = (inp) => {
+    if (inp.dataset.colorMemoryArmed) return;
+    inp.dataset.colorMemoryArmed = "1";
+    inp.insertAdjacentElement("afterend", buildColorMemoryStrip(inp));
+    armedAny = true;
+  };
+  if (root.matches && root.matches('input[type="color"]')) armOne(root);
+  (root.querySelectorAll ? root.querySelectorAll('input[type="color"]') : []).forEach(armOne);
+  if (armedAny) refreshColorMemoryStrips();
+}
+
+new MutationObserver((muts) => {
+  muts.forEach((m) => m.addedNodes.forEach(armColorInputsIn));
+}).observe(document.body, { childList: true, subtree: true });
+armColorInputsIn(document.body);
+
+// ---- Startup capability check: WebGL2 is required to render anything ----
+// Probe once up front so a missing GPU path surfaces as a clear message
+// (instead of an unresponsive page after the user opens a file)
+function webgl2Available() {
+  try {
+    const probe = document.createElement("canvas");
+    const gl = probe.getContext("webgl2");
+    if (!gl) return false;
+    const ext = gl.getExtension("WEBGL_lose_context");
+    if (ext) ext.loseContext(); // don't occupy a context slot for the app's lifetime
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+if (!webgl2Available()) {
+  ["startBtn", "useExamplesBtn"].forEach((id) => {
+    const b = document.getElementById(id);
+    if (!b) return;
+    b.disabled = true;
+    b.style.opacity = "0.5";
+    b.style.cursor = "not-allowed";
+    b.title = "WebGL2 is not available in this browser";
+  });
+  confirm(
+    "SlimShadey requires WebGL2, which this browser doesn't support or has disabled.\n\n" +
+      "Try a current version of Chrome, Edge, Firefox, or Safari, and make sure hardware acceleration is enabled in its settings."
+  );
+}
