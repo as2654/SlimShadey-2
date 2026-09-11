@@ -42,7 +42,7 @@ self.addEventListener("fetch", (e) => {
           }
           resolve();
         };
-        port.postMessage({ next: true }); // ask the page for the next chunk
+        port.postMessage({ next: true }); // ask page for next chunk
       });
     },
     cancel() {

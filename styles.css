@@ -836,7 +836,7 @@ html, body { overflow-x: clip; }
   color: var(--btn-hover-text);
 }
 
-/* ---- soft light-blue wash for tabs, name rows, and the small row icons ---- */
+/* ---- soft light-blue wash for tabs, name rows and the small row icons ---- */
 .tab-btn:hover,
 .name-row:hover {
   background: rgba(125, 180, 255, 0.12);
