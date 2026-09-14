@@ -610,7 +610,8 @@ function getSubstitutionScore(matrixName, charA, charB) {
   return m.matrix[i][j];
 }
 
-//  FASTA parsing
+// old FASTA parsing (please use streaming readers/writers)
+// kept here for historical value
 function parseFasta(text) {
   const records = [];
   let current = null;
@@ -633,7 +634,7 @@ function cellDimsFor(fontSize) {
   return { w: Math.round(fontSize * 0.85), h: Math.round(fontSize * 1.25) };
 }
 
-//  Glyph atlas (supports upper + lowercase)
+//  glyph atlas (supports upper + lowercase)
 const GLYPH_CHARSET = [];
 for (let code = 32; code <= 126; code++) GLYPH_CHARSET.push(String.fromCharCode(code));
 const charToGlyphIndex = new Map(GLYPH_CHARSET.map((c, i) => [c, i]));
@@ -673,7 +674,7 @@ const GLYPH_ATLAS = buildGlyphAtlas();
 
 let webglAlertShown = false; // fire the unsupported-browser alert once, not once per canvas
 
-//  Color scheme defaults
+//color scheme defaults
 function hexToRgbFloat(hex) {
   const h = hex.replace("#", "");
   return [
@@ -691,7 +692,7 @@ function rgbFloatToHex(rgb) {
   return `#${to2(rgb[0])}${to2(rgb[1])}${to2(rgb[2])}`.toUpperCase();
 }
 
-// ---------- Color palette: store 2-byte palette indices, not hex strings ----------
+// color palette: store 2-byte palette indices, not hex strings 
 // index 0 is reserved: 0 = "no override". Read contract matches the old
 // charColors[c]: a hex string, or undefined when the cell has no override.
 const COLOR_PALETTE = ["#FFFFFF"]; // dummy; index 0 is never read
@@ -972,7 +973,7 @@ function frequencyColumnMap(header, levels, counts, threshold) {
     if (freq >= threshold || freq > 1 - 1 / (seqNum * 2)) {
       dominantCategory = categoryOrder[i];
       break;
-    } // same
+    } // same as in alpha
   }
   const hasDominant = dominantChar !== null || dominantCategory !== null;
   const refCat = dominantChar !== null ? catOf[dominantChar] : null;
@@ -1004,13 +1005,13 @@ function computeFrequencyShadeColor(tabState, row, col, ch) {
     cache = tabState.frequencyColumns = {
       header: frequencyContentHeader(tabState),
       cols: {},
-      counts: {}, // both must exist from birth — the read paths below assume them
+      counts: {}, // both must exist from birth the read paths below assume them
       maps: {},
       n: 0,
       contentKey
     };
   if (cache.contentKey !== contentKey) {
-    // alphabet or row set changed: counts are content — rebuild tables AND recount
+    // alphabet or row set changed: counts are content sowe rebuild tables AND recount
     cache.contentKey = contentKey;
     cache.header = frequencyContentHeader(tabState);
     cache.counts = {};
@@ -1026,7 +1027,7 @@ function computeFrequencyShadeColor(tabState, row, col, ch) {
       white: [1, 1, 1],
       levelColors: cfg.inverse ? [identityRgb, similarRgb, diffRgb] : [diffRgb, similarRgb, identityRgb]
     };
-    cache.maps = {}; // colors/threshold changed → remap from cached counts, NO recount
+    cache.maps = {}; // colors/threshold changed -> remap from cached counts, NO recount
   }
   let colMap = cache.maps[col];
   if (!colMap) {
@@ -1158,7 +1159,7 @@ function computeUniqueColumnColor(tabState, col) {
   return colColors;
 }
 
-// stats pass: counts by uppercase char code — content-only, so it survives
+// stats pass: counts by uppercase char code content-only, so it survives
 // threshold/color tweaks. Allocation-free counting: 60k-row columns recompute
 // per visible column; string ops would dominate.
 function computeUniqueColumnCounts(tabState, col) {
@@ -1187,7 +1188,7 @@ function computeUniqueShadeColor(tabState, col, ch) {
   }
   const cfg = tabState.shadeConfig.unique;
   if (cache.hex !== cfg.colorHex) {
-    // color changed → re-derive the rgb, NOT the counts
+    // color changed -> re-derive the rgb, NOT the counts
     cache.hex = cfg.colorHex;
     cache.rgb = hexToRgbFloat(cfg.colorHex);
   }
@@ -1334,7 +1335,7 @@ function showFrequencyShadeModal(tabState, ctx) {
     if (e.target === overlay) overlay.remove();
   });
   document.body.appendChild(overlay);
-  applyAndRebuild(); // apply on open — same as the unique/matrix/sequence modals; warmup shows here
+  applyAndRebuild(); // apply on open same as the unique/matrix/sequence modals; warmup shows here
 }
 
 function randomHexColor() {
@@ -1580,8 +1581,6 @@ async function runScanPrositeShading(tabState, ctx) {
     ctx.applyColorOverrides(revertHits);
   }
 
-  // motif colors become persistent per-cell overrides on top of the current shading;
-  // the shade mode itself is left untouched
   const newHits = [];
   hitsByRow.forEach((colMap, row) => {
     const rec = tabState.records[row];
@@ -1672,7 +1671,7 @@ async function computeRegexHits(tabState, onProgress) {
     })
     .filter(Boolean);
 
-  // report invalid patterns back to the modal, if it's open
+  // report invalid patterns back to the modal if it's open
   if (typeof window._regexMarkInvalid === "function") {
     window._regexMarkInvalid(cfg.patterns.map((p) => !p.pattern.trim() || !safeCompile(p.pattern)));
   }
@@ -1684,7 +1683,7 @@ async function computeRegexHits(tabState, onProgress) {
 
   for (let r = 0; r < total; r++) {
     const rowHits = new Map();
-    hitsByRow[r] = rowHits; // every row gets a Map, even an empty one — downstream forEach relies on the shape
+    hitsByRow[r] = rowHits; // every row gets a Map, even an empty one bc downstream forEach relies on the shape
     const seq = records[r].seq;
     compiled.forEach(({ re, colorHex }) => {
       re.lastIndex = 0;
@@ -1720,7 +1719,7 @@ async function regexSearchWithProgress(pattern, tabState, onMatch) {
   const prog = showProgressOverlay("Searching");
   let cancelled = false;
 
-  // optional cancel button — piggyback on the overlay's DOM if reachable
+  // optional cancel button, piggyback on the overlay's DOM if reachable
   try {
     const overlay = document.querySelector(".progress-overlay"); // adjust selector to yours
     if (overlay) {
@@ -1804,7 +1803,7 @@ function sortBySequenceSimilarity(tabState, refId, onDone) {
   onDone();
 }
 
-//  Shared GL program
+//  Shared GL program, written in GLSL ES 3.00. vertex and fragment shaders
 const VS_SOURCE = `#version 300 es
   in vec2 a_quadPos;
   in vec2 a_cellPos;
@@ -2050,7 +2049,7 @@ function showColumnContextMenu(
 
   menu.appendChild(
     mkMenuItem("Block shading", () => {
-      window._activeContextMenuClearSelection = null; // keep the selection visible while the modal is open
+      window._activeContextMenuClearSelection = null; // again, keep the selection visible while the modal is open
       closeContextMenu();
       onBlockShade(lo, hi, onClearSelection);
     })
@@ -2089,7 +2088,7 @@ function showColumnContextMenu(
   setTimeout(() => document.addEventListener("click", docHandler), 0);
 }
 
-//  Cell edit popup (character + per-cell background color)
+//cell edit popup (character + per-cell background color)
 function showCellEditPopup(x, y, currentChar, currentColorHex, onApply, onResetColor) {
   closeContextMenu();
   closeDropdown();
@@ -2153,7 +2152,7 @@ document.addEventListener("keydown", (e) => {
   else if (window._activeDropdown) closeDropdown();
 });
 
-//  Generic dropdown (File / Shade menus)
+// Generic dropdown (File / Shade menus)
 function closeDropdown() {
   if (window._activeDropdown) {
     window._activeDropdown.remove();
@@ -2274,7 +2273,7 @@ async function openTextSink(filename, mime, ext, estBytes) {
 }
 
 // Byte-oriented variant of openTextSink, for .blim: identical routing (OPFS staging
-// for giants → service-worker stream → FS API → Blob fallback), but write() takes
+// for giants -> service-worker stream -> FS API -> Blob fallback), but write() takes
 // Uint8Array end-to-end. openOpfsSink and the FS-API writable are natively
 // byte-polymorphic; openStreamSink handles bytes after its one-line edit; the
 // Blob fallback's Blob(parts) accepts Uint8Array parts directly.
@@ -2356,12 +2355,10 @@ function makeBitWriter(emit, chunkBytes = 1 << 20) {
   };
 }
 
-// ---------- .blim (binary slim) loader — spec: blim-spec v1.2 ----------
+//  .blim (binary slim) loader — spec: blim-spec v1.2 as stated in manual
 
 // fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
-// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 → 7 + 16 ≤ 24
-// fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
-// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 → 7 + 16 ≤ 24
+// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 -> 7 + 16 ≤ 24
 function blimCodeAt(bytes, i, bits) {
   const bit = i * bits;
   const byte = Math.floor(bit / 8); // not >> 3: i*bits overflows int32 past 2^31 (≈268M cols × 9 bits)
@@ -2370,7 +2367,7 @@ function blimCodeAt(bytes, i, bits) {
   return (win >>> (24 - shift - bits)) & ((1 << bits) - 1);
 }
 
-// ---------- byte-row store ----------
+//  byte-row store 
 // At chromosome scale, sequence strings live in V8's 4GB pointer-compression cage
 // and kill the tab. Uint8Array backing stores live OUTSIDE the cage, so large rows
 // are stored as Latin-1 char codes (rec.seqCodes) with rec.seq as a String-like
@@ -2394,7 +2391,7 @@ function makeSeqFacade(codes) {
       if (prop in t) return t[prop];
       const c = Number(prop);
       if (!Number.isInteger(c)) return undefined;
-      return c >= 0 && c < codes.length ? String.fromCharCode(codes[c]) : undefined; // string semantics: OOB → undefined
+      return c >= 0 && c < codes.length ? String.fromCharCode(codes[c]) : undefined; // string semantics: OOB -> undefined
     }
   });
 }
@@ -2411,7 +2408,7 @@ const colCodeAt = (rec, col) => {
   return col < seq.length ? seq.charCodeAt(col) : 45;
 };
 
-// string → Uint8Array of Latin-1 codes; null if any char > 0xFF (row stays a string)
+// string to Uint8Array of Latin-1 codes; null if any char > 0xFF (row stays a string)
 function encodeRowToBytes(s) {
   const codes = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) {
@@ -2508,7 +2505,7 @@ async function parseBlimStream(file, onProgress) {
     return out;
   };
 
-  // ---- header ----
+  // header
   const magic = await readLine();
   if (magic !== ".blim" && magic !== ".bcmm") throw new Error("Not a .blim file");
   const isBcmm = magic === ".bcmm"; // subtype only changes $sequence_data (spec §4)
@@ -2567,7 +2564,7 @@ async function parseBlimStream(file, onProgress) {
     if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
     const cplane = await need(rowCharBytes);
     const kplane = await need(rowColorBytes);
-    const nl = await need(1); // framing checkpoint (spec §3)
+    const nl = await need(1); // framing checkpoint (spec 3)
     if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
     return { name: name.slice(1), cplane, kplane };
   };
@@ -2587,7 +2584,8 @@ async function parseBlimStream(file, onProgress) {
   const annotations = [];
   const records = [];
   let consensusBaked = null;
-
+  
+  // prepaare data sections
   for (;;) {
     if (section === "annotation_data") {
       for (let i = 0; i < annoCount; i++) {
@@ -2664,7 +2662,7 @@ async function parseBlimStream(file, onProgress) {
 
         const cplane = await need(rowCharBytes);
         const kplane = await need(rowColorBytes);
-        const nl = await need(1); // framing checkpoint (spec §3)
+        const nl = await need(1); // framing checkpoint (spec 3)
         if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
         const keepRef = isBcmm && i === 0;
         const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
@@ -2707,7 +2705,7 @@ async function parseBlimStream(file, onProgress) {
           colors[c] = paletteMap[fi];
         }
       }
-      consensusBaked = { chars, colors }; // colors: null ⇒ all-default; within a non-null plane, 0 = "no baked value" sentinel
+      consensusBaked = { chars, colors }; // colors: null means all-default; within a non-null plane, 0 = "no baked value" sentinel
     }
     if ((await readLine()) !== "}") throw new Error("Expected } closing $" + section);
     const next = await readLine();
@@ -2783,7 +2781,7 @@ async function openStreamSink(filename) {
   }
 
   // navigate a hidden iframe — deliberately NO download attribute. A plain
-  // navigation is what the service worker intercepts; its Content-Disposition:
+  // navigation is what the service worker intercepts, its Content-Disposition:
   // attachment response header is what turns it into a download. Anchor clicks
   // with a download attribute can bypass the SW and 404 against the real server.
   const iframe = document.createElement("iframe");
@@ -2819,7 +2817,7 @@ async function openStreamSink(filename) {
               '"automatic downloads" icon (allow it for this site), then retry.'
           )
         );
-      }, 15000); // 15s is an eternity for a local download to start — fail loud, not silent
+      }, 15000); // 15s is an eternity for a local download to start, so we fail loud, not silently
       onCredit = () => {
         clearTimeout(t);
         credit = false;
@@ -2978,7 +2976,7 @@ async function exportFastaStreaming(records, filename) {
   }
 }
 
-//  File export helpers
+// File export helpers
 function downloadFile(filename, content, mime) {
   const blob = content instanceof Blob ? content : new Blob([].concat(content), { type: mime });
   const url = URL.createObjectURL(blob);
@@ -3150,7 +3148,7 @@ async function generateRtfV2(
   );
 
   let trueIndex = tabState.firstIndex || 1;
-  const progressStride = Math.max(1, Math.floor(setsOfRows / 500)); // ≤500 UI updates, per-set on small runs
+  const progressStride = Math.max(1, Math.floor(setsOfRows / 500)); // <=500 UI updates, per-set on small runs
   for (let k = 0; k < setsOfRows; k++) {
     const lo = k * charsPerRow;
     const hi = Math.min(colCount, lo + charsPerRow);
@@ -3443,7 +3441,7 @@ function renderAlignmentPng(
 }
 
 // Vector export of a print-preview page: consumes the layout embedded in the
-// object returned by renderAlignmentPng, so page boundaries always match the preview.
+// object returned by renderAlignmentPng, so page boundaries always match the preview
 function svgForPrintPage(result, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus) {
   const L = result.layout;
   const {
@@ -3500,7 +3498,7 @@ function svgForPrintPage(result, tabState, resolveSeqColor, resolveAnnoColor, re
   out.push(`<rect x="0" y="0" width="${blockW}" height="${totalH}" fill="#FFFFFF"/>`);
 
   // Per-glyph absolute x positions: no textLength, so nothing accumulates and
-  // every character sits exactly in its cell regardless of the viewer's font.
+  // every character sits exactly in its cell regardless of the viewer's font
   function emitText(str, fromCol, nCols, color, y) {
     if (!str || !str.trim()) return;
     const xs = new Array(str.length);
@@ -3620,6 +3618,7 @@ function decideForegroundHex(bgHex, luminanceThreshold) {
   return L > luminanceThreshold ? "#000000" : "#FFFFFF";
 }
 
+// legacy slim parser (kept in case of need for a fallback)
 async function parseSlim(text, onProgress) {
   const lines = text.split(/\r?\n/);
   if (lines[0] !== ".slim") return null;
@@ -3760,7 +3759,7 @@ async function parseSlim(text, onProgress) {
 // .blim (binary slim) exporter — spec: blim-spec v1.2.
 // The sink opens BEFORE the dictionary sweep: both the SW-streamed download and
 // the FS-API picker require the click's transient user activation, and the sweep
-// would let it expire. Routing uses a cheap upper bound (≤4 bytes/cell).
+// would let it expire. Routing uses a cheap upper bound (<=4 bytes/cell).
 async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
   const prog = showProgressOverlay("Saving project");
   let sink = null;
@@ -3778,7 +3777,7 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     };
 
     // unified {ch, bg} cell shape; consensus uses the same two-plane grammar as
-    // every other row (spec §3). id tags the sequence section for .bcmm (§4).
+    // every other row (spec section 3). id tags the sequence section for .bcmm (manual section 4).
     const sections = [
       {
         id: "anno",
@@ -3828,7 +3827,7 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     }
     console.log("[blim] sink acquired");
 
-    // ---- phase 1: dictionary sweep (+ .bcmm reference capture & diff counts) ----
+    // phase 1: dictionary sweep (+ .bcmm reference capture & diff counts)
     const charIndex = new Map();
     const colorIndex = new Map(); // index 0 reserved = #FFFFFF; listed colors start at 1
     // .bcmm reference = row 0. Chars come from the resident string (no copy);
@@ -3913,7 +3912,7 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
       `$chardict{${charBits}}{${charList}}\n` +
       `$colordict{${colorBits}}{${colorList.join(",")}}\n`;
 
-    // ---- phase 2: the write ----
+    // phase 2, the write
     const u32le = (n) => {
       const b = new Uint8Array(4);
       b[0] = n & 0xff;
@@ -4012,6 +4011,7 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
   }
 }
 
+// realistically users should not be downloading very large .slim files, should be using .blim (.bcmm subtype)
 async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
   const prog = showProgressOverlay("Saving project");
   try {
@@ -4109,7 +4109,7 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     prog.close();
   }
 }
-//  Color scheme modal
+// Color scheme modal
 function showColorSchemeModal(tabState, onColorsChanged) {
   const alphabetList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
   const title = tabState.alphabet === "nucleotide" ? "Nucleotide Color Scheme" : "Amino Acid Color Scheme";
@@ -4172,6 +4172,7 @@ function showColorSchemeModal(tabState, onColorsChanged) {
 // main thread and trip Chrome's "Page Unresponsive" dialog no matter what modal
 // covers them. Byte rows structured-clone across; the merge lands in the same
 // cache shapes the lookups build (unique: Map per column; frequency: res/cat counts).
+// now legacy
 const STATS_WORKER_URL = URL.createObjectURL(
   new Blob(
     [
@@ -4268,7 +4269,7 @@ async function applyShadeWithWarmup(tabState, ctx, mode, title) {
   }
 }
 
-//  Shade unique modal
+// Shade unique modal
 function showUniqueShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.unique;
   const overlay = document.createElement("div");
@@ -4506,7 +4507,7 @@ function showMatrixShadeModal(tabState, ctx) {
   apply();
 }
 
-//  Sequence shading modal
+// Sequence shading modal
 function showSequenceShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.sequence;
   const overlay = document.createElement("div");
@@ -4994,7 +4995,7 @@ function showSeqLogoOptionsModal(tabState, onGenerate) {
   document.body.appendChild(overlay);
 }
 
-//  Sequence logo SVG export
+// Sequence logo SVG export
 function svgEscapeText(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -5186,7 +5187,7 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
 
 //  Clustal X shading
 // Rules per https://www.jalview.org/help/html/colourSchemes/clustal.html
-// clause = { t: threshold %, group: residue letters, any: false → group combined, true → any single letter }
+// clause = { t: threshold %, group: residue letters, any: false -> group combined, true -> any single letter }
 const CLUSTALX_RULES = (() => {
   const BLUE = { rgb: hexToRgbFloat("#80A0F0") };
   const RED = { rgb: hexToRgbFloat("#F01505") };
@@ -5453,7 +5454,7 @@ function showRegexShadeModal(tabState, ctx) {
   const addBtn = document.createElement("button");
   addBtn.textContent = "Add regex";
   addBtn.className = "modal-close-btn";
-  addBtn.addEventListener("click", () => addPatternRow("", "00FF00"));
+  addBtn.addEventListener("click", () => addPatternRow("", "FF0000"));
 
   const execBtn = document.createElement("button");
   execBtn.textContent = "Execute";
@@ -5503,7 +5504,7 @@ function showRegexShadeModal(tabState, ctx) {
           errorRow.style.display = "none";
         }
 
-        // sanity gate: a multi-million-cell hit set is usually a too-loose pattern,
+        // sanity check: a multi-million-cell hit set is usually a too-loose pattern,
         // and painting it costs real time even chunked — let the user opt out
         let totalHits = 0;
         cfg.hitsByRow.forEach((m) => (totalHits += m.size));
@@ -5572,7 +5573,7 @@ function showRegexShadeModal(tabState, ctx) {
   document.body.appendChild(overlay);
 }
 
-//  Block shading modal
+// Block shading modal
 function showBlockShadingModal(lo, hi, sections, onClose) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -5648,10 +5649,10 @@ function showBlockShadingModal(lo, hi, sections, onClose) {
   document.body.appendChild(overlay);
 }
 
-// luminance warning acknowledgment: one per page load, shared by all tabs (not persisted)
+// luminance warning acknowledgment: one per page load, shared by all tabs (but not persisted)
 let luminanceAcked = false;
 
-//  Luminance warning modal
+// Luminance warning modal (we need to address that users usually don't know what this even does)
 function showLuminanceWarningModal(onProceed) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -5690,7 +5691,7 @@ function showLuminanceWarningModal(onProceed) {
   document.body.appendChild(overlay);
 }
 
-//  Unaligned input warning modal
+// Unaligned input warning modal
 function showUnalignedWarningModal(onProceed) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -5762,7 +5763,7 @@ function showScanPrositeConfirmModal(onContinue) {
   document.body.appendChild(overlay);
 }
 
-//  Annotate selection modal
+// Annotate selection modal
 function showAnnotateSelectionModal(tabState, lo, hi, onApply, onClose) {
   const allowableLength = hi - lo + 1;
   const overlay = document.createElement("div");
@@ -5918,7 +5919,7 @@ function computeConsensusColumn(records, col) {
   const counts = new Int32Array(256); // ASCII char codes; alignments are ASCII in practice
   for (let i = 0; i < records.length; i++) {
     let code = colCodeAt(records[i], col);
-    if (code >= 97 && code <= 122) code -= 32; // uppercase a-z (what toUpperCase did)
+    if (code >= 97 && code <= 122) code -= 32; // uppercase a-z (avoid repeated costly toUpperCase)
     if (code < 256) counts[code]++;
   }
   let bestCode = 45,
@@ -6177,7 +6178,7 @@ function drawLogoAxes(ctx, maxBits, len, geom, fontFamily) {
   }
 }
 
-//  Freeze watchdog
+// Freeze watchdog (legacy - the user knows when it's freezing, but optimized SlimShadey basically never freezes)
 // Detects main-thread stalls ("the page froze") by measuring gaps between timer
 // ticks, and on Chromium also watches JS heap usage. The warning shows when the
 // page recovers, with a cooldown so it can't spam.
@@ -6236,6 +6237,7 @@ function freezeWatchdogTick() {
   }
 }
 
+// uncomment below if your implementation needs a freezing watchdog
 //setInterval(freezeWatchdogTick, FREEZE_CHECK_MS);
 
 // streamed-download service worker: powers .crswap-free exports
@@ -6243,7 +6245,7 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {}); // preview iframes may refuse; exports fall back
 }
 
-//  On-demand render scheduler
+// On-demand render scheduler
 // Renderers never self-loop. They register a redraw via requestRender();
 // one shared rAF tick drains everything that went dirty this frame.
 const _dirtyRenderers = new Set();
@@ -6464,7 +6466,7 @@ function initTrackRenderer(canvas, wrapperEl, config) {
 
   return {
     onScroll(scrollLeft) {
-      currentScrollX = scrollLeft * dpr; // keep your existing assignment line as-is
+      currentScrollX = scrollLeft * dpr; // keep existing assignment lines as-is
       if (windowNeedsRebuild())
         rebuildWindow(); // sets the scroll uniform and marks dirty
       else {
@@ -6551,7 +6553,7 @@ function initTrackRenderer(canvas, wrapperEl, config) {
   };
 }
 
-//  Alignment (main scrollable) renderer
+// Alignment (main scrollable) renderer
 function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   const dpr = window.devicePixelRatio || 1;
   let { w: CELL_W, h: CELL_H } = config.getCellDims();
@@ -6643,7 +6645,8 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     const records = config.getRecords();
     rows = records.length;
     cols = config.getColCount();
-
+    
+    // unique and frequency rely on cached column statistics that may have changed while their modals were closed
     if (config.getShadeMode() === "unique" && config.recomputeUniqueColors) {
       //config.recomputeUniqueColors(cols);
     }
@@ -6679,7 +6682,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     selLoAbs = -1,
     selHiAbs = -1;
 
-  // column highlight uniforms are window-relative; re-emitted on every window rebuild
+  // column highlight uniforms are window-relative; emitte again on every window rebuild
   function setHighlightUniforms() {
     gl.useProgram(prog);
     gl.uniform1f(uni.hoverCol, hoverColAbs < 0 ? -1 : hoverColAbs - winColStart);
@@ -6935,7 +6938,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       clearSelection
     );
   });
-  // ---- Touch column selection: long-press then drag ----
+  // Touch column selection: long-press then drag
   const LONG_PRESS_MS = 400;
   const MOVE_CANCEL_PX = 10;
   let touchSelTimer = null;
@@ -6995,7 +6998,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
           clearTimeout(touchSelTimer);
           touchSelTimer = null;
         }
-        return; // not selecting → let the scroll handlers work
+        return; // not selecting so let the scroll handlers work
       }
       e.preventDefault();
       e.stopPropagation(); // keep alignPanel's touch-scroll from fighting the selection
@@ -7152,7 +7155,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   };
 }
 
-// ---------- Per-column sequence logo strip (Jalview-style) ----------
+// Per-column sequence logo strip 
 function initLogoStrip(cfg) {
   const { tabState, stripEl, canvasEl, alignPanel, hScrollTrack, getColCount, getCellDims, realHScroll } = cfg;
   const ctx = canvasEl.getContext("2d");
@@ -7300,7 +7303,7 @@ function initLogoStrip(cfg) {
   };
 }
 
-// ---------- Conservation bars (per visible column) ----------
+// Conservation bars (per visible column) 
 function initConservationStrip(cfg) {
   const {
     tabState,
@@ -7355,7 +7358,6 @@ function initConservationStrip(cfg) {
   // % identity of most common non-gap char in col; returns {ch, pct} or null
   const statCache = new Map(); // col -> {ch, pct} | null — depends on data only, never on scroll or zoom
 
-  // identity of most common non-gap char in col — returns {ch, pct} or null
   // identity of most common non-gap char in col — returns {ch, pct} or null.
   // Row-sampled (same cap as the logo strip) and allocation-free: at 20k rows a
   // full scan was 20k string allocations per column; now ≤1000 sampled reads.
@@ -7488,7 +7490,7 @@ function initConservationStrip(cfg) {
   };
 }
 
-// ---------- Bottom overview strip (birds-eye + viewport connectors) ----------
+// Bottom overview strip (birds-eye + viewport connectors) 
 function initOverviewStrip(cfg) {
   const {
     tabState,
@@ -7799,7 +7801,7 @@ function showViewportModal(tabState, vp) {
   updateRect();
 }
 
-//  Tab management
+// Tab management
 let tabCount = 0;
 const tabRenderers = new Map(); // tabId -> [annotationCtl, numberingCtl, alignmentCtl, consensusCtl]
 
@@ -7936,7 +7938,7 @@ function createTab(name, records, presetState = null) {
     return tabState.luminance;
   }
 
-  // ---- Tab button ----
+  // Tab button
   const btn = document.createElement("div");
   btn.className = "tab-btn";
   btn.dataset.tabId = tabId;
@@ -7968,7 +7970,7 @@ function createTab(name, records, presetState = null) {
   btn.addEventListener("click", () => activateTab(tabId, btn));
   document.getElementById("tabBar").appendChild(btn);
 
-  // ---- Panel DOM ----
+  // Panel DOM
   const panel = document.createElement("div");
   panel.className = "tab-panel";
   panel.id = tabId;
@@ -8017,7 +8019,7 @@ function createTab(name, records, presetState = null) {
   document.getElementById("tabPanels").appendChild(panel);
   activateTab(tabId, btn);
 
-  // ---- DOM refs ----
+  // DOM refs
   const msaContainerEl = panel.querySelector(".msa-container");
   const namesColumn = panel.querySelector(".names-column");
   const annotationNamesEl = panel.querySelector(".annotation-names");
@@ -8180,7 +8182,6 @@ function createTab(name, records, presetState = null) {
     if (typeof alignmentCtl !== "undefined") alignmentCtl.onResize();
   }
 
-  // ---- Consensus ----
   // consensus is computed per column on demand — windowed rendering means only
   // visible columns are ever computed, so tab loading is O(1) in columns.
   // The Proxy keeps every existing `consensusStr[c]` / `.length` read working.
@@ -8277,7 +8278,7 @@ function createTab(name, records, presetState = null) {
     });
   }
 
-  // ---- Track renderers ----
+  // Track renderers
   const annotationCtl = initTrackRenderer(annotationCanvas, annotationContentEl, {
     getRowCount: () => tabState.annotations.length,
     getColCount,
@@ -8360,7 +8361,7 @@ function createTab(name, records, presetState = null) {
       const overrideChar = tabState.consensusOverrides[c];
       const current = overrideChar !== undefined ? overrideChar : consensusStr[c] || "-";
       const overrideHex = tabState.consensusColors[c];
-      // mirror cellForFn exactly: override → baked COLOR plane → tinted/white
+      // mirror cellForFn exactly: override -> baked COLOR plane -> tinted/white
       const bakedIdx = bakedColorAt(c);
       const currentColorHex =
         overrideHex ||
@@ -8447,7 +8448,7 @@ function createTab(name, records, presetState = null) {
     // caches on every rebuild. invalidate only when the shade config actually changed.
     recomputeUniqueColors: () => {
       // counts are content; config tweaks are derived live in computeUniqueShadeColor,
-      // so this hook guarantees existence and NEVER wipes — a wipe would force a recount
+      // so this hook guarantees existence and NEVER wipes bc a wipe would force a recount
       if (!tabState.uniqueColCounts || !tabState.uniqueColCounts.cols) tabState.uniqueColCounts = { cols: {}, n: 0 };
     },
     recomputeFrequencyColumns: () => {
@@ -8496,8 +8497,8 @@ function createTab(name, records, presetState = null) {
     onDeleteColumns: (lo, hi) => {
       tabState.records.forEach((rec) => {
         if (rec.seqCodes) {
-          // clamp the deletion to this row's length — rows can be shorter than
-          // the widest row, and unclamped typed-array construction/sets throw
+          // clamp the deletion to this row's length since rows can be shorter than
+          // the widest row and unclamped typed-array constructs/sets throw
           const L = rec.seqCodes.length;
           if (L > lo) {
             const del = Math.min(hi, L - 1) - lo + 1;
@@ -8531,7 +8532,7 @@ function createTab(name, records, presetState = null) {
       tabState.consensusOverrides = reindexColumnMap(tabState.consensusOverrides, lo, hi);
       tabState.consensusColors = reindexColumnMap(tabState.consensusColors, lo, hi);
 
-      // Lazily reindex the column-keyed caches instead of wiping them: a column's
+      // lazily reindex the column-keyed caches instead of wiping them: a column's
       // stats don't depend on other columns, so surviving entries stay valid —
       // only their indexes shift. Panning after a delete stays cache-warm.
       reindexColumnCacheMap(consensusCache, lo, hi); // the Proxy's outer memo
@@ -8570,7 +8571,7 @@ function createTab(name, records, presetState = null) {
       conservationStrip.reindex(lo, hi);
       logoStrip.reindex(lo, hi);
       overviewStrip.invalidate();
-      invalidateMotifCaches(); // regex/scanprosite hit coordinates stay dropped — revert semantics are positional
+      invalidateMotifCaches(); // regex/scanprosite hit coordinates stay dropped, revert semantics are positional
       annotationCtl.rebuildBuffer();
       numberingCtl.rebuildBuffer();
       consensusCtl.rebuildBuffer();
@@ -8707,7 +8708,7 @@ function createTab(name, records, presetState = null) {
 
   // the strip initializers return destroy functions — hold on to them so
   // closeTab can stop their interval timers instead of leaking them
-  // ---- Mini strips (overview / conservation / logo) ----
+  // Mini strips (overview / conservation / logo)
   // created BEFORE the alignment renderer: its onDataChanged / onDeleteColumns
   // closures call these strips' invalidate(), so the handles must exist by the
   // time initAlignmentRenderer's config object is built
@@ -8780,7 +8781,7 @@ function createTab(name, records, presetState = null) {
     });
   }
 
-  // ---- Cross-track hover: highlight column in all tracks + info readout ----
+  // Cross-track hover: highlight column in all tracks + info readout
   function handleHover(trackType, row, col) {
     let rowLabel;
     if (trackType === "alignment") rowLabel = `seq ${row + 1}`;
@@ -8797,7 +8798,7 @@ function createTab(name, records, presetState = null) {
     alignmentCtl.setHoverRow(-1);
   }
 
-  // ---- Annotation names (editable, with 5 actions) ----
+  // Annotation names (editable, with 5 actions)
   function defaultAnnotationName(n) {
     return `(Annotations_${n})`;
   }
@@ -8927,7 +8928,7 @@ function createTab(name, records, presetState = null) {
     document.body.appendChild(overlay);
   }
 
-  //  Last-row delete rejection modal
+  // Last-row delete rejection modal
   function showLastRowModal(kind) {
     const label = kind === "annotation" ? "annotation row" : "sequence";
     const overlay = document.createElement("div");
@@ -8957,7 +8958,7 @@ function createTab(name, records, presetState = null) {
     document.body.appendChild(overlay);
   }
 
-  // ---- Sequence names panel ----
+  // Sequence names panel
   function refreshAfterRecordsChanged() {
     refreshConsensus(); // clears both consensus cache layers — rows changed, every column's stats are stale
     tabState.consensusBaked = null; // rows changed — baked consensus is stale
@@ -8980,7 +8981,7 @@ function createTab(name, records, presetState = null) {
   }
   buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
 
-  // ---- Scroll sync ----
+  // Scroll sync
   let syncingV = false;
   namesPanel.addEventListener("scroll", () => {
     if (syncingV) return;
@@ -9048,7 +9049,7 @@ function createTab(name, records, presetState = null) {
   let touchStartY = null;
   let touchStartScrollLeft = 0;
   let touchStartScrollTop = 0;
-  let touchDirection = null; // null → undecided, "h" → horizontal, "v" → vertical
+  let touchDirection = null; // null -> undecided, "h" -> horizontal, "v" -> vertical
 
   alignPanel.addEventListener("touchstart", (e) => {
     touchStartX = e.touches[0].clientX;
@@ -9082,7 +9083,7 @@ function createTab(name, records, presetState = null) {
     touchStartX = null;
     touchDirection = null;
   });
-  // ---- Divider drag ----
+  // Divider drag 
   let dragging = false;
   dividerEl.addEventListener("mousedown", (e) => {
     dragging = true;
@@ -9123,7 +9124,7 @@ function createTab(name, records, presetState = null) {
     },
     { signal }
   );
-  // ---- Window resize ----
+  // Window resize 
   window.addEventListener(
     "resize",
     () => {
@@ -9169,7 +9170,7 @@ function createTab(name, records, presetState = null) {
     { signal }
   );
 
-  // ---- Settings wiring ----
+  // Settings wiring 
   const fontSizeInput = panel.querySelector(".fontSizeInput");
   const fontSizeLabel = panel.querySelector(".fontSizeLabel");
   const luminanceInput = panel.querySelector(".luminanceInput");
@@ -9231,7 +9232,7 @@ function createTab(name, records, presetState = null) {
     return nameSpan.textContent || "alignment";
   }
 
-  // ---- File menu ----
+  // File menu 
   fileMenuBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     showDropdown(fileMenuBtn, [
@@ -9404,7 +9405,7 @@ function createTab(name, records, presetState = null) {
     ]);
   });
 
-  // ---- Shade menu ----
+  // Shade menu 
   shadeMenuBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     const shadeCtx = {
@@ -9539,9 +9540,10 @@ function createTab(name, records, presetState = null) {
   return { refreshAfterRecordsChanged, tabState }; // tabState lets callers operate on the exact array the tab renders
 }
 
+// tab limit used to be 4 prior to this; suspend inacive tabs
 function activateTab(tabId, btnEl) {
   // free the outgoing tab's GL contexts before switching — browsers cap the
-  // number of live WebGL contexts per page and evict the oldest past it
+  // number of live WebGL contexts per page to 4 and evict the oldest past it
   const prevPanel = document.querySelector(".tab-panel.active");
   if (prevPanel && prevPanel.id !== tabId) {
     const prevEntry = tabRenderers.get(prevPanel.id);
@@ -9607,7 +9609,7 @@ function reindexColumnCacheMap(map, lo, hi) {
 //  Sequence names panel (virtualized): only rows near the viewport exist in
 //  the DOM. A spacer provides the scroll range; a translated window holds the
 //  visible slice. Reordering is data-driven (by record id), so the DOM slice
-//  is disposable and re-rendered from tabState.records.
+//  is disposable and re-rendered from tabState.records
 
 function buildNamesPanel(namesPanel, tabState, onStructureChanged) {
   if (!namesPanel._vstate) {
@@ -9623,7 +9625,7 @@ function buildNamesPanel(namesPanel, tabState, onStructureChanged) {
       passive: true
     });
   }
-  renderNameWindow(namesPanel, tabState, onStructureChanged, true); // structure may have changed — always rebuild the slice
+  renderNameWindow(namesPanel, tabState, onStructureChanged, true); // structure may have changed so always rebuild the slice
 }
 
 function renderNameWindow(namesPanel, tabState, onStructureChanged, force) {
@@ -9766,12 +9768,12 @@ function showSaveProjectModal(onBlim, onSlim) {
   box.appendChild(btnRow);
   overlay.appendChild(box);
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+    if (e.target === overlay) overlay.remove(); // clicking outside means cancel
   });
   document.body.appendChild(overlay);
 }
 
-//  Confirm-delete modal
+//Confirm-delete modal\
 function showConfirmDeleteModal(label, onConfirm) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -9810,7 +9812,7 @@ function showConfirmDeleteModal(label, onConfirm) {
   document.body.appendChild(overlay);
 }
 
-//  Last-row delete rejection modal
+// Last-row delete rejection modal
 function showLastRowModal(kind) {
   const label = kind === "annotation" ? "annotation row" : "sequence";
   const overlay = document.createElement("div");
@@ -9854,9 +9856,9 @@ function mkBtn(label, title, onClick) {
 
 // sample data
 
-// ===== Examples: auto-discovered from GitHub repo =====
+// Examples: auto-discovered from GitHub repo
 const EXAMPLE_REPO = { owner: "as2654", repo: "SlimShadey-Examples", branch: "main" };
-const EXAMPLE_EXTS = [".blim", ".slim", ".mm", ".fasta", ".fa", ".faa", ".aln"];
+const EXAMPLE_EXTS = [".blim", ".slim", ".mm", ".fasta", ".fa", ".faa", ".fna"];
 //const EXAMPLE_CACHE_KEY = "slimshadey.examples.v2";
 //const EXAMPLE_CACHE_TTL = 15 * 60 * 1000; // 15 min
 
@@ -10072,7 +10074,7 @@ function readFileWithProgress(file, onProgress) {
 }
 
 // Streams a File as lines: bytes are decoded in chunks and the partial tail
-// line of one chunk is carried into the next — no giant single string is built.
+// line of one chunk is carried into the next so no giant single string is built.
 async function* readFileLines(file, onProgress) {
   const decoder = new TextDecoder("utf-8");
   const reader = file.stream().getReader();
@@ -10093,7 +10095,7 @@ async function* readFileLines(file, onProgress) {
 
 // Same streamer, but yields arrays of lines — one promise per chunk instead of
 // one per line. On a 10GB .slim (~600M lines) this is the difference between
-// a snack and a weekend.
+// a snack and a weekend :)
 async function* readFileLineBatches(file, onProgress) {
   const decoder = new TextDecoder("utf-8");
   const reader = file.stream().getReader();
@@ -10109,7 +10111,7 @@ async function* readFileLineBatches(file, onProgress) {
     leftover = lines.pop();
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i];
-      if (l.charCodeAt(l.length - 1) === 13) lines[i] = l.slice(0, -1); // tolerate \r\n files
+      if (l.charCodeAt(l.length - 1) === 13) lines[i] = l.slice(0, -1); // tolerate \r\n files, 
     }
     yield lines;
   }
@@ -10241,10 +10243,10 @@ async function precomputeLoadPass(records, onProgress) {
   return { chars, alphabet: protein ? "protein" : "nucleotide" };
 }
 
-// Per-column character histograms for the whole alignment in ONE sweep — the
+// Per-column character histograms for the whole alignment in asingle sweep — the
 // same trick as the load-time precompute pass. Returns an Int32Array indexed
 // (col << 8) | uppercasedCode. Missing tail cells count as '-' — the semantics
-// of (seq[c] || "-").toUpperCase() that the consensus algorithms were built on.
+// of (seq[c] || "-").toUpperCase() that the consensus algorithms were built on
 async function columnCountsPlane(records, colCount, onProgress) {
   const N = records.length;
   const plane = new Int32Array(colCount << 8);
@@ -10732,7 +10734,7 @@ function showExamplesModal() {
     });
   });
 }
-//  File open flow
+// File open flow
 document.getElementById("startBtn").onclick = () => document.getElementById("fileInput").click();
 document.getElementById("fileInput").onchange = (e) => {
   const file = e.target.files[0];
@@ -10743,7 +10745,7 @@ document.getElementById("fileInput").onchange = (e) => {
 
 document.getElementById("useExamplesBtn").addEventListener("click", showExamplesModal);
 
-//  Startup flourish
+// Startup flourish 
 (() => {
   const titleLink = document.getElementById("titleLink");
   const halo = document.getElementById("clickMeHalo");
@@ -10766,7 +10768,7 @@ document.getElementById("useExamplesBtn").addEventListener("click", showExamples
   if (halo) haloTimer = setTimeout(killFlourish, 4500);
 })();
 
-//  Title dropdown (GitHub / Manual)
+// Title dropdown (GitHub / Manual)
 (() => {
   const titleLink = document.getElementById("titleLink");
   if (!titleLink) return;
@@ -10790,7 +10792,7 @@ document.getElementById("useExamplesBtn").addEventListener("click", showExamples
   });
 })();
 
-// ---------- Color picker memory (recent colors, app-wide) ----------
+// Color picker memory (recent colors, app-wide) 
 const RECENT_COLORS_MAX = 12;
 let recentColors = []; // in-memory only: per tab, cleared on reload
 
@@ -10883,8 +10885,8 @@ new MutationObserver((muts) => {
 }).observe(document.body, { childList: true, subtree: true });
 armColorInputsIn(document.body);
 
-// ---- Startup capability check: WebGL2 is required to render anything ----
-// Probe once up front so a missing GPU path surfaces as a clear message
+// Startup capability check: WebGL2 is required to render anything
+// Probe once up front so a missing GPU path -> clear message
 // (instead of an unresponsive page after the user opens a file)
 function webgl2Available() {
   try {
