@@ -10683,6 +10683,7 @@ function createTab(name, records, presetState = null) {
   ro.observe(alignPanel);
 
   tabRenderers.set(tabId, {
+    tabState,
     ctls: allTrackCtls,
     ac,
     stripDestroyers,
@@ -11517,12 +11518,20 @@ function closeTab(tabId, btnEl) {
   if (entry) {
     entry.ctls.forEach((ctl) => ctl.suspend());
     if (entry.ac) entry.ac.abort();
-    (entry.stripDestroyers || []).forEach((d) => {
-      if (typeof d === "function") d();
-    });
+    entry.stripDestroyers.forEach((s) => s && s.destroy && s.destroy()); // strip controllers: { destroy, invalidate, reindex } — destroy() clears their setInterval timers
     if (entry.ro) entry.ro.disconnect();
+    tabRenderers.delete(tabId);
+    // sever the payload — any stray closure now holds empty containers, not gigabytes of typed arrays
+    if (entry.tabState) {
+      entry.tabState.records.length = 0;
+      entry.tabState.records.push({ id: 0, header: "", seq: "" }); // benign shape for late callbacks
+      entry.tabState.annotations.length = 0;
+      entry.tabState.consensusBaked = null;
+      entry.tabState.loadPlane = null;
+      entry.tabState.colorPack = null;
+      entry.tabState.virtual = null; // releases the paged File reference too
+    }
   }
-  tabRenderers.delete(tabId);
   btnEl.remove();
   panel.remove();
   if (wasActive) {
