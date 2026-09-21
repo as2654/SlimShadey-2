@@ -640,7 +640,7 @@ body {
   cursor: default;
 }
 
-.hmmer-progress-outer {
+.scan-progress-outer {
   width: 100%;
   height: 10px;
   background: #2a2a2e;
@@ -648,7 +648,7 @@ body {
   overflow: hidden;
   margin: 10px 0;
 }
-.hmmer-progress-inner {
+.scan-progress-inner {
   height: 100%;
   width: 0%;
   background: #2d6cdf;
@@ -796,7 +796,7 @@ html, body { overflow-x: clip; }
 .examples-open-btn,
 .modal-box,
 .context-menu,
-.hmmer-progress-outer,
+.scan-progress-outer,
 .click-me-halo {
   border-radius: 0;
 }

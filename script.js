@@ -692,7 +692,7 @@ function rgbFloatToHex(rgb) {
   return `#${to2(rgb[0])}${to2(rgb[1])}${to2(rgb[2])}`.toUpperCase();
 }
 
-// color palette: store 2-byte palette indices, not hex strings 
+// color palette: store 2-byte palette indices, not hex strings
 // index 0 is reserved: 0 = "no override". Read contract matches the old
 // charColors[c]: a hex string, or undefined when the cell has no override.
 const COLOR_PALETTE = ["#FFFFFF"]; // dummy; index 0 is never read
@@ -714,13 +714,30 @@ function paletteHex(i) {
 }
 
 function recordColorAt(rec, c) {
-  const arr = rec.colorIdx;
+  const s = rec.colorSparse;
+  if (s) {
+    const v = s.get(c);
+    if (v !== undefined) return v === 0 ? undefined : COLOR_PALETTE[v]; // 0 = cleared: packed stays suppressed
+  }
+  const pk = rec.colorPacked;
+  if (pk) {
+    const pack = rec.colorPack;
+    if (c >= pack.cols) return undefined;
+    const fi = blimCodeAt(pk, c, pack.bits);
+    return fi === 0 ? undefined : COLOR_PALETTE[pack.palette[fi]];
+  }
+  const arr = rec.colorIdx; // legacy dense rows (.slim bridge, older producers)
   if (!arr || c >= arr.length) return undefined;
   const i = arr[c];
   return i === 0 ? undefined : COLOR_PALETTE[i];
 }
 
 function setRecordColor(rec, c, hex) {
+  if (rec.colorPacked) {
+    if (!rec.colorSparse) rec.colorSparse = new Map();
+    rec.colorSparse.set(c, paletteIndexFor(hex)); // painted layer, the packed plane is never mutated
+    return;
+  }
   let arr = rec.colorIdx;
   if (!arr || c >= arr.length) {
     const next = new Uint16Array(Math.max(c + 1, arr ? arr.length : 0));
@@ -731,6 +748,11 @@ function setRecordColor(rec, c, hex) {
 }
 
 function clearRecordColor(rec, c) {
+  if (rec.colorPacked) {
+    if (!rec.colorSparse) rec.colorSparse = new Map();
+    rec.colorSparse.set(c, 0); // 0 = explicit clear: computed shading shows, baked does not
+    return;
+  }
   const arr = rec.colorIdx;
   if (arr && c < arr.length) arr[c] = 0;
 }
@@ -818,32 +840,38 @@ function getColorForChar(tabState, ch) {
   return map[ch.toUpperCase()] || [0.5, 0.5, 0.5];
 }
 
+// module scope, near the alphabet definitions
+const NUC_TABLE = (() => {
+  const t = new Uint8Array(256);
+  for (const ch of "ACGTUNRYSWKMBDHVX-.*") {
+    t[ch.charCodeAt(0)] = 1;
+    const lc = ch.toLowerCase();
+    if (lc !== ch) t[lc.charCodeAt(0)] = 1;
+  }
+  return t;
+})();
+const NON_NUC_RE = /[^ACGTUNRYSWKMBDHVX.*-]/i;
+
+const DETECT_BASES_PER_ROW = 65536; // per-row scan cap when exact is unaffordable
+const DETECT_MAX_ROWS = 10000; // row stride cap when row-heavy
+
 function detectAlphabet(records) {
-  const nucChars = new Set([
-    "A",
-    "C",
-    "G",
-    "T",
-    "U",
-    "N",
-    "R",
-    "Y",
-    "S",
-    "W",
-    "K",
-    "M",
-    "B",
-    "D",
-    "H",
-    "V",
-    "X",
-    "-",
-    ".",
-    "*"
-  ]);
-  for (const rec of records) {
-    for (const ch of rec.seq.toUpperCase()) {
-      if (!nucChars.has(ch)) return "protein";
+  const N = records.length;
+  if (!N) return "nucleotide";
+  let total = 0;
+  for (let i = 0; i < N; i++) total += records[i].seq.length; // facades: O(1) reads
+  const exact = total <= 50e6; // same gate as the byte-row conversion: below it, exactness is free
+  const stride = exact ? 1 : Math.max(1, Math.floor(N / DETECT_MAX_ROWS));
+  const cap = exact ? Infinity : DETECT_BASES_PER_ROW;
+  for (let r = 0; r < N; r += stride) {
+    const rec = records[r];
+    const codes = rec.seqCodes;
+    if (codes) {
+      const n = Math.min(codes.length, cap);
+      for (let i = 0; i < n; i++) if (!NUC_TABLE[codes[i]]) return "protein";
+    } else {
+      const s = rec.seq.length > cap ? rec.seq.slice(0, cap) : rec.seq;
+      if (NON_NUC_RE.test(s)) return "protein";
     }
   }
   return "nucleotide";
@@ -905,6 +933,88 @@ function categoryFor(tabState, ch) {
   return map[ch.toUpperCase()] || null;
 }
 
+// Row-striped frequency counting: each worker accumulates partial per-column
+// residue/category planes for ITS rows only, so the dataset is cloned exactly once
+// across the pool. Lookup tables are posted in; partial planes transfer back.
+const FREQ_WORKER_SOURCE = `
+"use strict";
+onmessage = (e) => {
+  const { rows, cols, nRes, nCat, charToRes, resToCat, index } = e.data;
+  try {
+    const resPlane = new Int32Array(cols * nRes);
+    const catPlane = new Int32Array(cols * nCat);
+    let rowsDone = 0, lastReport = 0;
+    for (const codes of rows) {
+      const len = codes.length;
+      for (let c = 0; c < len; c++) {
+        const idx = charToRes[codes[c]];
+        if (idx === 255) continue;
+        resPlane[c * nRes + idx]++;
+        const ci = resToCat[idx];
+        if (ci !== 255) catPlane[c * nCat + ci]++;
+      }
+      rowsDone++;
+      const now = performance.now();
+      if (now - lastReport > 150) { lastReport = now; postMessage({ type: "progress", index, rowsDone }); }
+    }
+    postMessage({ type: "done", index, rowsDone, resPlane, catPlane }, [resPlane.buffer, catPlane.buffer]);
+  } catch (err) {
+    postMessage({ type: "error", index, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+// Row-striped column histograms, batched: workers persist for the whole warm-up,
+// accumulate into their OWN partial plane across batches, and transfer it back once
+// at the end. The dataset streams through in bounded clones, never one giant copy.
+// Rectangular byte rows only, the caller gates on that and falls back otherwise.
+const COUNTS_WORKER_SOURCE = `
+"use strict";
+let plane = null, colCount = 0, index = -1;
+onmessage = (e) => {
+  const m = e.data;
+  try {
+    if (m.type === "init") {
+      colCount = m.colCount;
+      index = m.index;
+      plane = new Int32Array(colCount << 8);
+      return; // messages are FIFO per worker, init lands before any rows
+    }
+    if (m.type === "rows") {
+      let rowsDone = 0, lastReport = 0;
+      for (const codes of m.rows) {
+        for (let c = 0; c < colCount; c++) plane[(c << 8) + codes[c]]++;
+        rowsDone++;
+        const now = performance.now();
+        if (now - lastReport > 150) { lastReport = now; postMessage({ type: "batchProgress", index, rowsDone }); }
+      }
+      postMessage({ type: "batchDone", index, rowsDone });
+      return;
+    }
+    if (m.type === "flush") {
+      postMessage({ type: "done", index, plane }, [plane.buffer]);
+      plane = null;
+    }
+  } catch (err) {
+    postMessage({ type: "error", index, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+let COUNTS_WORKER_URL = null;
+function countsWorkerUrl() {
+  if (!COUNTS_WORKER_URL)
+    COUNTS_WORKER_URL = URL.createObjectURL(new Blob([COUNTS_WORKER_SOURCE], { type: "text/javascript" }));
+  return COUNTS_WORKER_URL;
+}
+
+let FREQ_WORKER_URL = null;
+function freqWorkerUrl() {
+  if (!FREQ_WORKER_URL)
+    FREQ_WORKER_URL = URL.createObjectURL(new Blob([FREQ_WORKER_SOURCE], { type: "text/javascript" }));
+  return FREQ_WORKER_URL;
+}
+
 //  Shading mode color functions
 // content-only tables: rebuilt only when the alphabet or row set changes
 function frequencyContentHeader(tabState) {
@@ -936,15 +1046,20 @@ function frequencyContentHeader(tabState) {
   return { alphaList, residueKeys, categoryOrder, catOf, charToRes, resToCat, seqNum: tabState.records.length };
 }
 
-// counting pass — allocation-free, hash-free: two table reads + two typed-array
+// counting pass, allocation-free, hash-free: two table reads + two typed-array
 // increments per cell. (lifted verbatim from the old computeFrequencyColumnColor)
 function computeFrequencyColumnCounts(tabState, header, col) {
+  if (tabState.virtual)
+    return {
+      resCount: new Int32Array(header.residueKeys.length),
+      catCount: new Int32Array(header.categoryOrder.length)
+    };
   const { charToRes, resToCat, residueKeys, categoryOrder } = header;
   const resCount = new Int32Array(residueKeys.length);
   const catCount = new Int32Array(categoryOrder.length);
   const records = tabState.records;
   for (let ri = 0; ri < records.length; ri++) {
-    const code = colCodeAt(records[ri], col); // raw byte-row read — no facade trap
+    const code = colCodeAt(records[ri], col); // raw byte-row read, no facade trap
     const idx = code < 256 ? charToRes[code] : 255;
     if (idx === 255) continue; // gaps and non-residues don't count, as before
     resCount[idx]++;
@@ -954,7 +1069,7 @@ function computeFrequencyColumnCounts(tabState, header, col) {
   return { resCount, catCount };
 }
 
-// coloring pass — cheap: ~30 alphabet entries per column. Runs from cached counts,
+// coloring pass, cheap: ~30 alphabet entries per column. Runs from cached counts,
 // so threshold/color/inverse tweaks never recount.
 function frequencyColumnMap(header, levels, counts, threshold) {
   const { alphaList, residueKeys, categoryOrder, catOf, seqNum } = header;
@@ -996,12 +1111,158 @@ function frequencyColumnMap(header, levels, counts, threshold) {
   return colColors;
 }
 
+// Frequency counts straight from the retained load plane: the plane already holds
+// per-column counts for every byte (lowercase folded), this is a regrouping, not a recount.
+function countsFromLoadPlane(plane, header, col) {
+  const { residueKeys, categoryOrder, resToCat } = header;
+  const resCount = new Int32Array(residueKeys.length);
+  const catCount = new Int32Array(categoryOrder.length);
+  const base = col << plane.shift;
+  for (let i = 0; i < residueKeys.length; i++) {
+    const n = plane.counts[base + plane.toDense[residueKeys[i].charCodeAt(0)]];
+    if (!n) continue;
+    resCount[i] = n;
+    const ci = resToCat[i];
+    if (ci !== 255) catCount[ci] += n;
+  }
+  return { resCount, catCount };
+}
+
+// Pre-builds all column counts for frequency shading. Three tiers: instant from the
+// load plane, parallel for moderate plane-less tabs, and a quiet no-op that leaves
+// the lazy per-column path in charge for small/string/huge tabs. Fire-and-forget:
+// the lazy path remains correct while this runs (identical values, last write wins).
+async function warmFrequencyCounts(tabState, cache) {
+  if (cache.warming) return;
+  cache.warming = true;
+  const workers = [];
+  try {
+    const records = tabState.records;
+    const N = records.length;
+    if (!N) return;
+    let cols = 0;
+    for (let r = 0; r < N; r++) {
+      const sc = records[r].seqCodes;
+      if (!sc) {
+        console.warn("[freq] warm skip: string/mixed tab");
+        return;
+      }
+      if (sc.length > cols) cols = sc.length;
+    }
+    const plane = tabState.loadPlane;
+    console.log(
+      "[freq] warm:",
+      N,
+      "rows ×",
+      cols,
+      "cols | plane:",
+      plane ? "rows=" + plane.rows + " cols=" + plane.cols : "none"
+    );
+    if (!cols) return;
+    const header = cache.header;
+    const key = cache.contentKey;
+
+    // tier 1: the load plane already counted every byte per column
+    //const plane = tabState.loadPlane;
+    if (plane && plane.rows === N && plane.cols >= cols) {
+      for (let c = 0; c < cols; c++) cache.counts[c] = countsFromLoadPlane(plane, header, c);
+      cache.n = cols;
+      return;
+    }
+
+    if (typeof Worker === "undefined") return;
+    if (N * cols < 1 << 22) return; // small tabs: lazy counting is cheaper than worker startup
+    if (N * cols > 2 ** 31) return; // cloning cap: huge plane-less tabs stay lazy
+
+    const prog = showProgressOverlay("Frequency shading");
+    prog.setLabel("Counting residues…");
+    prog.setProgress(0, N);
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const W = Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+      const stripe = Math.ceil(N / W);
+      const dones = new Float64Array(W);
+      const report = () => {
+        let t = 0;
+        for (let i = 0; i < W; i++) t += dones[i];
+        prog.setProgress(Math.min(t, N), N);
+      };
+      const jobs = [];
+      for (let k = 0; k < W; k++) {
+        const lo = k * stripe,
+          hi = Math.min(N, lo + stripe);
+        if (lo >= hi) continue;
+        const w = new Worker(freqWorkerUrl());
+        workers.push(w);
+        const rows = [];
+        for (let r = lo; r < hi; r++) rows.push(records[r].seqCodes); // CLONED, no transfer list
+        jobs.push(
+          new Promise((resolve, reject) => {
+            w.onmessage = (e) => {
+              const m = e.data;
+              if (m.type === "progress") {
+                dones[m.index] = m.rowsDone;
+                report();
+              } else if (m.type === "done") {
+                dones[m.index] = m.rowsDone;
+                report();
+                resolve(m);
+              } else {
+                reject(new Error(m.message));
+              }
+            };
+            w.onerror = (err) => reject(new Error(err.message || "worker error"));
+            w.postMessage({
+              rows,
+              cols,
+              nRes: header.residueKeys.length,
+              nCat: header.categoryOrder.length,
+              charToRes: header.charToRes,
+              resToCat: header.resToCat,
+              index: k
+            });
+          })
+        );
+      }
+      const parts = await Promise.all(jobs);
+      if (cache.contentKey !== key) return; // content changed mid-warm, discard
+
+      const nRes = header.residueKeys.length,
+        nCat = header.categoryOrder.length;
+      const resPlane = new Int32Array(cols * nRes);
+      const catPlane = new Int32Array(cols * nCat);
+      for (const p of parts) {
+        for (let i = 0; i < resPlane.length; i++) resPlane[i] += p.resPlane[i];
+        for (let i = 0; i < catPlane.length; i++) catPlane[i] += p.catPlane[i];
+      }
+      for (let c = 0; c < cols; c++)
+        cache.counts[c] = {
+          resCount: resPlane.subarray(c * nRes, (c + 1) * nRes),
+          catCount: catPlane.subarray(c * nCat, (c + 1) * nCat)
+        };
+      cache.n = cols;
+    } finally {
+      prog.close();
+      workers.forEach((w) => w.terminate());
+      if (FREQ_WORKER_URL) {
+        URL.revokeObjectURL(FREQ_WORKER_URL);
+        FREQ_WORKER_URL = null;
+      }
+    }
+  } catch (err) {
+    console.warn("[frequency] warm-up failed, staying lazy:", err);
+  } finally {
+    cache.warming = false;
+  }
+}
+
 function computeFrequencyShadeColor(tabState, row, col, ch) {
+  if (tabState.freqWarming) return [1, 1, 1]; // warm in flight, paint white, never lazy-count O(rows)
   const cfg = tabState.shadeConfig.frequency;
   const contentKey = tabState.alphabet + "|" + tabState.records.length;
   const cfgKey = [cfg.threshold, cfg.identityHex, cfg.similarHex, cfg.diffHex, cfg.inverse].join("|");
   let cache = tabState.frequencyColumns;
-  if (!cache || !cache.cols)
+  if (!cache || !cache.cols) {
     cache = tabState.frequencyColumns = {
       header: frequencyContentHeader(tabState),
       cols: {},
@@ -1010,6 +1271,8 @@ function computeFrequencyShadeColor(tabState, row, col, ch) {
       n: 0,
       contentKey
     };
+    warmFrequencyCounts(tabState, cache); // once per cache lifetime, lazy counting covers the interim
+  }
   if (cache.contentKey !== contentKey) {
     // alphabet or row set changed: counts are content sowe rebuild tables AND recount
     cache.contentKey = contentKey;
@@ -1017,6 +1280,7 @@ function computeFrequencyShadeColor(tabState, row, col, ch) {
     cache.counts = {};
     cache.maps = {};
     cache.n = 0;
+    warmFrequencyCounts(tabState, cache); // once per content change, correct as you have it
   }
   if (cache.cfgKey !== cfgKey) {
     cache.cfgKey = cfgKey;
@@ -1087,9 +1351,15 @@ function matrixColumnRef(tabState, header, col) {
     const ch = header.refSeq && col < header.refSeq.length ? header.refSeq[col] : "-";
     return ch === "-" || ch === "." ? null : ch;
   }
+  if (tabState.virtual) return null; // no lazy O(rows) on paged tabs, the plane covered what it could
   const records = tabState.records;
   const rowCount = records.length;
   if (rowCount === 0) return null;
+  window.__mcr = (window.__mcr || 0) + 1;
+  if (window.__mcr <= 5 || window.__mcr % 100 === 0)
+    console.log(
+      "[matrixColumnRef] full O(rows) count #" + window.__mcr + " col=" + col + " t=" + Math.round(performance.now())
+    );
   const counts = {};
   for (let r = 0; r < rowCount; r++) {
     const seq = records[r].seq;
@@ -1124,12 +1394,83 @@ function matrixColorRowFor(header, refCh) {
   return rowColors;
 }
 
+// Majority refs from the retained dense load plane. Omitted columns stay lazy:
+// ties (the exact path's tie-break is first-seen row order, unknowable from counts)
+// and OTHER-bucket columns (exotic bytes the dense plane folds away).
+function matrixRefsFromDensePlane(plane, colCount, rowCount, threshold) {
+  const refs = {};
+  const { counts, denseChar, shift, otherSlot } = plane;
+  for (let c = 0; c < colCount; c++) {
+    const base = c << shift;
+    if (counts[base + otherSlot] > 0) continue;
+    let bestSlot = -1,
+      bestCount = -1,
+      tie = false;
+    for (let s = 0; s < otherSlot; s++) {
+      const n = counts[base + s];
+      if (n > bestCount) {
+        bestCount = n;
+        bestSlot = s;
+        tie = false;
+      } else if (n === bestCount) tie = true;
+    }
+    if (tie || bestCount <= 0) continue;
+    const ch = String.fromCharCode(denseChar[bestSlot]);
+    refs[c] = bestCount / rowCount > threshold && ch !== "-" && ch !== "." ? ch : null;
+  }
+  return refs;
+}
+
+// Same from the 256-slot counts plane (parallel or single sweep). Also bails to
+// lazy on any byte ≥ 128 (JS toUpperCase folds Latin-1, the sweep doesn't) and on
+// columns whose total ≠ rowCount (the sweep skips >255 codes from string rows).
+function matrixRefsFromCountsPlane(plane, colCount, rowCount, threshold) {
+  const refs = {};
+  for (let c = 0; c < colCount; c++) {
+    const base = c << 8;
+    let total = 0,
+      best = -1,
+      bestCount = -1,
+      tie = false,
+      high = false;
+    for (let k = 0; k < 256; k++) {
+      const n = plane[base + k];
+      total += n;
+      if (k >= 128 && n) high = true;
+      if (n > bestCount) {
+        bestCount = n;
+        best = k;
+        tie = false;
+      } else if (n === bestCount) tie = true;
+    }
+    if (tie || high || total !== rowCount || bestCount <= 0) continue;
+    const ch = String.fromCharCode(best);
+    refs[c] = bestCount / rowCount > threshold && ch !== "-" && ch !== "." ? ch : null;
+  }
+  return refs;
+}
+
+function matrixCfgKey(cfg) {
+  return [cfg.mode, cfg.matrixName, cfg.matchHex, cfg.mismatchHex, cfg.refSeqId, cfg.shadeMaster, cfg.frequency].join(
+    "|"
+  );
+}
+
 function computeMatrixShadeColor(tabState, row, col, ch) {
+  if (tabState.matrixWarming) return [1, 1, 1]; // warm in flight, paint white, never lazy-count O(rows)
+  const cfg = tabState.shadeConfig.matrix;
   let cache = tabState.matrixCache;
   if (!cache || !cache.colRef) {
-    cache = tabState.matrixCache = { header: matrixCacheHeader(tabState), colRef: {}, tables: {} };
+    cache = tabState.matrixCache = { header: matrixCacheHeader(tabState), colRef: {}, tables: {}, cfgKey: null };
   }
-  const cfg = tabState.shadeConfig.matrix;
+  const key = matrixCfgKey(cfg);
+  if (cache.cfgKey !== key) {
+    // mode/matrix/colors/threshold changed, refs and per-ref tables are stale
+    cache.cfgKey = key;
+    cache.header = matrixCacheHeader(tabState);
+    cache.colRef = {};
+    cache.tables = {};
+  }
   if (cache.header.mode === "sequence" && row === cache.header.refIndex && !cfg.shadeMaster) return [1, 1, 1];
   let ref = cache.colRef[col];
   if (ref === undefined) ref = cache.colRef[col] = matrixColumnRef(tabState, cache.header, col);
@@ -1163,6 +1504,7 @@ function computeUniqueColumnColor(tabState, col) {
 // threshold/color tweaks. Allocation-free counting: 60k-row columns recompute
 // per visible column; string ops would dominate.
 function computeUniqueColumnCounts(tabState, col) {
+  if (tabState.virtual) return new Map();
   const counts = new Map();
   const records = tabState.records;
   for (let r = 0; r < records.length; r++) {
@@ -1174,6 +1516,7 @@ function computeUniqueColumnCounts(tabState, col) {
 }
 
 function computeUniqueShadeColor(tabState, col, ch) {
+  if (tabState.uniqueWarming) return [1, 1, 1]; // warm in flight, paint white, never lazy-count O(rows)
   let cache = tabState.uniqueColCounts;
   if (!cache || !cache.cols)
     cache = tabState.uniqueColCounts = { cols: {}, cfgStamp: JSON.stringify(tabState.shadeConfig.unique) };
@@ -1338,6 +1681,73 @@ function showFrequencyShadeModal(tabState, ctx) {
   applyAndRebuild(); // apply on open same as the unique/matrix/sequence modals; warmup shows here
 }
 
+// Shared scan worker: rows (byte or string) + patterns in, per-row hit Maps out
+// ([rowIdx, Map<col, key>|null] pairs, Maps are structured-cloneable). degap jobs
+// (PROSITE) rebuild a colMap per row and translate hits back to alignment columns.
+// Rows are CLONED in, never transferred, so the tab's seqCodes stay attached.
+const SCAN_WORKER_SOURCE = `
+"use strict";
+const codesToString = (codes) => {
+  let s = "";
+  for (let off = 0; off < codes.length; off += 8192)
+    s += String.fromCharCode.apply(null, codes.subarray(off, off + 8192));
+  return s;
+};
+onmessage = (e) => {
+  const { rows, patterns, degap, overlap, index } = e.data;
+  try {
+    const scanners = patterns.map((p) => ({ re: new RegExp(p.source, "g"), key: p.key }));
+    const rowHits = []; // [rowIdx, Map<col, key>|null]
+    let lastReport = 0, rowsDone = 0;
+    for (const { rowIdx, codes, str } of rows) {
+      let text = codes ? codesToString(codes) : str;
+      let colMap = null;
+      if (degap) {
+        const map = [];
+        let out = "";
+        for (let c = 0; c < text.length; c++) {
+          const ch = text[c];
+          if (ch === "-") continue; // MUST mirror degapWithColMap's gap set, add "." here if it strips dots
+          map.push(c);
+          out += ch;
+        }
+        text = out.toUpperCase();
+        colMap = map;
+      }
+      let map = null;
+      for (const { re, key } of scanners) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          if (m[0].length > 0) {
+            let s = m.index, en = m.index + m[0].length - 1;
+            if (colMap) { s = colMap[s]; en = colMap[en]; }
+            if (!map) map = new Map();
+            for (let c = s; c <= en; c++) map.set(c, key);
+          }
+          if (overlap) re.lastIndex = m.index + 1; // PROSITE: overlapping matches, zero-length safe
+          else if (m[0].length === 0) re.lastIndex++; // regex shading: engine semantics, zero-width guard
+        }
+      }
+      rowHits.push([rowIdx, map]);
+      rowsDone++;
+      const now = performance.now();
+      if (now - lastReport > 150) { lastReport = now; postMessage({ type: "progress", index, rowsDone }); }
+    }
+    postMessage({ type: "done", index, rowsDone, rowHits });
+  } catch (err) {
+    postMessage({ type: "error", index, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+let SCAN_WORKER_URL = null;
+function scanWorkerUrl() {
+  if (!SCAN_WORKER_URL)
+    SCAN_WORKER_URL = URL.createObjectURL(new Blob([SCAN_WORKER_SOURCE], { type: "text/javascript" }));
+  return SCAN_WORKER_URL;
+}
+
 function randomHexColor() {
   const r = Math.floor(Math.random() * 200 + 30);
   const g = Math.floor(Math.random() * 200 + 30);
@@ -1454,7 +1864,7 @@ function prositePatternToRegex(pattern) {
   return new RegExp((anchoredStart ? "^" : "") + out + (anchoredEnd ? "$" : ""));
 }
 
-function showHmmerLoadingOverlay() {
+function showScanningLoadingOverlay() {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   const box = document.createElement("div");
@@ -1462,9 +1872,9 @@ function showHmmerLoadingOverlay() {
   box.innerHTML = `<h3>Scanning...</h3>`;
 
   const barOuter = document.createElement("div");
-  barOuter.className = "hmmer-progress-outer";
+  barOuter.className = "scan-progress-outer";
   const barInner = document.createElement("div");
-  barInner.className = "hmmer-progress-inner";
+  barInner.className = "scan-progress-inner";
   barOuter.appendChild(barInner);
   box.appendChild(barOuter);
 
@@ -1476,20 +1886,234 @@ function showHmmerLoadingOverlay() {
   overlay.appendChild(box);
   document.body.appendChild(overlay);
 
+  let phase = "";
   return {
+    setLabel: (s) => {
+      phase = s;
+    },
     setProgress: (done, total) => {
       const pct = total ? Math.round((done / total) * 100) : 0;
       barInner.style.width = pct + "%";
-      statusText.textContent = `Completed ${done} / ${total} searches...`;
+      statusText.textContent =
+        (phase ? phase + " " : "") + (total === 1 ? pct + "%" : `Completed ${done} / ${total} searches...`);
     },
     close: () => overlay.remove()
   };
 }
 
+// Dedup rows by exact sequence identity, byte rows hash via hashCodes (word-wise
+// FNV, cached on rec.h), string rows key on the string itself. Fixes the old
+// Map(rec.seq) dedup, which keyed facades by identity: on byte tabs, nothing deduped.
+async function deduplicateRows(records, onProgress) {
+  const N = records.length;
+  const repForRow = new Int32Array(N);
+  const reps = [];
+  const buckets = new Map(); // hash -> rep row indices (byte rows)
+  const byString = new Map(); // seq string -> rep row (string rows)
+  const eq = (a, b) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let last = performance.now();
+  for (let r = 0; r < N; r++) {
+    const rec = records[r];
+    if (rec.seqCodes) {
+      const h = rec.h !== undefined ? rec.h : (rec.h = hashCodes(rec.seqCodes));
+      const bucket = buckets.get(h);
+      let rep = -1;
+      if (bucket)
+        for (const j of bucket)
+          if (eq(records[j].seqCodes, rec.seqCodes)) {
+            rep = j;
+            break;
+          }
+      if (rep === -1) {
+        rep = r;
+        reps.push(r);
+        if (bucket) bucket.push(r);
+        else buckets.set(h, [r]);
+      }
+      repForRow[r] = rep;
+    } else {
+      const s = rec.seq;
+      if (byString.has(s)) repForRow[r] = byString.get(s);
+      else {
+        byString.set(s, r);
+        reps.push(r);
+        repForRow[r] = r;
+      }
+    }
+    if ((r & 1023) === 1023) {
+      if (onProgress) onProgress(r + 1, N);
+      if (performance.now() - last > 30) {
+        await tick();
+        last = performance.now();
+      }
+    }
+  }
+  if (onProgress) onProgress(N, N);
+  return { reps, repForRow };
+}
+
+// Single-threaded scan, same semantics as the worker, the fallback path, and the
+// reference implementation for correctness spot-checks. Returns [rowIdx, Map|null] pairs.
+async function scanOnMain(records, reps, patterns, degap, overlap, onProgress) {
+  const scanners = patterns.map((p) => ({ re: new RegExp(p.source, "g"), key: p.key }));
+  const rowHits = [];
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let last = performance.now();
+  for (let i = 0; i < reps.length; i++) {
+    const rec = records[reps[i]];
+    let text,
+      colMap = null;
+    if (degap) {
+      const d = degapWithColMap(rec.seq, rec.seqCodes);
+      text = d.degapped.toUpperCase();
+      colMap = d.colMap;
+    } else {
+      text = String(rec.seq);
+    }
+    let map = null;
+    for (const { re, key } of scanners) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (m[0].length > 0) {
+          let s = m.index,
+            en = m.index + m[0].length - 1;
+          if (colMap) {
+            s = colMap[s];
+            en = colMap[en];
+          }
+          if (!map) map = new Map();
+          for (let c = s; c <= en; c++) map.set(c, key);
+        }
+        if (overlap) re.lastIndex = m.index + 1;
+        else if (m[0].length === 0) re.lastIndex++;
+      }
+    }
+    rowHits.push([reps[i], map]);
+    if (onProgress) onProgress(i + 1, reps.length);
+    if (performance.now() - last > 30) {
+      await tick();
+      last = performance.now();
+    }
+  }
+  return rowHits;
+}
+
+async function scanWithWorkers(records, reps, patterns, degap, overlap, onProgress) {
+  const W = workerPoolSize();
+  const stripe = Math.ceil(reps.length / W);
+  const dones = new Float64Array(W);
+  const workers = [];
+  const report = () => {
+    let t = 0;
+    for (let i = 0; i < W; i++) t += dones[i];
+    if (onProgress) onProgress(Math.min(t, reps.length), reps.length);
+  };
+  try {
+    const jobs = [];
+    for (let k = 0; k < W; k++) {
+      const lo = k * stripe,
+        hi = Math.min(reps.length, lo + stripe);
+      if (lo >= hi) continue;
+      const w = new Worker(scanWorkerUrl());
+      workers.push(w);
+      const rows = [];
+      for (let i = lo; i < hi; i++) {
+        const rec = records[reps[i]];
+        rows.push(
+          rec.seqCodes
+            ? { rowIdx: reps[i], codes: rec.seqCodes, str: null }
+            : { rowIdx: reps[i], codes: null, str: String(rec.seq) }
+        );
+      }
+      jobs.push(
+        new Promise((resolve, reject) => {
+          w.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === "progress") {
+              dones[m.index] = m.rowsDone;
+              report();
+            } else if (m.type === "done") {
+              dones[m.index] = m.rowsDone;
+              report();
+              resolve(m.rowHits);
+            } else {
+              reject(new Error(m.message));
+            }
+          };
+          w.onerror = (err) => {
+            console.error("[scan worker " + k + "] " + (err.message || "error"));
+            reject(new Error(err.message || "worker error"));
+          };
+          w.postMessage({
+            rows,
+            patterns: patterns.map((p) => ({ source: p.source, key: p.key })),
+            degap,
+            overlap,
+            index: k
+          });
+          // no transfer list, structured CLONE; the tab keeps its seqCodes attached
+        })
+      );
+    }
+    const parts = await Promise.all(jobs);
+    return parts.flat();
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (SCAN_WORKER_URL) {
+      URL.revokeObjectURL(SCAN_WORKER_URL);
+      SCAN_WORKER_URL = null;
+    }
+  }
+}
+
+// Core parallel scan: dedup → stripe representatives across workers (hits arrive as
+// per-row Maps, expanded inside the workers) → fan hits out to duplicate rows by
+// SHARING the representative's Map (all consumers are read-only).
+// onProgress(done, total, phase), phase is "dedup" or "scan"; scan totals are in
+// pattern-searches so legacy overlays keep their meaning.
+async function runParallelScan(tabState, patterns, { degap, overlap }, onProgress) {
+  if (virtualGate(tabState, "Pattern scanning")) return { hitsByRow: null };
+  const records = tabState.records;
+  const N = records.length;
+  if (!patterns.length || !N)
+    return { hitsByRow: records.map(() => new Map()), reps: [], repForRow: new Int32Array(N) };
+
+  if (onProgress) onProgress(0, N, "dedup");
+  const { reps, repForRow } = await deduplicateRows(records, (d, t) => onProgress && onProgress(d, t, "dedup"));
+
+  const P = patterns.length;
+  const scanProgress = (d, t) => onProgress && onProgress(d * P, t * P, "scan");
+  let rowHits = null;
+  if (typeof Worker !== "undefined" && reps.length >= 2) {
+    try {
+      rowHits = await scanWithWorkers(records, reps, patterns, degap, overlap, scanProgress);
+    } catch (err) {
+      console.warn("[scan] parallel scan failed, falling back:", err);
+    }
+  }
+  if (!rowHits) rowHits = await scanOnMain(records, reps, patterns, degap, overlap, scanProgress);
+
+  const hitsByRow = new Array(N);
+  for (const [rowIdx, map] of rowHits) hitsByRow[rowIdx] = map || new Map();
+  // duplicates SHARE their representative's Map, every consumer is read-only,
+  // and a copy-per-duplicate costs O(dup rows × hit cells) for zero benefit
+  for (let r = 0; r < N; r++) {
+    const rep = repForRow[r];
+    hitsByRow[r] = rep === r ? hitsByRow[r] || new Map() : hitsByRow[rep];
+  }
+  return { hitsByRow, reps, repForRow };
+}
+
 async function runScanPrositeShading(tabState, ctx) {
   const cfg = tabState.shadeConfig.scanprosite;
 
-  const loading = showHmmerLoadingOverlay();
+  const loading = showScanningLoadingOverlay();
 
   let db;
   try {
@@ -1500,58 +2124,20 @@ async function runScanPrositeShading(tabState, ctx) {
     return;
   }
 
-  const hitsByRow = tabState.records.map(() => new Map());
-  const colorsByName = {};
-
-  // dereplicate: only unique sequences are scanned; identical copies inherit hits
-  const repOf = new Map(); // sequence string -> representative row index
-  const repForRow = new Array(tabState.records.length);
-  const rowsToScan = [];
-  tabState.records.forEach((rec, r) => {
-    if (repOf.has(rec.seq)) {
-      repForRow[r] = repOf.get(rec.seq);
-    } else {
-      repOf.set(rec.seq, r);
-      repForRow[r] = r;
-      rowsToScan.push(r);
-    }
+  const patterns = db.map((entry) => ({ source: entry.regex.source, key: entry.name }));
+  const { hitsByRow } = await runParallelScan(tabState, patterns, { degap: true, overlap: true }, (d, t, phase) => {
+    loading.setLabel(phase === "dedup" ? "Deduplicating..." : "Scanning...");
+    loading.setProgress(phase === "dedup" ? (d / t) * 0.3 : 0.3 + (d / t) * 0.7, 1);
   });
 
-  // compile each pattern once, globally: the engine scans natively instead of
-  // JS slicing the sequence at every position
-  const scanners = db.map((entry) => ({ name: entry.name, re: new RegExp(entry.regex.source, "g") }));
-  const totalSteps = rowsToScan.length * scanners.length;
-  let step = 0;
-
-  for (const row of rowsToScan) {
-    const rec = tabState.records[row];
-    const { degapped, colMap } = degapWithColMap(rec.seq, rec.seqCodes);
-    const upper = degapped.toUpperCase();
-    for (const { name, re } of scanners) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(upper)) !== null) {
-        const start = m.index;
-        const end = start + m[0].length - 1;
-        if (!colorsByName[name]) colorsByName[name] = randomHexColor();
-        for (let c = start; c <= end && c < colMap.length; c++) {
-          hitsByRow[row].set(colMap[c], name);
-        }
-        re.lastIndex = m.index + 1; // overlapping matches are found; zero-length matches can't loop
-      }
-      step++;
-      if ((step & 31) === 0) {
-        loading.setProgress(step, totalSteps);
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-    }
-    loading.setProgress(step, totalSteps);
-  }
-
-  // fan out: duplicates get an independent copy of their representative's hits
-  for (let r = 0; r < tabState.records.length; r++) {
-    if (repForRow[r] !== r) hitsByRow[r] = new Map(hitsByRow[repForRow[r]]);
-  }
+  // colors for exactly the patterns that hit something, same set as the old
+  // first-sighting assignment, assigned here in row order
+  const colorsByName = {};
+  hitsByRow.forEach((m) =>
+    m.forEach((name) => {
+      if (!colorsByName[name]) colorsByName[name] = randomHexColor();
+    })
+  );
 
   cfg.hitsByRow = hitsByRow;
   cfg.colorsByName = colorsByName;
@@ -1596,6 +2182,7 @@ async function runScanPrositeShading(tabState, ctx) {
   loading.close();
   showScanPrositeColorLegendModal(tabState, ctx);
 }
+
 function showScanPrositeColorLegendModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.scanprosite;
   const overlay = document.createElement("div");
@@ -1662,52 +2249,25 @@ async function computeRegexHits(tabState, onProgress) {
   const cfg = tabState.shadeConfig.regex;
   const compiled = cfg.patterns
     .filter((p) => p.pattern.trim())
-    .map((p) => {
-      try {
-        return { re: new RegExp(p.pattern, "g"), colorHex: p.colorHex.replace("#", "") };
-      } catch (err) {
-        return null; // invalid pattern: excluded from scanning, flagged to the user
-      }
-    })
-    .filter(Boolean);
+    .map((p) => ({ source: p.pattern, key: p.colorHex.replace("#", "") }))
+    .filter((p) => safeCompile(p.source)); // invalid patterns: excluded from scanning, flagged to the user
 
   // report invalid patterns back to the modal if it's open
   if (typeof window._regexMarkInvalid === "function") {
     window._regexMarkInvalid(cfg.patterns.map((p) => !p.pattern.trim() || !safeCompile(p.pattern)));
   }
 
-  const records = tabState.records;
-  const total = records.length;
-  const hitsByRow = new Array(total);
-  let lastYield = performance.now();
-
-  for (let r = 0; r < total; r++) {
-    const rowHits = new Map();
-    hitsByRow[r] = rowHits; // every row gets a Map, even an empty one bc downstream forEach relies on the shape
-    const seq = records[r].seq;
-    compiled.forEach(({ re, colorHex }) => {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(seq)) !== null) {
-        for (let c = m.index; c < m.index + m[0].length; c++) {
-          rowHits.set(c, colorHex);
-        }
-        if (m[0].length === 0) re.lastIndex++;
-      }
-    });
-
-    // clock checked EVERY row: performance.now() costs microseconds, and with
-    // 30k-char rows even a handful of rows between checks can exceed Chrome's
-    // unresponsive-dialog threshold. Yields happen at most ~20x/sec
-    const now = performance.now();
-    if (now - lastYield > 50) {
-      if (onProgress) onProgress(r + 1, total);
-      await new Promise((res) => setTimeout(res, 0));
-      lastYield = performance.now();
-    }
+  if (!compiled.length) {
+    cfg.hitsByRow = tabState.records.map(() => new Map());
+    return;
   }
 
-  if (onProgress) onProgress(total, total);
+  const { hitsByRow } = await runParallelScan(
+    tabState,
+    compiled,
+    { degap: false, overlap: false },
+    (d, t, phase) => onProgress && onProgress(d, t, phase)
+  );
   cfg.hitsByRow = hitsByRow;
 }
 
@@ -1734,7 +2294,7 @@ async function regexSearchWithProgress(pattern, tabState, onMatch) {
   } catch (err) {}
 
   // critical: give the browser two frames so the modal actually renders
-  // before the synchronous regex work begins — otherwise it never appears
+  // before the synchronous regex work begins, otherwise it never appears
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   let re;
@@ -1783,24 +2343,241 @@ function computeRegexShadeColor(tabState, row, col, ch) {
   return colorHex ? hexToRgbFloat(colorHex) : null;
 }
 
-function sortBySequenceSimilarity(tabState, refId, onDone) {
-  const ref = tabState.records.find((r) => r.id === refId);
-  if (!ref) return;
-  const scored = tabState.records.map((rec) => {
-    let score = 0;
-    const len = Math.min(rec.seq.length, ref.seq.length);
-    for (let i = 0; i < len; i++) {
-      const a = (ref.seq[i] || "-").toUpperCase();
-      const b = (rec.seq[i] || "-").toUpperCase();
-      if (a === "-" || b === "-") continue;
-      score += getSubstitutionScore("BLOSUM62", a, b);
+// Similarity-scoring worker: stateless per batch after init. Rows arrive as
+// TRANSFERRED copies (the tab's own seqCodes stay attached, the counts-sweep
+// lesson) and scores leave the same way. Identical inner loop to the serial path.
+const SORTWORKER_SOURCE = `
+"use strict";
+let REF = null, TABLE = null, ISNUC = false, INDEX = -1;
+onmessage = (e) => {
+  const m = e.data;
+  try {
+    if (m.type === "init") {
+      REF = m.refCodes; TABLE = m.T; ISNUC = m.isNuc; INDEX = m.index;
+      return;
     }
-    return { rec, score };
-  });
-  scored.sort((x, y) => y.score - x.score);
-  tabState.records.length = 0;
-  tabState.records.push(...scored.map((s) => s.rec));
-  onDone();
+    if (m.type === "rows") {
+      const out = new Float64Array(m.rows.length);
+      for (let q = 0; q < m.rows.length; q++) {
+        const codes = m.rows[q];
+        const len = Math.min(codes.length, REF.length);
+        let score = 0;
+        for (let i = 0; i < len; i++) {
+          const a = REF[i];
+          if (a === 45) continue; // gap in the reference: no score
+          let b = codes[i];
+          if (b >= 97 && b <= 122) b -= 32;
+          if (b === 45) continue; // gap in the row: no score
+          if (ISNUC) { if (a === b) score++; }
+          else { if (b > 255) b = 88; score += TABLE[(a << 8) | b]; }
+        }
+        out[q] = score;
+      }
+      postMessage({ type: "done", index: INDEX, offset: m.offset, scores: out }, [out.buffer]);
+    }
+  } catch (err) {
+    postMessage({ type: "error", index: INDEX, message: String((err && err.message) || err) });
+  }
+};`;
+
+let SORTWORKER_URL = null;
+function sortWorkerUrl() {
+  if (!SORTWORKER_URL) SORTWORKER_URL = URL.createObjectURL(new Blob([SORTWORKER_SOURCE], { type: "text/javascript" }));
+  return SORTWORKER_URL;
+}
+
+// Pull-based striped scoring: persistent workers grab byte-bounded batches as they
+// finish, so fast workers take more rows and a 250MB chromosome is just a batch of
+// one. Worker count tapers by reference length, every worker holds a CLONE of the
+// folded reference, and 8 x 250MB is not a plan.
+async function scoreRowsParallel(records, scores, refCodes, T, isNuc, prog, totalCells) {
+  const N = records.length;
+  const refLen = refCodes.length;
+  // inline pool sizing (same formula as the counts driver), workerPoolSize went
+  // missing in an edit storm once already, and Math.max(2, NaN) is NaN: zero
+  // workers, zero batches, zero cells. Never trust a shared constant here.
+  const W = Math.max(
+    2,
+    Math.min(16, (navigator.hardwareConcurrency || 4) - 1, Math.max(2, Math.floor((2 * 2 ** 30) / Math.max(1, refLen))))
+  );
+  const BATCH_BYTES = 256 << 20;
+  const workers = [];
+  let nextRow = 0;
+  let doneCells = 0; // hoisted out of the try: the finally/probe scope trap
+  try {
+    for (let k = 0; k < W; k++) {
+      const w = new Worker(sortWorkerUrl());
+      workers.push(w);
+      w.postMessage({ type: "init", refCodes, T, isNuc, index: k }); // cloned once per worker
+    }
+    const sendBatch = (w, lo, hi) => {
+      const rows = [],
+        transfers = [];
+      let cells = 0;
+      for (let r = lo; r < hi; r++) {
+        const copy = records[r].seqCodes.slice(); // memcpy, originals stay attached
+        rows.push(copy);
+        transfers.push(copy.buffer);
+        cells += Math.min(records[r].seq.length, refLen);
+      }
+      return new Promise((resolve, reject) => {
+        w.onmessage = (e) => {
+          const m = e.data;
+          console.log("[sort] msg", m.type, "from worker", m.index); // temporary probe
+          if (m.type === "done") resolve(m);
+          else if (m.type === "error") reject(new Error(m.message));
+        };
+        w.onerror = (err) => reject(new Error((err && err.message) || "worker error"));
+        w.postMessage({ type: "rows", rows, offset: lo }, transfers);
+      }).then((m) => {
+        for (let q = 0; q < m.scores.length; q++) scores[m.offset + q] = m.scores[q];
+        doneCells += cells;
+        prog.setProgress(doneCells, totalCells);
+      });
+    };
+    await Promise.all(
+      workers.map(async (w) => {
+        while (nextRow < N) {
+          const lo = nextRow;
+          let bytes = 0;
+          while (nextRow < N && (bytes < BATCH_BYTES || nextRow === lo)) {
+            bytes += records[nextRow].seqCodes.byteLength;
+            nextRow++;
+          }
+          console.log("[sort] batch", lo, "→", nextRow); // temporary probe
+          await sendBatch(w, lo, nextRow);
+        }
+      })
+    );
+    if (doneCells === 0 && totalCells > 0) throw new Error("[sort] parallel scored zero cells, refusing to trust it");
+    console.log(
+      "[sort] parallel done:",
+      doneCells,
+      "of",
+      totalCells,
+      "cells; scores head:",
+      Array.from(scores.slice(0, 4))
+    );
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (SORTWORKER_URL) {
+      URL.revokeObjectURL(SORTWORKER_URL);
+      SORTWORKER_URL = null;
+    }
+  }
+}
+
+// Sort rows by similarity to a reference sequence. Metric follows context:
+// nucleotide → Hamming identity; protein from the sequence modal → BLOSUM62
+// default; protein from the matrix modal → the matrix selected there. Work is
+// O(cells), so progress and yields are per-CELL. Byte-row tabs score in workers
+// past 64M cells (pull-based batches, transferred copies); string tabs and small
+// tabs take the serial path. Ties keep pre-sort order (stable sort).
+async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
+  if (virtualGate(tabState, "Sort by similarity")) return;
+  const ref = tabState.records.find((r) => r.id === refId);
+  if (!ref) {
+    console.warn("[sort] no record with id", refId, "— silent exit"); // was a silent return
+    return;
+  }
+  const records = tabState.records;
+  const N = records.length;
+  if (!N) return;
+
+  const isNuc = tabState.alphabet === "nucleotide";
+  const matrix = isNuc ? null : SUBSTITUTION_MATRICES[matrixName] ? matrixName : "BLOSUM62";
+  const prog = showProgressOverlay("Sorting by similarity");
+  const refLen = ref.seq.length;
+  let totalCells = 0;
+  for (const rec of records) totalCells += Math.min(rec.seq.length, refLen);
+  prog.setLabel(`Scoring ${N.toLocaleString()} sequences${isNuc ? " (identity)" : ` (${matrix})`}…`);
+  prog.setProgress(0, Math.max(1, totalCells));
+  await new Promise((r) => setTimeout(r, 50)); // let the overlay paint
+  try {
+    const refRaw = ref.seqCodes || null;
+    const refStr = refRaw ? null : ref.seq;
+    const refCodes = refRaw ? new Uint8Array(refLen) : new Int32Array(refLen);
+    let last = performance.now();
+    for (let i = 0; i < refLen; i++) {
+      let code = refRaw ? refRaw[i] : refStr.charCodeAt(i);
+      if (code >= 97 && code <= 122) code -= 32;
+      if (code > 255) code = 88; // 'X'
+      refCodes[i] = code;
+      if ((i & 1048575) === 1048575 && performance.now() - last > 40) {
+        await new Promise((res) => setTimeout(res, 0));
+        last = performance.now();
+      }
+    }
+    const T = isNuc ? null : new Int16Array(256 * 256);
+    if (T)
+      for (let a = 0; a < 256; a++)
+        for (let b = 0; b < 256; b++) T[(a << 8) | b] = getSubstitutionScore(matrix, charOfCode(a), charOfCode(b));
+
+    const scores = new Float64Array(N);
+    let scored = false;
+    const gateWorker = typeof Worker !== "undefined";
+    const gateSize = totalCells >= 64 * 2 ** 20;
+    const gateBytes = records.every((r) => r.seqCodes);
+    console.log("[sort] gate:", { gateWorker, gateSize, gateBytes, totalCells, N, isNuc, refLen });
+    if (gateWorker && gateSize && gateBytes) {
+      try {
+        await scoreRowsParallel(records, scores, refCodes, T, isNuc, prog, totalCells);
+        scored = true;
+      } catch (err) {
+        console.warn("[sort] parallel scoring failed, serial fallback", err);
+      }
+    }
+    if (!scored) {
+      const CELL_CHUNK = 4 * 1024 * 1024;
+      let doneCells = 0;
+      for (let r = 0; r < N; r++) {
+        const rec = records[r];
+        const len = Math.min(rec.seq.length, refLen);
+        const codes = rec.seqCodes || null;
+        const s = codes ? null : rec.seq;
+        let score = 0;
+        for (let c0 = 0; c0 < len; c0 += CELL_CHUNK) {
+          const c1 = Math.min(len, c0 + CELL_CHUNK);
+          for (let i = c0; i < c1; i++) {
+            const a = refCodes[i];
+            if (a === 45) continue;
+            let b = codes ? codes[i] : s.charCodeAt(i);
+            if (b >= 97 && b <= 122) b -= 32;
+            if (b === 45) continue;
+            if (isNuc) {
+              if (a === b) score++;
+            } else {
+              if (b > 255) b = 88;
+              score += T[(a << 8) | b];
+            }
+          }
+          doneCells += c1 - c0;
+          prog.setProgress(doneCells, totalCells);
+          if (performance.now() - last > 40) {
+            await new Promise((res) => setTimeout(res, 0));
+            last = performance.now();
+          }
+        }
+        scores[r] = score;
+      }
+      console.log("[sort] serial done; scores head:", Array.from(scores.slice(0, 4)));
+    }
+
+    prog.setLabel("Reordering…");
+    prog.setProgress(totalCells, totalCells);
+    await new Promise((res) => setTimeout(res, 30));
+    const order = records.map((_, i) => i).sort((x, y) => scores[y] - scores[x]);
+    const sorted = order.map((i) => records[i]);
+    records.length = 0;
+    records.push(...sorted);
+    console.log(
+      "[sort] applied. identity order?",
+      order.every((v, i) => v === i)
+    ); // AFTER the const, never in its TDZ
+    if (onDone) onDone();
+  } finally {
+    prog.close();
+  }
 }
 
 //  Shared GL program, written in GLSL ES 3.00. vertex and fragment shaders
@@ -2225,7 +3002,7 @@ function runWithLoading(btn, action) {
 // Writes text chunks straight to disk via the File System Access API where
 // available (Chrome/Edge); otherwise accumulates chunks and downloads one Blob.
 async function openTextSink(filename, mime, ext, estBytes) {
-  // huge exports: OPFS staging + blob download — no .crswap commit, no SW ceiling
+  // huge exports: OPFS staging + blob download, no .crswap commit, no SW ceiling
   if (estBytes && estBytes > 1024 * 1024 * 1024) {
     const staged = await openOpfsSink(filename);
     if (staged) return staged;
@@ -2239,7 +3016,7 @@ async function openTextSink(filename, mime, ext, estBytes) {
         suggestedName: filename,
         types: [{ description: filename, accept: { [mime]: [ext] } }]
       });
-      // in-place writing: no .crswap, no atomic commit on close() — the commit
+      // in-place writing: no .crswap, no atomic commit on close(), the commit
       // is where InvalidStateError killed the 10GB export. truncate(0) clears
       // any previous content so the write is a clean full overwrite.
       const stream = await handle.createWritable({ keepExistingData: true });
@@ -2253,7 +3030,7 @@ async function openTextSink(filename, mime, ext, estBytes) {
 
   // Last resort (Firefox/Safari, non-secure contexts, first visit before the SW
   // controls the page): accumulate chunks and download one Blob on close. This
-  // holds the whole export in the heap — fail loudly past a budget rather than
+  // holds the whole export in the heap, fail loudly past a budget rather than
   // OOM-ing the tab. Mirrors openByteSink's final tier.
   const parts = [];
   let totalBytes = 0;
@@ -2263,7 +3040,7 @@ async function openTextSink(filename, mime, ext, estBytes) {
       totalBytes += typeof s === "string" ? s.length : s.byteLength;
       if (totalBytes > 1.5e9) {
         throw new Error(
-          "Export exceeds this browser's in-memory download limit — please retry in Chrome or Edge, which can stream it to disk."
+          "Export exceeds this browser's in-memory download limit, please retry in Chrome or Edge, which can stream it to disk."
         );
       }
       return Promise.resolve(); // uniform with the async sinks; callers await
@@ -2280,9 +3057,9 @@ async function openTextSink(filename, mime, ext, estBytes) {
 // Byte-oriented sink for .blim. OPFS staging first at ANY size: .blim exports
 // write in bursts after a sweep, a pattern that kills live-streamed downloads
 // (the SW tier's fetch dies when its consumer goes idle). Staging decouples
-// writing from downloading entirely — the download starts from a complete file.
+// writing from downloading entirely, the download starts from a complete file.
 async function openByteSink(filename, estBytes) {
-  console.log("[blim] sink v3 — OPFS first");
+  console.log("[blim] sink v3, OPFS first");
   const staged = await openOpfsSink(filename);
   if (staged) {
     console.log("[blim] tier: OPFS staging");
@@ -2319,7 +3096,7 @@ async function openByteSink(filename, estBytes) {
 // whole-byte chunks (~1 MiB) via emit(Uint8Array). flush() is called at each plane
 // boundary: the final partial byte is zero-padded in its low bits (spec §3).
 // Codes are ≤16 bits (colordict cap), so the accumulator never exceeds 23 live
-// bits — safely inside JS's 32-bit bitwise range.
+// bits, safely inside JS's 32-bit bitwise range.
 function makeBitWriter(emit, chunkBytes = 1 << 20) {
   let buf = new Uint8Array(chunkBytes);
   let used = 0; // whole bytes filled in buf
@@ -2355,19 +3132,7 @@ function makeBitWriter(emit, chunkBytes = 1 << 20) {
   };
 }
 
-//  .blim (binary slim) loader — spec: blim-spec v1.2 as stated in manual
-
-// fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
-// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 -> 7 + 16 ≤ 24
-function blimCodeAt(bytes, i, bits) {
-  const bit = i * bits;
-  const byte = Math.floor(bit / 8); // not >> 3: i*bits overflows int32 past 2^31 (≈268M cols × 9 bits)
-  const shift = bit % 8; // not & 7: same reason
-  const win = (bytes[byte] << 16) | ((bytes[byte + 1] || 0) << 8) | (bytes[byte + 2] || 0);
-  return (win >>> (24 - shift - bits)) & ((1 << bits) - 1);
-}
-
-//  byte-row store 
+//  byte-row store
 // At chromosome scale, sequence strings live in V8's 4GB pointer-compression cage
 // and kill the tab. Uint8Array backing stores live OUTSIDE the cage, so large rows
 // are stored as Latin-1 char codes (rec.seqCodes) with rec.seq as a String-like
@@ -2376,7 +3141,7 @@ function blimCodeAt(bytes, i, bits) {
 const SEQ_FACADE_DECODER = new TextDecoder("latin1");
 
 function makeSeqFacade(codes) {
-  const charCodeAt = (i) => codes[i]; // one stable closure — no per-call allocation
+  const charCodeAt = (i) => codes[i]; // one stable closure, no per-call allocation
   const api = {
     length: codes.length,
     charCodeAt,
@@ -2392,6 +3157,183 @@ function makeSeqFacade(codes) {
       const c = Number(prop);
       if (!Number.isInteger(c)) return undefined;
       return c >= 0 && c < codes.length ? String.fromCharCode(codes[c]) : undefined; // string semantics: OOB -> undefined
+    }
+  });
+}
+
+// ===== Virtual rows: FASTA too big for RAM keeps rows in the File and pages them =====
+//const VIRTUAL_MIN_BYTES = 6 * 2 ** 30; // console override: window.SS_VIRTUAL_MIN
+const VIRTUAL_MIN_BYTES = Number.POSITIVE_INFINITY; // opt-in only: window.SS_VIRTUAL_MIN in the console enables virtual mode
+const VPAGE_BYTES = 32 * 2 ** 20; // raw file bytes per page
+const VPAGE_CACHE_BYTES = 768 * 2 ** 20;
+
+// Replays parseFastaStream's line semantics over one raw page: '>' at line start
+// opens a record; content lines trimmed of ASCII whitespace (<=32), internal kept.
+// Row lengths come from the index, so a mismatch means the file is pathological —
+// those rows stay null (placeholders), nothing crashes.
+function decodeVirtualPage(bytes, page, lens) {
+  const n = page.endRow - page.startRow;
+  const rows = new Array(n).fill(null);
+  let rec = -1,
+    out = null,
+    fill = 0,
+    ok = true;
+  const closeRec = () => {
+    if (rec < 0) return;
+    if (fill !== lens[page.startRow + rec]) ok = false;
+    else rows[rec] = out;
+  };
+  let pos = 0;
+  while (pos < bytes.length && ok) {
+    let nl = bytes.indexOf(10, pos);
+    if (nl === -1) nl = bytes.length;
+    let s = pos,
+      e = nl;
+    while (s < e && bytes[s] <= 32) s++;
+    while (e > s && bytes[e - 1] <= 32) e--;
+    if (s < e) {
+      if (bytes[s] === 62) {
+        closeRec();
+        rec++;
+        if (rec >= n) {
+          ok = false;
+          break;
+        }
+        out = new Uint8Array(lens[page.startRow + rec]);
+        fill = 0;
+      } else if (out && fill + (e - s) <= out.length) {
+        out.set(bytes.subarray(s, e), fill);
+        fill += e - s;
+      } else ok = false;
+    }
+    pos = nl + 1;
+  }
+  closeRec();
+  if (!ok) console.warn("[vpage] decode mismatch rows " + page.startRow + "–" + page.endRow + ", placeholders");
+  return rows;
+}
+
+function makeVirtualRowSource(file, offs, lens) {
+  const N = lens.length;
+  const pageOf = new Int32Array(N);
+  const pages = [];
+  let start = 0;
+  for (let r = 1; r < N; r++) {
+    if (Number(offs[r] - offs[start]) > VPAGE_BYTES) {
+      pages.push({ startRow: start, endRow: r });
+      start = r;
+    }
+  }
+  pages.push({ startRow: start, endRow: N });
+  for (let p = 0; p < pages.length; p++) {
+    pages[p].off = Number(offs[pages[p].startRow]);
+    pages[p].end = pages[p].endRow < N ? Number(offs[pages[p].endRow]) : file.size;
+    for (let r = pages[p].startRow; r < pages[p].endRow; r++) pageOf[r] = p;
+  }
+  const cache = new Map(); // pageIdx -> { rows, bytes, last }
+  const inflight = new Map();
+  let cacheBytes = 0,
+    tick = 0;
+  function evict() {
+    if (cacheBytes <= VPAGE_CACHE_BYTES) return;
+    const byAge = [...cache.entries()].sort((a, b) => a[1].last - b[1].last);
+    for (const [p, ent] of byAge) {
+      if (cacheBytes <= VPAGE_CACHE_BYTES) break;
+      cache.delete(p);
+      cacheBytes -= ent.bytes;
+    }
+  }
+  function fetchPage(p, notify) {
+    if (p < 0 || p >= pages.length || cache.has(p) || inflight.has(p)) return;
+    const pg = pages[p];
+    const pr = (async () => {
+      const buf = await file.slice(pg.off, pg.end).arrayBuffer();
+      const rows = decodeVirtualPage(new Uint8Array(buf), pg, lens);
+      cache.set(p, { rows, bytes: pg.end - pg.off, last: ++tick });
+      cacheBytes += pg.end - pg.off;
+      evict();
+      if (notify && vsrc.onMiss) vsrc.onMiss(); // placeholders just became real cells, repaint
+    })()
+      .catch((err) => console.warn("[vpage] fetch failed page " + p, err))
+      .finally(() => inflight.delete(p));
+    inflight.set(p, pr);
+  }
+  const vsrc = {
+    onMiss: null, // wired to scheduleRebuild by createTab
+    rowCount: N,
+    peekRow(r) {
+      const p = pageOf[r];
+      const ent = cache.get(p);
+      if (ent) {
+        ent.last = ++tick;
+        return ent.rows[r - pages[p].startRow];
+      }
+      fetchPage(p, true);
+      fetchPage(p - 1, false); // read-ahead both directions; scroll direction unknown
+      fetchPage(p + 1, false);
+      return null;
+    },
+    residentBytes: () => cacheBytes,
+    peekRowQuiet(r) {
+      // strips/overviews: cache lookup ONLY, they sample every row and must never
+      // kick fetches, or the whole file pages in behind a 60px strip
+      const p = pageOf[r];
+      const ent = cache.get(p);
+      return ent ? ent.rows[r - pages[p].startRow] : null;
+    },
+    ensureRow(r) {
+      // Promise → resident; the cell editor's lazy open
+      const p = pageOf[r];
+      if (cache.has(p)) return Promise.resolve();
+      return fetchPage(p, true) || inflight.get(p) || Promise.resolve();
+    }
+  };
+  return vsrc;
+}
+
+function virtualGate(tabState, feature) {
+  if (!tabState.virtual) return false;
+  alert(feature + " isn't available on virtual (file-paged) tabs yet.");
+  return true;
+}
+
+// seq facade over paged rows. Non-resident cells read as "-" (white) for exactly the
+// frames between scroll and page arrival; peekRow's miss kick + onMiss repaint make
+// fill-in automatic. colCodeAt already routes facade rows through charCodeAt, so the
+// renderer needs zero changes.
+function makeVirtualSeqFacade(vsrc, row, len) {
+  const peek = () => vsrc.peekRow(row);
+  const api = {
+    length: len,
+    charCodeAt: (i) => {
+      const c = peek();
+      return c && i >= 0 && i < c.length ? c[i] : 45;
+    },
+    charAt: (i) => {
+      const c = peek();
+      return c && i >= 0 && i < c.length ? String.fromCharCode(c[i]) : "";
+    },
+    slice: (a, b) => {
+      const c = peek();
+      return c ? SEQFACADEDECODER.decode(c.subarray(a, b)) : "";
+    },
+    toString: () => {
+      const c = peek();
+      return c ? SEQFACADEDECODER.decode(c) : "";
+    },
+    toUpperCase: () => {
+      const c = peek();
+      return c ? SEQFACADEDECODER.decode(c).toUpperCase() : "";
+    }
+  };
+  return new Proxy(api, {
+    get(t, prop) {
+      if (typeof prop === "symbol") return undefined;
+      if (prop in t) return t[prop];
+      const c = Number(prop);
+      if (!Number.isInteger(c)) return undefined;
+      const codes = peek();
+      return codes && c >= 0 && c < codes.length ? String.fromCharCode(codes[c]) : undefined;
     }
   });
 }
@@ -2417,306 +3359,6 @@ function encodeRowToBytes(s) {
     codes[i] = code;
   }
   return codes;
-}
-
-// Parses a .blim File/Blob in one streaming pass; memory stays flat (one row's
-// planes live at a time). Returns { meta, annotations, records, consensusBaked }.
-async function parseBlimStream(file, onProgress) {
-  const reader = file.stream().getReader();
-  let chunks = [];
-  let buffered = 0;
-  let done = false;
-  let offset = 0;
-
-  const fill = async () => {
-    const { value, done: d } = await reader.read();
-    if (d) {
-      done = true;
-      return;
-    }
-    chunks.push(value);
-    buffered += value.length;
-  };
-
-  // once, up top of parseBlimStream — alongside need/readLine
-  const gcYield = (() => {
-    const ch = new MessageChannel();
-    return () =>
-      new Promise((r) => {
-        ch.port1.onmessage = r;
-        ch.port2.postMessage(0);
-      });
-  })();
-
-  // consume exactly n bytes as one contiguous Uint8Array
-  const need = async (n) => {
-    while (buffered < n && !done) await fill();
-    if (buffered < n) throw new Error("Unexpected end of .blim file");
-    const out = new Uint8Array(n);
-    let o = 0;
-    while (o < n) {
-      const head = chunks[0];
-      const take = Math.min(head.length, n - o);
-      out.set(head.subarray(0, take), o);
-      o += take;
-      offset += take;
-      if (take === head.length) chunks.shift();
-      else chunks[0] = head.subarray(take);
-      buffered -= take;
-    }
-    return out;
-  };
-
-  const dec = new TextDecoder();
-  const readLine = async () => {
-    for (;;) {
-      let scanned = 0;
-      for (const ch of chunks) {
-        const idx = ch.indexOf(10);
-        if (idx !== -1) {
-          const bytes = await need(scanned + idx);
-          await need(1); // the \n itself
-          let s = dec.decode(bytes);
-          if (s.endsWith("\r")) s = s.slice(0, -1);
-          return s;
-        }
-        scanned += ch.length;
-      }
-      if (done) {
-        if (buffered === 0) return null; // clean EOF
-        return dec.decode(await need(buffered)); // final line, no newline
-      }
-      await fill();
-    }
-  };
-
-  const readU32 = async () => {
-    const b = await need(4);
-    return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
-  };
-  const readDiffRecords = async (n) => {
-    // -> flat [col, dictIdx, col, dictIdx, ...]
-    const b = await need(n * 6);
-    const out = new Array(n * 2);
-    for (let i = 0, j = 0; i < n; i++, j += 6) {
-      out[i * 2] = (b[j] | (b[j + 1] << 8) | (b[j + 2] << 16) | (b[j + 3] << 24)) >>> 0;
-      out[i * 2 + 1] = b[j + 4] | (b[j + 5] << 8);
-    }
-    return out;
-  };
-
-  // header
-  const magic = await readLine();
-  if (magic !== ".blim" && magic !== ".bcmm") throw new Error("Not a .blim file");
-  const isBcmm = magic === ".bcmm"; // subtype only changes $sequence_data (spec §4)
-  const meta = { fontSize: 18, luminance: 0.5, alphabet: "protein" };
-  let columns = 0,
-    annoCount = 0,
-    seqCount = 0,
-    charBits = 0,
-    colorBits = 0;
-  let charCodes = [],
-    colorList = [];
-  let section = null;
-  const fieldRe = /^\$([a-z]+)((?:\{[^}]*\})+)$/;
-  for (;;) {
-    const line = await readLine();
-    if (line === null) throw new Error(".blim ended in the header");
-    if (line === "$annotation_data{" || line === "$sequence_data{" || line === "$consensus_data{") {
-      section = line.slice(1, -1);
-      break;
-    }
-    const m = line.match(fieldRe);
-    if (!m) throw new Error("Bad .blim header line: " + line);
-    const vals = [];
-    const vm = /\{([^}]*)\}/g;
-    let v;
-    while ((v = vm.exec(m[2])) !== null) vals.push(v[1]);
-    const key = m[1];
-    if (key === "version") {
-      if (+vals[0] !== 1) throw new Error("Unsupported .blim version: " + vals[0]);
-    } else if (key === "columns") columns = +vals[0];
-    else if (key === "rows") {
-      annoCount = +vals[0];
-      seqCount = +vals[1];
-    } else if (key === "chardict") {
-      charBits = +vals[0];
-      charCodes = vals[1].split(",").map(Number);
-    } else if (key === "colordict") {
-      colorBits = +vals[0];
-      colorList = vals[1] ? vals[1].split(",") : [];
-    } else if (key === "fontsize") meta.fontSize = +vals[0];
-    else if (key === "luminance") meta.luminance = +vals[0];
-    else if (key === "alphabetdef") meta.alphabet = vals[0] === "Nucleotide" ? "nucleotide" : "protein";
-  }
-  if (!columns || !charBits || !colorBits) throw new Error(".blim header missing columns/dictionaries");
-
-  const chardictIsByte = charCodes.every((code) => code <= 255); // byte rows + 1-byte consensus chars when true
-  // file color index -> app palette index (paletteIndexFor is the global palette store)
-  const paletteMap = new Uint16Array(colorList.length + 1);
-  colorList.forEach((hex, i) => (paletteMap[i + 1] = paletteIndexFor(hex)));
-
-  const rowCharBytes = Math.ceil((columns * charBits) / 8);
-  const rowColorBytes = Math.ceil((columns * colorBits) / 8);
-
-  const readRow = async () => {
-    const name = await readLine();
-    if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
-    const cplane = await need(rowCharBytes);
-    const kplane = await need(rowColorBytes);
-    const nl = await need(1); // framing checkpoint (spec 3)
-    if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
-    return { name: name.slice(1), cplane, kplane };
-  };
-
-  const scratch = new Uint16Array(columns);
-  const decodeCharCodes = (plane, target) => {
-    for (let c = 0; c < columns; c++) target[c] = charCodes[blimCodeAt(plane, c, charBits)];
-    return target;
-  };
-  const codesToString = (arr) => {
-    let s = "";
-    for (let off = 0; off < columns; off += 8192) s += String.fromCharCode.apply(null, arr.subarray(off, off + 8192));
-    return s;
-  };
-  const decodeChars = (plane) => codesToString(decodeCharCodes(plane, scratch));
-
-  const annotations = [];
-  const records = [];
-  let consensusBaked = null;
-  
-  // prepaare data sections
-  for (;;) {
-    if (section === "annotation_data") {
-      for (let i = 0; i < annoCount; i++) {
-        const { name, cplane, kplane } = await readRow();
-        let data = decodeChars(cplane);
-        // .blim stores annotation planes full-width; a fresh tab's are "" (createTab).
-        // Compact: right-trim spaces — all-space rows collapse to "".
-        const t = data.replace(/ +$/, "");
-        data = t === data ? data : t.split("").join(""); // flatten: a substring slice would pin the whole 250MB rope
-        const ann = { name, data, colors: {} };
-        for (let c = 0; c < columns; c++) {
-          const fi = blimCodeAt(kplane, c, colorBits);
-          if (fi !== 0) ann.colors[c] = colorList[fi - 1];
-        }
-        annotations.push(ann);
-        if (onProgress) onProgress(offset, file.size);
-      }
-    } else if (section === "sequence_data") {
-      let refCharCodes = null; // .bcmm reference row: decoded char codes (Uint8 or Uint16)
-      let refFileColors = null; // .bcmm reference row: file color indices (0 = white)
-      for (let i = 0; i < seqCount; i++) {
-        const name = await readLine();
-        if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
-
-        if (isBcmm && i > 0) {
-          const tag = (await need(1))[0];
-          if (tag === 1) {
-            // diff row: copy the reference vectors, apply records (spec §4)
-            if (!refCharCodes) throw new Error(".bcmm diff row before reference row");
-            const cd = await readDiffRecords(await readU32());
-            const kd = await readDiffRecords(await readU32());
-            const nl = await need(1);
-            if (nl[0] !== 10) throw new Error(".bcmm framing error at sequence row " + i);
-            const codes = refCharCodes.slice(); // fresh copies — never alias the reference,
-            const kcol = refFileColors.slice(); // or edits would propagate across rows
-            for (let j = 0; j < cd.length; j += 2) {
-              const col = cd[j],
-                ci = cd[j + 1];
-              if (col >= columns || ci >= charCodes.length)
-                throw new Error(".bcmm char diff out of range, sequence row " + i);
-              codes[col] = charCodes[ci];
-            }
-            for (let j = 0; j < kd.length; j += 2) {
-              const col = kd[j],
-                ki = kd[j + 1];
-              if (col >= columns || ki > colorList.length)
-                throw new Error(".bcmm color diff out of range, sequence row " + i);
-              kcol[col] = ki; // index 0 = white is a legal explicit value here
-            }
-            const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
-            if (chardictIsByte) {
-              rec.seqCodes = codes; // refCharCodes is Uint8, so .slice() gave us Uint8
-              rec.seq = makeSeqFacade(codes);
-            } else {
-              rec.seq = codesToString(codes);
-            }
-            let colorIdx = null;
-            for (let c = 0; c < columns; c++) {
-              const fi = kcol[c];
-              if (fi !== 0) {
-                if (!colorIdx) colorIdx = new Uint16Array(columns);
-                colorIdx[c] = paletteMap[fi];
-              }
-            }
-            if (colorIdx) rec.colorIdx = colorIdx;
-            records.push(rec);
-            if (onProgress) onProgress(offset, file.size);
-            await gcYield(); // GC window between rows
-            continue;
-          }
-          if (tag !== 0) throw new Error("Bad .bcmm row tag " + tag + " at sequence row " + i);
-          // tag 0x00: full planes follow, base-format shape
-        }
-
-        const cplane = await need(rowCharBytes);
-        const kplane = await need(rowColorBytes);
-        const nl = await need(1); // framing checkpoint (spec 3)
-        if (nl[0] !== 10) throw new Error(".blim framing error — row payload length mismatch");
-        const keepRef = isBcmm && i === 0;
-        const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
-        if (chardictIsByte) {
-          const codes = new Uint8Array(columns);
-          for (let c = 0; c < columns; c++) codes[c] = charCodes[blimCodeAt(cplane, c, charBits)];
-          rec.seqCodes = codes;
-          rec.seq = makeSeqFacade(codes);
-          if (keepRef) refCharCodes = codes;
-        } else {
-          const codes = keepRef ? decodeCharCodes(cplane, new Uint16Array(columns)) : null;
-          rec.seq = codes ? codesToString(codes) : decodeChars(cplane);
-          if (keepRef) refCharCodes = codes;
-        }
-        const kcol = keepRef ? new Uint16Array(columns) : null;
-        let colorIdx = null;
-        for (let c = 0; c < columns; c++) {
-          const fi = blimCodeAt(kplane, c, colorBits);
-          if (kcol) kcol[c] = fi;
-          if (fi !== 0) {
-            if (!colorIdx) colorIdx = new Uint16Array(columns);
-            colorIdx[c] = paletteMap[fi];
-          }
-        }
-        if (colorIdx) rec.colorIdx = colorIdx;
-        if (keepRef) refFileColors = kcol;
-        records.push(rec);
-        if (onProgress) onProgress(offset, file.size);
-        await gcYield(); // GC window between rows
-      }
-    } else if (section === "consensus_data") {
-      const { cplane, kplane } = await readRow(); // the single %consensus row
-      const chars = chardictIsByte ? new Uint8Array(columns) : new Uint16Array(columns);
-      let colors = null; // null = plane was entirely default — allocate only if real color appears
-      for (let c = 0; c < columns; c++) chars[c] = charCodes[blimCodeAt(cplane, c, charBits)];
-      for (let c = 0; c < columns; c++) {
-        const fi = blimCodeAt(kplane, c, colorBits);
-        if (fi !== 0) {
-          if (!colors) colors = new Uint16Array(columns);
-          colors[c] = paletteMap[fi];
-        }
-      }
-      consensusBaked = { chars, colors }; // colors: null means all-default; within a non-null plane, 0 = "no baked value" sentinel
-    }
-    if ((await readLine()) !== "}") throw new Error("Expected } closing $" + section);
-    const next = await readLine();
-    if (next === null) break;
-    if (next === "$annotation_data{" || next === "$sequence_data{" || next === "$consensus_data{") {
-      section = next.slice(1, -1);
-    } else {
-      throw new Error("Unknown .blim section: " + next);
-    }
-  }
-  return { meta, annotations, records, consensusBaked };
 }
 
 async function withTextSink(filename, mime, ext, produce, estBytes) {
@@ -2756,7 +3398,7 @@ async function openStreamSink(filename) {
     return null;
   }
   if (!reg || !reg.active) return null;
-  if (!navigator.serviceWorker.controller) return null; // page not controlled yet — fall back
+  if (!navigator.serviceWorker.controller) return null; // page not controlled yet, fall back
 
   const encoder = new TextEncoder();
   const url = new URL("stream-download-" + Math.random().toString(36).slice(2), location.href).href;
@@ -2780,7 +3422,7 @@ async function openStreamSink(filename) {
     return null;
   }
 
-  // navigate a hidden iframe — deliberately NO download attribute. A plain
+  // navigate a hidden iframe, deliberately NO download attribute. A plain
   // navigation is what the service worker intercepts, its Content-Disposition:
   // attachment response header is what turns it into a download. Anchor clicks
   // with a download attribute can bypass the SW and 404 against the real server.
@@ -2841,7 +3483,7 @@ async function openStreamSink(filename) {
 
 // OPFS staging sink for huge exports: write into the origin-private file system
 // (nothing external can invalidate it), then download the result as a
-// file-backed blob — no service worker, no ~5-minute ceiling, streams from disk.
+// file-backed blob, no service worker, no ~5-minute ceiling, streams from disk.
 async function openOpfsSink(filename) {
   if (!navigator.storage || !navigator.storage.getDirectory) return null;
   let handle, writable;
@@ -2882,7 +3524,7 @@ async function openOpfsSink(filename) {
   };
 }
 
-// foreground color is a pure function of the background hex — cache it
+// foreground color is a pure function of the background hex, cache it
 function makeFgCache(luminance) {
   const m = new Map();
   return (bgHex) => {
@@ -2916,9 +3558,9 @@ function showProgressOverlay(title) {
   box.appendChild(spinner);
 
   const barOuter = document.createElement("div");
-  barOuter.className = "hmmer-progress-outer";
+  barOuter.className = "scan-progress-outer";
   const barInner = document.createElement("div");
-  barInner.className = "hmmer-progress-inner";
+  barInner.className = "scan-progress-inner";
   barOuter.appendChild(barInner);
   box.appendChild(barOuter);
   const statusText = document.createElement("div");
@@ -2942,6 +3584,7 @@ function showProgressOverlay(title) {
     close: () => overlay.remove()
   };
 }
+
 // FASTA export: streams each record's sequence in ~1MB slices
 async function exportFastaStreaming(records, filename) {
   const prog = showProgressOverlay("Exporting FASTA");
@@ -3042,7 +3685,7 @@ async function generateRtfV2(
   const WHITE_INDEX = colorIndexFor("#FFFFFF");
   const BLACK_INDEX = colorIndexFor("#000000");
 
-  // rows are described lazily — no per-cell objects are materialized.
+  // rows are described lazily, no per-cell objects are materialized.
   // bgAt() is the cheap scan form (no char, no object); cellAt() is the emit form.
   const rows = [];
   tabState.annotations.forEach((ann, r) => {
@@ -3131,7 +3774,7 @@ async function generateRtfV2(
 
   const setsOfRows = Math.max(1, Math.ceil(colCount / charsPerRow));
 
-  // header / preamble (tiny) — written once, up front
+  // header / preamble (tiny), written once, up front
   const inset = "650";
   await sink.write(
     [
@@ -3165,10 +3808,6 @@ async function generateRtfV2(
 
   await flushOut(true);
   await sink.write("}");
-}
-
-function parseSlimTriplet(line) {
-  return { ch: line.charAt(0), bgHex: line.substring(2, 9), fgHex: line.substring(10) };
 }
 
 function renderAlignmentPng(
@@ -3388,7 +4027,7 @@ function renderAlignmentPng(
         }
         y += CH;
       }
-      // sequence rows — each cell's color resolved exactly once
+      // sequence rows, each cell's color resolved exactly once
       for (let r = 0; r < seqRows; r++, y += CH) {
         const rec = tabState.records[r];
         const colors = new Array(c1 - c0);
@@ -3396,7 +4035,7 @@ function renderAlignmentPng(
         ctx.textAlign = "center";
         drawRow(ctx, colors, (c) => rec.seq[c] || "-", c0, c1, nameW, y);
       }
-      // consensus row — resolve each column once, reused for color and char
+      // consensus row, resolve each column once, reused for color and char
       if (showConsensus) {
         const consRow = new Array(c1 - c0);
         for (let c = c0; c < c1; c++) consRow[c - c0] = resolveConsensus(c);
@@ -3618,6 +4257,10 @@ function decideForegroundHex(bgHex, luminanceThreshold) {
   return L > luminanceThreshold ? "#000000" : "#FFFFFF";
 }
 
+function parseSlimTriplet(line) {
+  return { ch: line.charAt(0), bgHex: line.substring(2, 9), fgHex: line.substring(10) };
+}
+
 // legacy slim parser (kept in case of need for a fallback)
 async function parseSlim(text, onProgress) {
   const lines = text.split(/\r?\n/);
@@ -3751,17 +4394,37 @@ async function parseSlim(text, onProgress) {
   return { records, annotations, consensusOverrides, consensusColors, ...meta };
 }
 
-// .blim (binary slim) exporter — spec: blim-spec v1.2.
+async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
+  console.log(
+    "[blim] route:",
+    blimParallelEligible(tabState, colCount) ? "parallel" : "serial",
+    "| mode:",
+    tabState.shadeMode || "standard"
+  );
+  if (blimParallelEligible(tabState, colCount)) {
+    try {
+      await exportBlimParallel(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename);
+      return;
+    } catch (err) {
+      console.warn("[blim] parallel path failed, falling back to serial:", err);
+    }
+  }
+  return exportBlimStreamingSerial(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename);
+}
+
+// .blim (binary slim) exporter, spec: blim-spec v1.2.
 // Two phases: (1) a read-only sweep building the char/color dictionaries,
 // (2) the streaming write. Per row the cell callback fires ONCE; color indices
 // are stashed in a scratch array so the color plane writes right after the char
 // plane without re-running shading math.
-// .blim (binary slim) exporter — spec: blim-spec v1.2.
 // The sink opens BEFORE the dictionary sweep: both the SW-streamed download and
 // the FS-API picker require the click's transient user activation, and the sweep
 // would let it expire. Routing uses a cheap upper bound (<=4 bytes/cell).
-async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
+// Dictionaries are DIRECT-INDEXED (char code / packed RGB), not Maps: at rows x
+// cols cells, Map hashing dominates the whole export.
+async function exportBlimStreamingSerial(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
   const prog = showProgressOverlay("Saving project");
+  const t0 = performance.now();
   let sink = null;
   try {
     const enc = new TextEncoder();
@@ -3776,8 +4439,58 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
       }
     };
 
-    // unified {ch, bg} cell shape; consensus uses the same two-plane grammar as
-    // every other row (spec section 3). id tags the sequence section for .bcmm (manual section 4).
+    // per-cell string allocs are the enemy; ASCII chars come from a cache
+    const CHARS = new Array(128);
+    for (let i = 0; i < 128; i++) CHARS[i] = String.fromCharCode(i);
+    const charOf = (code) => (code < 128 ? CHARS[code] : String.fromCharCode(code));
+
+    // direct-indexed dictionaries
+    const charDict = new Int32Array(65536).fill(-1); // char code -> index
+    const charCodes = []; // insertion order = dictionary order
+    const colorDict = new Uint16Array(1 << 24); // packed RGB -> index; 0 = unset/white
+    const colorList = []; // insertion order, normalized hex
+    const hv = (cc) => (cc <= 57 ? cc - 48 : (cc & 15) + 9); // '0'-'9','A'-'F','a'-'f'
+    const hexToRgb = (h) => {
+      const s = h.charCodeAt(0) === 35 ? 1 : 0;
+      if (h.length - s === 6) {
+        return (
+          (hv(h.charCodeAt(s)) << 20) |
+          (hv(h.charCodeAt(s + 1)) << 16) |
+          (hv(h.charCodeAt(s + 2)) << 12) |
+          (hv(h.charCodeAt(s + 3)) << 8) |
+          (hv(h.charCodeAt(s + 4)) << 4) |
+          hv(h.charCodeAt(s + 5))
+        );
+      }
+      return (parseInt(h.slice(s), 16) || 0) & 0xffffff; // rare fallback
+    };
+    const registerColor = (bg) => {
+      // -> dictionary index; 0 = white, never listed. Registers on first sight.
+      const rgb = hexToRgb(bg);
+      if (rgb === 0xffffff) return 0;
+      let i = colorDict[rgb];
+      if (!i) {
+        if (colorList.length >= 65535) {
+          throw new Error("Too many distinct colors for .blim v1 (" + (colorList.length + 1) + " > 65535)");
+        }
+        i = colorList.length + 1;
+        colorDict[rgb] = i;
+        colorList.push(normHex(bg));
+      }
+      return i;
+    };
+    const registerChar = (code) => {
+      let i = charDict[code];
+      if (i < 0) {
+        i = charCodes.length;
+        charDict[code] = i;
+        charCodes.push(code);
+      }
+      return i;
+    };
+
+    // unified {ch, bg} cell shape for the COLD sections (annotations/consensus);
+    // the sequence section runs its own inlined loops below, that is the hot path
     const sections = [
       {
         id: "anno",
@@ -3795,12 +4508,7 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
         open: "$sequence_data{\n",
         rows: tabState.records,
         name: (r) => "%>" + tabState.records[r].header,
-        cell: (r, c) => {
-          const rec = tabState.records[r];
-          const codes = rec.seqCodes;
-          const ch = codes ? (c < codes.length ? String.fromCharCode(codes[c]) : "-") : rec.seq[c] || "-";
-          return { ch, bg: getSeqBgHex(r, c, ch) };
-        }
+        cell: null // never called, seq rows use the specialized loops
       },
       {
         id: "cons",
@@ -3828,55 +4536,65 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     console.log("[blim] sink acquired");
 
     // phase 1: dictionary sweep (+ .bcmm reference capture & diff counts)
-    const charIndex = new Map();
-    const colorIndex = new Map(); // index 0 reserved = #FFFFFF; listed colors start at 1
-    // .bcmm reference = row 0. Chars come from the resident string (no copy);
-    // colors are captured during the sweep as compact dictionary indices.
-    const refSeq = seqCount > 1 ? tabState.records[0].seq : null;
+    // .bcmm reference = row 0, as CODES, rec.seq[i] on a byte row is a Proxy
+    // trap (~100ns); at rows x cols that is hours, not seconds
+    const refCodes = seqCount > 1 ? tabState.records[0].seqCodes || null : null;
+    const refSeqStr = seqCount > 1 && !refCodes ? tabState.records[0].seq : null;
     const refColorIdx = seqCount > 1 ? new Uint16Array(colCount) : null;
     const charDiffs = new Uint32Array(seqCount);
     const colorDiffs = new Uint32Array(seqCount);
     let done = 0;
     for (const s of sections) {
-      const isSeq = s.id === "seq";
-      for (let r = 0; r < s.rows.length; r++) {
-        for (let c = 0; c < colCount; c++) {
-          const { ch, bg } = s.cell(r, c);
-          if (!charIndex.has(ch)) charIndex.set(ch, charIndex.size);
-          const n = normHex(bg);
-          if (n !== "#FFFFFF" && !colorIndex.has(n)) colorIndex.set(n, colorIndex.size + 1);
-          if (isSeq && refColorIdx) {
-            const ci = colorIndex.get(n) || 0; // assigned just above; indices are stable
-            if (r === 0) {
-              refColorIdx[c] = ci;
-            } else {
-              if (ch !== (refSeq[c] || "-")) charDiffs[r]++;
-              if (ci !== refColorIdx[c]) colorDiffs[r]++;
+      if (s.id === "seq") {
+        // HOT LOOP: chars as codes, dicts inlined, one getSeqBgHex call per cell
+        for (let r = 0; r < seqCount; r++) {
+          const rec = tabState.records[r];
+          const codes = rec.seqCodes;
+          const seqStr = codes ? null : rec.seq;
+          for (let c = 0; c < colCount; c++) {
+            const code = codes ? (c < codes.length ? codes[c] : 45) : seqStr.charCodeAt(c) || 45;
+            const bg = getSeqBgHex(r, c, charOf(code));
+            if (charDict[code] < 0) {
+              charDict[code] = charCodes.length;
+              charCodes.push(code);
             }
+            const ci = registerColor(bg);
+            if (refColorIdx) {
+              if (r === 0) {
+                refColorIdx[c] = ci;
+              } else {
+                const rc = refCodes ? (c < refCodes.length ? refCodes[c] : 45) : refSeqStr.charCodeAt(c) || 45;
+                if (code !== rc) charDiffs[r]++; // sweep COUNTS diffs; records only exist in the write phase
+                if (ci !== refColorIdx[c]) colorDiffs[r]++;
+              }
+            }
+            if ((c & 8191) === 0) await beat();
           }
-          if ((c & 8191) === 0) await beat();
+          prog.setProgress(++done, totalRows * 2);
         }
-        prog.setProgress(++done, totalRows * 2);
+      } else {
+        for (let r = 0; r < s.rows.length; r++) {
+          for (let c = 0; c < colCount; c++) {
+            const { ch, bg } = s.cell(r, c);
+            registerChar(ch.charCodeAt(0));
+            registerColor(bg);
+            if ((c & 8191) === 0) await beat();
+          }
+          prog.setProgress(++done, totalRows * 2);
+        }
       }
     }
-    if (colorIndex.size > 65535) {
-      throw new Error("Too many distinct colors for .blim v1 (" + colorIndex.size + " > 65535)");
-    }
 
-    const charBits = Math.max(1, Math.ceil(Math.log2(Math.max(2, charIndex.size))));
-    const colorBits = Math.max(1, Math.ceil(Math.log2(colorIndex.size + 1)));
-    const colorList = new Array(colorIndex.size);
-    colorIndex.forEach((i, hex) => (colorList[i - 1] = hex));
-    const charList = Array.from(charIndex.keys())
-      .map((ch) => ch.charCodeAt(0))
-      .join(",");
+    const charBits = Math.max(1, Math.ceil(Math.log2(Math.max(2, charCodes.length))));
+    const colorBits = Math.max(1, Math.ceil(Math.log2(colorList.length + 1)));
+    const charList = charCodes.join(",");
     console.log(
       "[blim] sweep done:",
-      charIndex.size,
+      charCodes.length,
       "chars @",
       charBits,
       "b,",
-      colorIndex.size,
+      colorList.length,
       "colors @",
       colorBits,
       "b"
@@ -3936,64 +4654,93 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
       }
       return b;
     };
+    const colorOf = (bg) => (hexToRgb(bg) === 0xffffff ? 0 : colorDict[hexToRgb(bg)]);
 
     await sink.write(enc.encode(header));
     const colorScratch = new Uint16Array(colCount);
     for (const s of sections) {
       await sink.write(enc.encode(s.open));
       const bcmmRows = useBcmm && s.id === "seq";
-      for (let r = 0; r < s.rows.length; r++) {
-        await sink.write(enc.encode(s.name(r).replace(/[\r\n]+/g, " ") + "\n"));
-        const pending = [];
-        const emit = (chunk) => pending.push(sink.write(chunk));
+      if (s.id === "seq") {
+        for (let r = 0; r < seqCount; r++) {
+          await sink.write(enc.encode(s.name(r).replace(/[\r\n]+/g, " ") + "\n"));
+          const pending = [];
+          const emit = (chunk) => pending.push(sink.write(chunk));
+          const rec = tabState.records[r];
+          const codes = rec.seqCodes;
+          const seqStr = codes ? null : rec.seq;
 
-        if (bcmmRows && r > 0) {
-          const diffBytes = 8 + 6 * (charDiffs[r] + colorDiffs[r]);
-          if (diffBytes < rowBytes) {
-            emit(new Uint8Array([1])); // tag 0x01: diff row (spec §4)
-            const cd = [],
-              kd = [];
-            for (let c = 0; c < colCount; c++) {
-              const { ch, bg } = s.cell(r, c);
-              if (ch !== (refSeq[c] || "-")) cd.push(c, charIndex.get(ch));
-              const ci = colorIndex.get(normHex(bg)) || 0;
-              if (ci !== refColorIdx[c]) kd.push(c, ci);
-              if ((c & 8191) === 0) await beat();
+          if (bcmmRows && r > 0) {
+            const diffBytes = 8 + 6 * (charDiffs[r] + colorDiffs[r]);
+            if (diffBytes < rowBytes) {
+              emit(new Uint8Array([1])); // tag 0x01: diff row (spec §4)
+              const cd = [],
+                kd = [];
+              for (let c = 0; c < colCount; c++) {
+                const code = codes ? (c < codes.length ? codes[c] : 45) : seqStr.charCodeAt(c) || 45;
+                const rc = refCodes ? (c < refCodes.length ? refCodes[c] : 45) : refSeqStr.charCodeAt(c) || 45;
+                if (code !== rc) cd.push(c, charDict[code]);
+                const ci = colorOf(getSeqBgHex(r, c, charOf(code)));
+                if (ci !== refColorIdx[c]) kd.push(c, ci);
+                if ((c & 8191) === 0) await beat();
+              }
+              emit(u32le(cd.length / 2));
+              emit(diffRecords(cd));
+              emit(u32le(kd.length / 2));
+              emit(diffRecords(kd));
+              await Promise.all(pending.splice(0)); // sink backpressure, per row
+              await sink.write(enc.encode("\n")); // framing checkpoint
+              prog.setProgress(++done, totalRows * 2);
+              continue;
             }
-            emit(u32le(cd.length / 2));
-            emit(diffRecords(cd));
-            emit(u32le(kd.length / 2));
-            emit(diffRecords(kd));
-            await Promise.all(pending.splice(0)); // sink backpressure, per row
-            await sink.write(enc.encode("\n")); // framing checkpoint
-            prog.setProgress(++done, totalRows * 2);
-            continue;
+            emit(new Uint8Array([0])); // tag 0x00: full row, planes follow
           }
-          emit(new Uint8Array([0])); // tag 0x00: full row, planes follow
-        }
 
-        const w = makeBitWriter(emit);
-        for (let c = 0; c < colCount; c++) {
-          const { ch, bg } = s.cell(r, c);
-          w.write(charIndex.get(ch), charBits);
-          colorScratch[c] = colorIndex.get(normHex(bg)) || 0;
-          if ((c & 8191) === 0) await beat();
+          const w = makeBitWriter(emit);
+          for (let c = 0; c < colCount; c++) {
+            const code = codes ? (c < codes.length ? codes[c] : 45) : seqStr.charCodeAt(c) || 45;
+            w.write(charDict[code], charBits);
+            colorScratch[c] = colorOf(getSeqBgHex(r, c, charOf(code)));
+            if ((c & 8191) === 0) await beat();
+          }
+          w.flush(); // char plane boundary (spec §3)
+          for (let c = 0; c < colCount; c++) {
+            w.write(colorScratch[c], colorBits);
+            if ((c & 8191) === 0) await beat();
+          }
+          w.flush(); // color plane boundary
+          await Promise.all(pending.splice(0)); // sink backpressure, per row
+          await sink.write(enc.encode("\n")); // framing checkpoint
+          prog.setProgress(++done, totalRows * 2);
         }
-        w.flush(); // char plane boundary (spec §3)
-        for (let c = 0; c < colCount; c++) {
-          w.write(colorScratch[c], colorBits);
-          if ((c & 8191) === 0) await beat();
+      } else {
+        for (let r = 0; r < s.rows.length; r++) {
+          await sink.write(enc.encode(s.name(r).replace(/[\r\n]+/g, " ") + "\n"));
+          const pending = [];
+          const emit = (chunk) => pending.push(sink.write(chunk));
+          const w = makeBitWriter(emit);
+          for (let c = 0; c < colCount; c++) {
+            const { ch, bg } = s.cell(r, c);
+            w.write(charDict[ch.charCodeAt(0)], charBits);
+            colorScratch[c] = colorOf(bg);
+            if ((c & 8191) === 0) await beat();
+          }
+          w.flush(); // char plane boundary (spec §3)
+          for (let c = 0; c < colCount; c++) {
+            w.write(colorScratch[c], colorBits);
+            if ((c & 8191) === 0) await beat();
+          }
+          w.flush(); // color plane boundary
+          await Promise.all(pending.splice(0)); // sink backpressure, per row
+          await sink.write(enc.encode("\n")); // framing checkpoint
+          prog.setProgress(++done, totalRows * 2);
         }
-        w.flush(); // color plane boundary
-        await Promise.all(pending.splice(0)); // sink backpressure, per row
-        await sink.write(enc.encode("\n")); // framing checkpoint
-        prog.setProgress(++done, totalRows * 2);
       }
       await sink.write(enc.encode("}\n"));
     }
-    console.log("[blim] all rows written — closing sink");
+    console.log("[blim] all rows written, closing sink");
     await sink.close();
-    console.log("[blim] sink closed");
+    console.log("[blim] sink closed,", ((performance.now() - t0) / 1000).toFixed(1) + "s total");
   } catch (err) {
     console.error("Blim export failed:", err);
     if (sink) {
@@ -4003,10 +4750,679 @@ async function exportBlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     }
     alert("Project export failed: " + err.message);
   } finally {
-    // consensus caches exist for the UI's repeated reads; the export sweep reads
-    // each column exactly once, so what they accumulated is dead weight
-    tabState.consensusCols = [];
-    if (typeof consensusCache !== "undefined" && consensusCache.clear) consensusCache.clear();
+    prog.close();
+  }
+}
+
+// ============================================================================
+// blim-parallel.js v2, worker-pool .blim/.bcmm exporter
+//
+// INTEGRATION: replaces the previous blim-parallel module wholesale. The
+// dispatcher (exportBlimStreaming) and the serial exporter
+// (exportBlimStreamingSerial) are UNCHANGED.
+//
+// v2 FIXES (verified against the current script.js):
+//   - Mode property is tabState.shadeMode (not .shadingMode); mode key is
+//     "clustalx" (lowercase x).
+//   - Overrides live in rec.colorIdx / colorPacked / colorSparse and are read
+//     ONLY via recordColorAt(rec, col) -> hex string | undefined. The v1
+//     rec.colorMap / rec.colorRanges reads were fictitious and dropped every
+//     override, fatal for .blim-loaded tabs, where shadeCleared = true and
+//     ALL color is baked into overrides.
+//   - "sequence" mode is NOT (column,char)-determined (the reference row gets
+//     masterRgb; other rows get identity/similar/diff) -> stays serial, as do
+//     matrix tabs whose cfg sub-mode is "sequence", regex/scanprosite tabs,
+//     and virtual (paged) tabs.
+//   - shadeCleared tabs skip the table compile (table would be all white) and
+//     export purely from the override plane.
+//   - Worker setup no longer double-slices the color table.
+//
+// ASSUMES IN SCOPE: showProgressOverlay, openByteSink, makeBitWriter,
+//   getShadeColor, recordColorAt (script.js globals).
+//
+// [BIT-ORDER] the worker's bit writer must pack bits exactly like makeBitWriter.
+//   MSB-first is active; an LSB-first variant is provided at the marker.
+// ============================================================================
+
+("use strict");
+
+function blimParallelEligible(tabState, colCount) {
+  const mode = tabState.shadeMode || "standard";
+  // (column, char)-determined modes only. "sequence" colors the reference row
+  // differently; matrix with sub-mode "sequence" has the same reference-row
+  // dependency; regex/scanprosite are row-dependent via hitsByRow.
+  const cfg = tabState.shadeConfig || {};
+  const tableSafe =
+    mode === "standard" ||
+    mode === "clustalx" ||
+    mode === "unique" ||
+    mode === "frequency" ||
+    mode === "sequence" || // ref row handled via explicit-color row below
+    (mode === "matrix" && !(cfg.matrix && cfg.matrix.mode === "sequence"));
+  return (
+    tableSafe &&
+    !tabState.virtual && // paged rows: stripe packing would storm the pager
+    typeof Worker !== "undefined" &&
+    typeof Blob !== "undefined" &&
+    tabState.records.length >= 16 &&
+    tabState.records.length * colCount >= 4e6 &&
+    (navigator.hardwareConcurrency || 2) >= 4
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Worker source (self-contained; loaded via Blob URL)
+// ---------------------------------------------------------------------------
+const BLIM_WORKER_SRC = `
+"use strict";
+var CT = null, COLS = 0;
+var COLOR_IDX = new Uint16Array(1 << 24); // recycled across pack calls
+var ENC = new TextEncoder();
+var NO_OVERRIDE = 0xffffffff; // dense-plane sentinel (rgb values are 24-bit)
+
+function buildOv(triples) {
+  if (!triples || !triples.length) return null;
+  var byRow = new Map();
+  for (var i = 0; i < triples.length; i += 3) {
+    var lr = triples[i];
+    var mm = byRow.get(lr);
+    if (!mm) { mm = new Map(); byRow.set(lr, mm); }
+    mm.set(triples[i + 1], triples[i + 2]);
+  }
+  return byRow;
+}
+
+self.onmessage = function (e) {
+  var m = e.data;
+
+  if (m.cmd === "setup") {
+    CT = m.colorTable; // Uint32Array [col*256 + code] -> packed rgb888
+    COLS = m.colCount;
+    return;
+  }
+
+  if (m.cmd === "sweep") {
+    var rows = m.rows, n = rows.length / COLS;
+    var ovMap = buildOv(m.ovTriples), ovDense = m.ovDense || null;
+    var chars = new Set(), colors = new Map();
+    var charDiffs = new Uint32Array(n), colorDiffs = new Uint32Array(n);
+    var refC = m.refCodes, refK = m.refColors;
+    for (var lr = 0; lr < n; lr++) {
+      var base = lr * COLS, isRef = m.globalRow0 + lr === 0;
+      var ovRow = ovMap ? ovMap.get(lr) : null;
+      for (var c = 0; c < COLS; c++) {
+        var code = rows[base + c];
+        chars.add(code);
+        var o = ovDense ? ovDense[base + c] : ovRow ? ovRow.get(c) : undefined;
+        if (o === NO_OVERRIDE) o = undefined;
+        var rgb = o !== undefined ? o : CT[(c << 8) + code];
+        if (rgb !== 0xffffff) colors.set(rgb, 1);
+        if (!isRef && refC) {
+          if (code !== refC[c]) charDiffs[lr]++;
+          if (rgb !== refK[c]) colorDiffs[lr]++;
+        }
+      }
+    }
+    self.postMessage(
+      { cmd: "swept", stripe: m.stripe, chars: Array.from(chars), colors: Array.from(colors.keys()),
+        charDiffs: charDiffs, colorDiffs: colorDiffs },
+      [charDiffs.buffer, colorDiffs.buffer]
+    );
+    return;
+  }
+
+  if (m.cmd === "pack") {
+    var rows = m.rows, n = rows.length / COLS;
+    var ovMap = buildOv(m.ovTriples), ovDense = m.ovDense || null;
+    var colors = m.colorList; // array of packed rgb ints, index+1 = dictionary index
+    var i;
+    for (i = 0; i < colors.length; i++) COLOR_IDX[colors[i]] = i + 1;
+    var charIdx = m.charTable; // Int32Array(65536) code -> dictionary index
+    var refC = m.refCodes, refKG = m.refColorGlobalIdx;
+    var ciOf = function (rgb) { return rgb === 0xffffff ? 0 : COLOR_IDX[rgb]; };
+
+    var est = Math.ceil(n * (COLS * 2.2 + 64)) + 1024;
+    var buf = new Uint8Array(est), len = 0;
+    function ensure(k) {
+      if (len + k > buf.length) {
+        var nb2 = new Uint8Array(Math.max(buf.length * 2, len + k + 1024));
+        nb2.set(buf.subarray(0, len));
+        buf = nb2;
+      }
+    }
+    function put(b) { ensure(1); buf[len++] = b; }
+    function putBytes(b) { ensure(b.length); buf.set(b, len); len += b.length; }
+    function putStr(s) { putBytes(ENC.encode(s)); }
+    function u32le(x) { put(x & 255); put((x >>> 8) & 255); put((x >>> 16) & 255); put((x >>> 24) & 255); }
+    function diffRecords(pairs) {
+      for (var i2 = 0; i2 < pairs.length; i2 += 2) {
+        u32le(pairs[i2]);
+        put(pairs[i2 + 1] & 255);
+        put((pairs[i2 + 1] >>> 8) & 255);
+      }
+    }
+
+    // [BIT-ORDER] MSB-first packing. If makeBitWriter is LSB-first, delete these
+    // two functions and use the variant in the comment below instead.
+    var acc = 0, nbits = 0;
+    function wbits(v, k) {
+      acc = (acc << k) | v; nbits += k;
+      while (nbits >= 8) { nbits -= 8; put((acc >>> nbits) & 255); acc &= (1 << nbits) - 1; }
+    }
+    function wflush() { if (nbits) { put((acc << (8 - nbits)) & 255); acc = 0; nbits = 0; } }
+    // LSB-first variant:
+    // function wbits(v, k) { acc |= v << nbits; nbits += k; while (nbits >= 8) { put(acc & 255); acc >>>= 8; nbits -= 8; } }
+    // function wflush() { if (nbits) { put(acc & 255); acc = 0; nbits = 0; } }
+
+    var scratch = new Uint16Array(COLS);
+    for (var lr = 0; lr < n; lr++) {
+      var gr = m.globalRow0 + lr;
+      putStr(m.headers[lr]);
+      put(10);
+      var base = lr * COLS;
+      var ovRow = ovMap ? ovMap.get(lr) : null;
+
+      if (m.useBcmm && gr > 0) {
+        var diffBytes = 8 + 6 * (m.charDiffs[lr] + m.colorDiffs[lr]);
+        if (diffBytes < m.rowBytes) {
+          put(1); // tag 0x01: diff row
+          var cd = [], kd = [];
+          for (var c = 0; c < COLS; c++) {
+            var code = rows[base + c];
+            if (code !== refC[c]) cd.push(c, charIdx[code]);
+            var o = ovDense ? ovDense[base + c] : ovRow ? ovRow.get(c) : undefined;
+            if (o === NO_OVERRIDE) o = undefined;
+            var ci = ciOf(o !== undefined ? o : CT[(c << 8) + code]);
+            if (ci !== refKG[c]) kd.push(c, ci);
+          }
+          u32le(cd.length / 2); diffRecords(cd);
+          u32le(kd.length / 2); diffRecords(kd);
+          put(10);
+          continue;
+        }
+        put(0); // tag 0x00: full row
+      }
+
+      for (var c = 0; c < COLS; c++) {
+        var code = rows[base + c];
+        wbits(charIdx[code], m.charBits);
+        var o = ovDense ? ovDense[base + c] : ovRow ? ovRow.get(c) : undefined;
+        if (o === NO_OVERRIDE) o = undefined;
+        scratch[c] = ciOf(o !== undefined ? o : CT[(c << 8) + code]);
+      }
+      wflush(); // char plane boundary
+      for (var c2 = 0; c2 < COLS; c2++) wbits(scratch[c2], m.colorBits);
+      wflush(); // color plane boundary
+      put(10);
+    }
+
+    for (i = 0; i < colors.length; i++) COLOR_IDX[colors[i]] = 0; // recycle
+    var out = buf.slice(0, len);
+    self.postMessage({ cmd: "packed", stripe: m.stripe, blob: out }, [out.buffer]);
+    return;
+  }
+};
+`;
+
+// ---------------------------------------------------------------------------
+// Main-thread orchestrator
+// ---------------------------------------------------------------------------
+async function exportBlimParallel(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
+  const prog = showProgressOverlay("Saving project");
+  const t0 = performance.now();
+  let sink = null;
+  const workers = [];
+  try {
+    const enc = new TextEncoder();
+    const seqCount = tabState.records.length;
+    const annoCount = tabState.annotations.length;
+    const totalRows = annoCount + seqCount + 1;
+    const mode = tabState.shadeMode || "standard";
+    // sequence mode: the reference row is row-dependent (masterRgb). Compile the
+    // table from any OTHER row; ship the ref row as explicit colors. Mirrors
+    // sequenceCacheHeader's findIndex + fallback-to-0.
+    const seqRefIndex =
+      mode === "sequence"
+        ? Math.max(
+            0,
+            tabState.records.findIndex((r) => r.id === (tabState.shadeConfig.sequence || {}).refSeqId)
+          )
+        : -1;
+    const tableRow = seqRefIndex === 0 ? 1 : 0; // any non-reference row; row is only ever compared to refIndex
+
+    let done = 0;
+
+    // sink first, while the click is still warm (same reasoning as serial)
+    const estBytes = 4096 + totalRows * (colCount * 4 + 32);
+    console.log("[blim] parallel: opening sink, est", estBytes, "bytes");
+    sink = await openByteSink(filename, estBytes);
+    if (!sink) {
+      alert("Save canceled.");
+      return;
+    }
+
+    // hex helpers (nibble math; no per-cell string ops)
+    const hv = (cc) => (cc <= 57 ? cc - 48 : (cc & 15) + 9);
+    const hexToRgb = (h) => {
+      const s = h.charCodeAt(0) === 35 ? 1 : 0;
+      if (h.length - s === 6) {
+        return (
+          (hv(h.charCodeAt(s)) << 20) |
+          (hv(h.charCodeAt(s + 1)) << 16) |
+          (hv(h.charCodeAt(s + 2)) << 12) |
+          (hv(h.charCodeAt(s + 3)) << 8) |
+          (hv(h.charCodeAt(s + 4)) << 4) |
+          hv(h.charCodeAt(s + 5))
+        );
+      }
+      return (parseInt(h.slice(s), 16) || 0) & 0xffffff;
+    };
+    const rgbToHex = (rgb) => "#" + rgb.toString(16).padStart(6, "0").toUpperCase();
+    const normHex = (h) => (h[0] === "#" ? h : "#" + h).toUpperCase();
+    const clamp255 = (f) => Math.round(Math.min(1, Math.max(0, f)) * 255);
+
+    // Per-column 256-entry color tables via the sanctioned wrapper (the exact
+    // call getSeqBgHex makes). cols*256 lookups instead of rows*cols.
+    // shadeCleared tabs: base shading is white by definition (.blim loads bake
+    // colors into overrides), skip the compile entirely.
+    const CH = new Array(256);
+    for (let i = 0; i < 256; i++) CH[i] = String.fromCharCode(i);
+    const colorTable = new Uint32Array(colCount * 256).fill(0xffffff);
+    if (tabState.shadeCleared) {
+      console.log("[blim] parallel: shadeCleared, override-driven, table compile skipped");
+    } else {
+      console.log("[blim] parallel: compiling shade tables (mode:", mode + ")");
+      for (let c = 0; c < colCount; c++) {
+        const base = c << 8;
+        for (let code = 0; code < 256; code++) {
+          const rgb = getShadeColor(tabState, tableRow, c, CH[code]); // non-ref row; modes here ignore row except sequence's ref check
+          colorTable[base + code] = rgb
+            ? (clamp255(rgb[0]) << 16) | (clamp255(rgb[1]) << 8) | clamp255(rgb[2])
+            : 0xffffff;
+        }
+      }
+    }
+
+    // worker pool
+    const nWorkers = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 1));
+    const blobURL = URL.createObjectURL(new Blob([BLIM_WORKER_SRC], { type: "text/javascript" }));
+    for (let i = 0; i < nWorkers; i++) workers.push(new Worker(blobURL));
+    URL.revokeObjectURL(blobURL);
+    const pending = workers.map(() => new Map());
+    workers.forEach((w, k) => {
+      w.onmessage = (e) => {
+        const m = e.data;
+        const res = pending[k].get(m.stripe);
+        if (res) {
+          pending[k].delete(m.stripe);
+          res(m);
+        }
+      };
+    });
+    const send = (k, msg, transfers) =>
+      new Promise((res) => {
+        pending[k].set(msg.stripe, res);
+        workers[k].postMessage(msg, transfers);
+      });
+    for (let k = 0; k < nWorkers; k++) {
+      const ct = colorTable.slice(); // one copy per worker, transferred
+      workers[k].postMessage({ cmd: "setup", colorTable: ct, colCount }, [ct.buffer]);
+    }
+
+    // reference row (codes + override-aware packed colors), for .bcmm diffs.
+    // getSeqBgHex reads recordColorAt internally, correct even on baked tabs.
+    const refCodes = seqCount > 1 ? new Uint8Array(colCount).fill(45) : null;
+    const refColors = seqCount > 1 ? new Uint32Array(colCount) : null;
+    if (seqCount > 1) {
+      const r0 = tabState.records[0];
+      if (r0.seqCodes) refCodes.set(r0.seqCodes.subarray(0, Math.min(colCount, r0.seqCodes.length)));
+      else for (let c = 0; c < colCount; c++) refCodes[c] = r0.seq.charCodeAt(c) || 45;
+      for (let c = 0; c < colCount; c++) refColors[c] = hexToRgb(getSeqBgHex(0, c, CH[refCodes[c]]));
+    }
+
+    // stripe geometry: target ~48MB packed blobs
+    const stripeRowsN = Math.max(256, Math.min(8192, Math.floor(48e6 / (colCount * 2.2 + 64)) || 256));
+    const stripeCount = Math.ceil(seqCount / stripeRowsN);
+
+    const stripeRowBuf = (r0, r1) => {
+      const buf = new Uint8Array((r1 - r0) * colCount).fill(45);
+      for (let r = r0; r < r1; r++) {
+        const rec = tabState.records[r];
+        const dst = buf.subarray((r - r0) * colCount, (r - r0 + 1) * colCount);
+        if (rec.seqCodes) dst.set(rec.seqCodes.subarray(0, Math.min(colCount, rec.seqCodes.length)));
+        else {
+          const s = rec.seq;
+          const n = Math.min(colCount, s.length);
+          for (let c = 0; c < n; c++) dst[c] = s.charCodeAt(c);
+        }
+      }
+      return buf;
+    };
+
+    // Override extraction via recordColorAt(rec, col), the ONLY reader of the
+    // colorIdx/colorPacked/colorSparse union (and legacy charColors). Sparse
+    // triples when few rows carry overrides; a dense per-stripe plane
+    // (0xffffffff = no override) when many do, e.g. .blim-loaded tabs, where
+    // every visible color is a baked override.
+    const rowHasOverrides = (rec) => !!(rec.colorIdx || rec.colorPacked || rec.colorSparse || rec.charColors);
+    const stripeOverrides = (r0, r1) => {
+      const flagged = [];
+      for (let r = r0; r < r1; r++) {
+        if (rowHasOverrides(tabState.records[r])) flagged.push(r);
+      }
+      // sequence mode's reference row ships as explicit colors resolved through
+      // getSeqBgHex (override ?? masterRgb), the table can't express it
+      if (seqRefIndex >= r0 && seqRefIndex < r1 && !flagged.includes(seqRefIndex)) flagged.push(seqRefIndex);
+      if (!flagged.length) return { triples: null, dense: null };
+      const cellHex = (r, rec, c) => {
+        if (r !== seqRefIndex) return recordColorAt(rec, c);
+        const codes = rec.seqCodes;
+        return getSeqBgHex(r, c, codes ? (c < codes.length ? CH[codes[c]] : "-") : rec.seq[c] || "-");
+      };
+      if (flagged.length <= 32) {
+        const out = [];
+        for (const r of flagged) {
+          const rec = tabState.records[r];
+          for (let c = 0; c < colCount; c++) {
+            const hex = cellHex(r, rec, c);
+            if (hex != null) out.push(r - r0, c, hexToRgb(hex));
+          }
+        }
+        if (out.length <= 3e6) {
+          return { triples: out.length ? new Int32Array(out) : null, dense: null };
+        } // else fall through to dense
+      }
+      const dense = new Uint32Array((r1 - r0) * colCount).fill(0xffffffff);
+      for (const r of flagged) {
+        const rec = tabState.records[r];
+        const base = (r - r0) * colCount;
+        for (let c = 0; c < colCount; c++) {
+          const hex = cellHex(r, rec, c);
+          if (hex != null) dense[base + c] = hexToRgb(hex);
+        }
+      }
+      return { triples: null, dense };
+    };
+
+    // ---- round 1: parallel sweep (local dicts + .bcmm diff counts) ----
+    console.log("[blim] parallel: sweep,", stripeCount, "stripes x", stripeRowsN, "rows on", nWorkers, "workers");
+    const sweepResults = new Array(stripeCount);
+    const q1 = workers.map(() => Promise.resolve());
+    for (let s = 0; s < stripeCount; s++) {
+      const k = s % nWorkers;
+      const r0 = s * stripeRowsN,
+        r1 = Math.min(seqCount, r0 + stripeRowsN);
+      const rows = stripeRowBuf(r0, r1);
+      const ov = stripeOverrides(r0, r1);
+      const rc = refCodes ? refCodes.slice() : null;
+      const rk = refColors ? refColors.slice() : null;
+      const msg = {
+        cmd: "sweep",
+        stripe: s,
+        globalRow0: r0,
+        rows,
+        ovTriples: ov.triples,
+        ovDense: ov.dense,
+        refCodes: rc,
+        refColors: rk
+      };
+      const transfers = [rows.buffer];
+      if (ov.triples) transfers.push(ov.triples.buffer);
+      if (ov.dense) transfers.push(ov.dense.buffer);
+      if (rc) transfers.push(rc.buffer);
+      if (rk) transfers.push(rk.buffer);
+      q1[k] = q1[k]
+        .then(() => send(k, msg, transfers))
+        .then((res) => {
+          sweepResults[s] = res;
+          done += r1 - r0;
+          prog.setProgress(done, totalRows * 2);
+        });
+    }
+
+    // main thread sweeps annotations + consensus while workers run (file order: first)
+    const charTable = new Int32Array(65536).fill(-1);
+    const charCodes = [];
+    const colorDict = new Uint16Array(1 << 24);
+    const colorRgbList = [];
+    const colorHexList = [];
+    const registerCharCode = (code) => {
+      if (charTable[code] < 0) {
+        charTable[code] = charCodes.length;
+        charCodes.push(code);
+      }
+    };
+    const registerColorRgb = (rgb, hexStr) => {
+      if (rgb === 0xffffff) return 0;
+      let i2 = colorDict[rgb];
+      if (!i2) {
+        if (colorRgbList.length >= 65535) {
+          throw new Error("Too many distinct colors for .blim v1 (" + (colorRgbList.length + 1) + " > 65535)");
+        }
+        i2 = colorRgbList.length + 1;
+        colorDict[rgb] = i2;
+        colorRgbList.push(rgb);
+        colorHexList.push(hexStr || rgbToHex(rgb));
+      }
+      return i2;
+    };
+    const annoCells = []; // {codesA, cis} per anno row, packed later
+    for (let r = 0; r < annoCount; r++) {
+      const ann = tabState.annotations[r];
+      const codesA = new Uint16Array(colCount);
+      const cis = new Uint16Array(colCount);
+      for (let c = 0; c < colCount; c++) {
+        const ch = ann.data[c] || " ";
+        const code = ch.charCodeAt(0);
+        codesA[c] = code;
+        registerCharCode(code);
+        const hex = getAnnoBgHex(r, c, ch);
+        cis[c] = registerColorRgb(hexToRgb(hex), normHex(hex));
+      }
+      annoCells.push({ codesA, cis });
+      prog.setProgress(++done, totalRows * 2);
+    }
+    const consCodes = new Uint16Array(colCount);
+    const consCis = new Uint16Array(colCount);
+    for (let c = 0; c < colCount; c++) {
+      const g = getConsensus(c);
+      const code = g.ch.charCodeAt(0);
+      consCodes[c] = code;
+      registerCharCode(code);
+      consCis[c] = registerColorRgb(hexToRgb(g.bgHex), normHex(g.bgHex));
+    }
+    prog.setProgress(++done, totalRows * 2);
+
+    await Promise.all(q1);
+
+    // merge worker dicts, strictly in stripe order (deterministic)
+    const globalCharDiffs = new Uint32Array(seqCount);
+    const globalColorDiffs = new Uint32Array(seqCount);
+    for (let s = 0; s < stripeCount; s++) {
+      const res = sweepResults[s];
+      const r0 = res.stripe * stripeRowsN;
+      globalCharDiffs.set(res.charDiffs, r0);
+      globalColorDiffs.set(res.colorDiffs, r0);
+      for (const code of res.chars) registerCharCode(code);
+      for (const rgb of res.colors) registerColorRgb(rgb);
+    }
+    sweepResults.length = 0;
+
+    const charBits = Math.max(1, Math.ceil(Math.log2(Math.max(2, charCodes.length))));
+    const colorBits = Math.max(1, Math.ceil(Math.log2(colorRgbList.length + 1)));
+    const charList = charCodes.join(",");
+    console.log(
+      "[blim] sweep done:",
+      charCodes.length,
+      "chars @",
+      charBits,
+      "b,",
+      colorRgbList.length,
+      "colors @",
+      colorBits,
+      "b"
+    );
+
+    // .bcmm auto-select (identical arithmetic to serial)
+    const rowCharBytes = Math.ceil((colCount * charBits) / 8);
+    const rowColorBytes = Math.ceil((colCount * colorBits) / 8);
+    const rowBytes = rowCharBytes + rowColorBytes;
+    let useBcmm = false;
+    if (seqCount > 1) {
+      let bcmmTotal = rowBytes;
+      for (let r = 1; r < seqCount; r++) {
+        bcmmTotal += 1 + Math.min(8 + 6 * (globalCharDiffs[r] + globalColorDiffs[r]), rowBytes);
+      }
+      useBcmm = bcmmTotal < seqCount * rowBytes;
+      console.log(
+        "[blim] subtype:",
+        useBcmm ? ".bcmm" : ".blim",
+        "(" + bcmmTotal + " vs " + seqCount * rowBytes + " row bytes)"
+      );
+    }
+    const refColorGlobalIdx = seqCount > 1 ? new Uint16Array(colCount) : null;
+    if (refColorGlobalIdx) {
+      for (let c = 0; c < colCount; c++) {
+        const rgb = refColors[c];
+        refColorGlobalIdx[c] = rgb === 0xffffff ? 0 : colorDict[rgb];
+      }
+    }
+
+    // header + annotation section (main, cold)
+    const header =
+      (useBcmm ? ".bcmm\n" : ".blim\n") +
+      "$version{1}\n" +
+      "$fontsize{" +
+      tabState.fontSize +
+      "}\n" +
+      "$luminance{" +
+      tabState.luminance +
+      "}\n" +
+      "$alphabetdef{" +
+      (tabState.alphabet === "nucleotide" ? "Nucleotide" : "Protein") +
+      "}\n" +
+      "$columns{" +
+      colCount +
+      "}\n" +
+      "$rows{" +
+      annoCount +
+      "}{" +
+      seqCount +
+      "}\n" +
+      "$chardict{" +
+      charBits +
+      "}{" +
+      charList +
+      "}\n" +
+      "$colordict{" +
+      colorBits +
+      "}{" +
+      colorHexList.join(",") +
+      "}\n";
+    await sink.write(enc.encode(header));
+
+    const packPlanes = (codesArr, cisArr) => {
+      const parts = [];
+      const emit = (chunk) => parts.push(chunk);
+      const w = makeBitWriter(emit);
+      for (let c = 0; c < colCount; c++) w.write(charTable[codesArr[c]], charBits);
+      w.flush();
+      for (let c = 0; c < colCount; c++) w.write(cisArr[c], colorBits);
+      w.flush();
+      let n = 0;
+      for (const p of parts) n += p.length;
+      const out = new Uint8Array(n);
+      let o = 0;
+      for (const p of parts) {
+        out.set(p, o);
+        o += p.length;
+      }
+      return out;
+    };
+
+    await sink.write(enc.encode("$annotation_data{\n"));
+    for (let r = 0; r < annoCount; r++) {
+      await sink.write(enc.encode(("%" + tabState.annotations[r].name).replace(/[\r\n]+/g, " ") + "\n"));
+      await sink.write(packPlanes(annoCells[r].codesA, annoCells[r].cis));
+      await sink.write(enc.encode("\n"));
+      prog.setProgress(++done, totalRows * 2);
+    }
+    await sink.write(enc.encode("}\n"));
+    await sink.write(enc.encode("$sequence_data{\n"));
+
+    // ---- round 2: parallel pack, written strictly in stripe order ----
+    console.log("[blim] parallel: pack");
+    const packPromises = new Array(stripeCount);
+    const q2 = workers.map(() => Promise.resolve());
+    let launched = 0;
+    const launch = (s) => {
+      const k = s % nWorkers;
+      const r0 = s * stripeRowsN,
+        r1 = Math.min(seqCount, r0 + stripeRowsN);
+      const rows = stripeRowBuf(r0, r1);
+      const ov = stripeOverrides(r0, r1);
+      const headers = new Array(r1 - r0);
+      for (let r = r0; r < r1; r++) {
+        headers[r - r0] = ("%>" + tabState.records[r].header).replace(/[\r\n]+/g, " ");
+      }
+      const msg = {
+        cmd: "pack",
+        stripe: s,
+        globalRow0: r0,
+        rows,
+        ovTriples: ov.triples,
+        ovDense: ov.dense,
+        refCodes: refCodes ? refCodes.slice() : null,
+        refColorGlobalIdx: refColorGlobalIdx ? refColorGlobalIdx.slice() : null,
+        charDiffs: globalCharDiffs.slice(r0, r1),
+        colorDiffs: globalColorDiffs.slice(r0, r1),
+        charTable: charTable.slice(),
+        colorList: colorRgbList,
+        charBits,
+        colorBits,
+        useBcmm,
+        rowBytes,
+        headers
+      };
+      const transfers = [rows.buffer, msg.charDiffs.buffer, msg.colorDiffs.buffer, msg.charTable.buffer];
+      if (ov.triples) transfers.push(ov.triples.buffer);
+      if (ov.dense) transfers.push(ov.dense.buffer);
+      if (msg.refCodes) transfers.push(msg.refCodes.buffer);
+      if (msg.refColorGlobalIdx) transfers.push(msg.refColorGlobalIdx.buffer);
+      packPromises[s] = q2[k] = q2[k].then(() => send(k, msg, transfers));
+    };
+    for (let s = 0; s < stripeCount; s++) {
+      while (launched < stripeCount && launched - s < nWorkers) launch(launched++);
+      const res = await packPromises[s];
+      packPromises[s] = null;
+      await sink.write(res.blob);
+      const r0 = s * stripeRowsN,
+        r1 = Math.min(seqCount, r0 + stripeRowsN);
+      done += r1 - r0;
+      prog.setProgress(done, totalRows * 2);
+    }
+    await sink.write(enc.encode("}\n"));
+
+    // consensus section (main, cold)
+    await sink.write(enc.encode("$consensus_data{\n"));
+    await sink.write(enc.encode("%consensus\n"));
+    await sink.write(packPlanes(consCodes, consCis));
+    await sink.write(enc.encode("\n"));
+    await sink.write(enc.encode("}\n"));
+    prog.setProgress(++done, totalRows * 2);
+
+    console.log("[blim] all rows written, closing sink");
+    await sink.close();
+    console.log("[blim] sink closed,", ((performance.now() - t0) / 1000).toFixed(1) + "s total (parallel)");
+  } catch (err) {
+    if (sink) {
+      try {
+        await sink.close();
+      } catch (e) {}
+    }
+    throw err; // dispatcher falls back to the serial exporter
+  } finally {
+    workers.forEach((w) => w.terminate());
     prog.close();
   }
 }
@@ -4045,7 +5461,7 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
 
         const totalRows = tabState.annotations.length + tabState.records.length + 1;
         let doneRows = 0;
-        // spec triplet: <char>.#RRGGBB.#RRGGBB — the "." separators and the "#" on the
+        // spec triplet: <char>.#RRGGBB.#RRGGBB, the "." separators and the "#" on the
         // background color are load-bearing (parseSlimTriplet reads fixed positions)
         const writeCells = async (cellAt) => {
           let batch = [];
@@ -4077,9 +5493,10 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
         buf += "$sequence_data{\n";
         for (let r = 0; r < tabState.records.length; r++) {
           const rec = tabState.records[r];
+          const codes = rec.seqCodes || null; // byte rows: raw reads, a facade trap per cell is a wall at this scale
           buf += `%${rec.header}\n`;
           await writeCells((c) => {
-            const ch = rec.seq[c] || "-";
+            const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-";
             return { ch, bgHex: getSeqBgHex(r, c, ch) };
           });
           prog.setProgress(++doneRows, totalRows);
@@ -4098,7 +5515,7 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     console.error("Project export failed:", err);
     if (err && err.name === "InvalidStateError") {
       alert(
-        "Export failed because the destination file changed on disk while writing — sync tools " +
+        "Export failed because the destination file changed on disk while writing, sync tools " +
           "(OneDrive/Dropbox), antivirus scans, or having the file open elsewhere are the usual causes. " +
           "Export to a local, non-synced folder and leave the file untouched until it finishes."
       );
@@ -4109,6 +5526,7 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
     prog.close();
   }
 }
+
 // Color scheme modal
 function showColorSchemeModal(tabState, onColorsChanged) {
   const alphabetList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
@@ -4220,50 +5638,155 @@ const STATS_WORKER_URL = URL.createObjectURL(
 async function applyShadeWithWarmup(tabState, ctx, mode, title) {
   const prog = showProgressOverlay(title);
   prog.setLabel("Computing column statistics…");
-  await new Promise((r) => setTimeout(r, 50)); // let the overlay paint
 
   const records = tabState.records;
   const rowCount = records.length;
   let colCount = 1;
   for (const rec of records) if (rec.seq.length > colCount) colCount = rec.seq.length;
 
+  const lp = colCount <= 262144 ? tabState.loadPlane : null;
+  const lpFresh = lp && lp.rows === rowCount && lp.cols >= colCount;
+  const mc = mode === "matrix" ? tabState.matrixCache : null;
+  const mcPlaneFresh =
+    mode === "matrix" &&
+    tabState.shadeConfig.matrix.mode === "majority" &&
+    mc &&
+    mc.plane &&
+    mc.planeRows === rowCount &&
+    mc.planeCols >= colCount;
+
+  // the 50ms yield exists so the overlay paints before a BLOCKING sweep; plane
+  // tiers finish in milliseconds, so skip the wait (and the flicker) for them
+  const maySweep =
+    colCount <= 262144 &&
+    !lpFresh &&
+    !mcPlaneFresh &&
+    !(mode === "matrix" && tabState.shadeConfig.matrix.mode === "sequence");
+  if (maySweep) await new Promise((r) => setTimeout(r, 50));
+
+  let tier = "none";
+
+  let __pLast = performance.now(),
+    __pRow = 0;
+  const onProg = (done) => {
+    const now = performance.now();
+    if (now - __pLast > 750) console.warn("[warmup] gap " + Math.round(now - __pLast) + "ms after row " + __pRow);
+    __pLast = now;
+    __pRow = done;
+    prog.setProgress(done, rowCount);
+  };
+  console.log("[warmup] start mode=" + mode);
+
+  const t0 = performance.now();
   try {
-    if (colCount << 10 <= 256 * 1024 * 1024) {
-      // one sweep counts every column at once; both shade modes then warm from the
-      // plane. replaces the worker round-trip AND its structured clone of every row.
-      const plane = await columnCountsPlane(records, colCount, (done) => prog.setProgress(done, rowCount));
-      if (mode === "unique") {
-        tabState.uniqueColCounts = { cols: uniqueCacheFromPlane(plane, colCount), n: colCount };
-      } else {
+    // multiplication, not bit shifts: << wraps int32 negative past 2^21 columns
+    // and used to ENTER this branch at chromosome scale, then die allocating
+    if (colCount <= 262144) {
+      if (mode === "frequency" && lpFresh) {
+        tier = "loadPlane"; // no sweep: the retained load plane already counted every byte per column
         const header = frequencyContentHeader(tabState);
+        const counts = {};
+        for (let c = 0; c < colCount; c++) counts[c] = countsFromLoadPlane(lp, header, c);
         tabState.frequencyColumns = {
           header,
           cols: {},
-          counts: frequencyCountsFromPlane(plane, colCount, header),
+          counts,
           maps: {},
           n: colCount,
-          contentKey: tabState.alphabet + "|" + tabState.records.length
+          contentKey: tabState.alphabet + "|" + rowCount
         };
+      } else if (mode === "unique" && lpFresh) {
+        tier = "loadPlane"; // exact for named slots; OTHER-bucket columns stay lazy
+        tabState.uniqueColCounts = { cols: uniqueCacheFromDensePlane(lp, colCount), n: colCount };
+      } else if (mode === "matrix" && tabState.shadeConfig.matrix.mode === "sequence") {
+        tier = "trivial"; // refs are O(1) reads off the reference row, nothing to count
+      } else if (mode === "matrix") {
+        const cfgM = tabState.shadeConfig.matrix;
+        let refs,
+          plane = null;
+        if (lpFresh) {
+          tier = "loadPlane";
+          refs = matrixRefsFromDensePlane(lp, colCount, rowCount, cfgM.frequency);
+        } else if (mcPlaneFresh) {
+          tier = "planeReuse"; // slider ticks: re-derive refs from the retained sweep plane
+          refs = matrixRefsFromCountsPlane(mc.plane, colCount, rowCount, cfgM.frequency);
+          plane = mc.plane;
+        } else {
+          tier = "sweep";
+          tabState.matrixWarming = true; // renders during the sweep paint white, no O(rows) lazy counts
+          try {
+            plane =
+              (await columnCountsPlaneParallel(records, colCount, onProg)) ||
+              (await columnCountsPlane(records, colCount, onProg));
+          } finally {
+            tabState.matrixWarming = false;
+          }
+          console.log("[warmup] sweep done " + ((performance.now() - t0) | 0) + "ms");
+          refs = matrixRefsFromCountsPlane(plane, colCount, rowCount, cfgM.frequency);
+        }
+        tabState.matrixCache = {
+          header: matrixCacheHeader(tabState),
+          colRef: refs,
+          tables: {},
+          cfgKey: matrixCfgKey(cfgM), // stamped: the first render must NOT wipe the prefill
+          plane, // retained: tweaks re-derive refs in O(cols x 256), no recount
+          planeRows: rowCount,
+          planeCols: plane ? colCount : 0
+        };
+      } else {
+        // one sweep counts every column at once, parallel when the tab qualifies
+        tier = "sweep";
+        const flag = mode === "unique" ? "uniqueWarming" : "freqWarming";
+        tabState[flag] = true; // renders during the sweep paint white, no O(rows) lazy counts
+        let plane;
+        try {
+          plane =
+            (await columnCountsPlaneParallel(records, colCount, (done) => prog.setProgress(done, rowCount))) ||
+            (await columnCountsPlane(records, colCount, (done) => prog.setProgress(done, rowCount)));
+        } finally {
+          tabState[flag] = false; // even if the sweep throws, the gate must reopen
+        }
+        if (mode === "unique") {
+          tabState.uniqueColCounts = { cols: uniqueCacheFromPlane(plane, colCount), n: colCount };
+        } else {
+          const header = frequencyContentHeader(tabState);
+          tabState.frequencyColumns = {
+            header,
+            cols: {},
+            counts: frequencyCountsFromPlane(plane, colCount, header),
+            maps: {},
+            n: colCount,
+            contentKey: tabState.alphabet + "|" + rowCount
+          };
+        }
       }
     } else if (ctx.visibleColumnRange) {
-      // too wide for a full plane (the histogram alone would top 256MB): warm only
-      // the visible window per-column, lazily as before
+      // wider than a full plane can ever be (chromosome scale): warm the visible
+      // window per-column, the lazy caches handle the rest as you scroll
+      tier = "window";
       const { lo, hi } = ctx.visibleColumnRange();
       const cols = [];
       for (let c = lo; c < hi; c++) cols.push(c);
       let last = performance.now();
       for (let k = 0; k < cols.length; k++) {
         if (mode === "frequency") computeFrequencyShadeColor(tabState, 0, cols[k], "-");
+        else if (mode === "matrix") computeMatrixShadeColor(tabState, 0, cols[k], "-");
         else computeUniqueShadeColor(tabState, cols[k], "-");
         if (performance.now() - last > 40) {
-          prog.setProgress(k + 1, cols.length); // bar + counts
+          prog.setProgress(k + 1, cols.length);
           await new Promise((r) => setTimeout(r, 0));
           last = performance.now();
         }
       }
     }
-    ctx.setShadeMode(mode); // hot cache — fast rebuild, no watchdog
+    ctx.setShadeMode(mode); // hot cache, fast rebuild, no watchdog
     if (ctx.invalidateStrips) ctx.invalidateStrips();
+    console.log(
+      "[warmup] tier=" + tier,
+      "rows=" + rowCount,
+      "cols=" + colCount,
+      "total=" + ((performance.now() - t0) | 0) + "ms"
+    );
   } finally {
     prog.close();
   }
@@ -4345,6 +5868,170 @@ function showUniqueShadeModal(tabState, ctx) {
   apply();
 }
 
+const VSEQ_ROW_H = 22;
+const VSEQ_NATIVE_MAX = 5000; // below this a native <select> is the better widget
+
+// Windowed stand-in for the per-record <select>: native dropdowns materialize one
+// <option> per record and layout stalls at genome-collection scale. Renders only
+// the scrolled-to window (spacer + translated slice, same trick as the names
+// panel) plus type-to-filter. Supports exactly the API the shade modals use:
+// value get/set, disabled, addEventListener("change").
+function makeVirtualSeqSelect(records, initialValue) {
+  if (records.length <= VSEQ_NATIVE_MAX) {
+    const sel = document.createElement("select");
+    records.forEach((r) => {
+      const opt = document.createElement("option");
+      opt.value = r.id;
+      opt.textContent = r.header;
+      sel.appendChild(opt);
+    });
+    sel.value = initialValue;
+    return sel;
+  }
+
+  let value = String(initialValue);
+  let disabled = false;
+  let open = false;
+  let matches = null; // null = unfiltered (identity over records)
+  let docHandler = null;
+
+  const root = document.createElement("div");
+  root.style.cssText = "position:relative;flex:1;min-width:0;";
+  const display = document.createElement("input");
+  display.type = "text";
+  display.readOnly = true;
+  display.style.cssText = "width:100%;box-sizing:border-box;cursor:pointer;";
+  root.appendChild(display);
+
+  const panel = document.createElement("div");
+  panel.style.cssText =
+    "position:absolute;left:0;right:0;top:100%;max-height:240px;overflow-y:auto;background:#2b2b2b;border:1px solid #555;z-index:20;display:none;";
+  const spacer = document.createElement("div");
+  const win = document.createElement("div");
+  win.style.cssText = "position:absolute;top:0;left:0;right:0;";
+  panel.appendChild(spacer);
+  panel.appendChild(win);
+  root.appendChild(panel);
+
+  const matchCount = () => (matches ? matches.length : records.length);
+  const recordAt = (i) => records[matches ? matches[i] : i];
+  const headerOf = (v) => {
+    const rec = records.find((r) => String(r.id) === String(v));
+    return rec ? rec.header : "";
+  };
+  const syncDisplay = () => {
+    if (!open) display.value = headerOf(value);
+  };
+
+  function renderWindow() {
+    const total = matchCount();
+    spacer.style.height = total * VSEQ_ROW_H + "px";
+    const MARGIN = 8;
+    const first = Math.max(0, Math.floor(panel.scrollTop / VSEQ_ROW_H) - MARGIN);
+    const last = Math.min(total, Math.ceil((panel.scrollTop + panel.clientHeight) / VSEQ_ROW_H) + MARGIN);
+    win.style.transform = `translateY(${first * VSEQ_ROW_H}px)`;
+    win.innerHTML = "";
+    for (let i = first; i < last; i++) {
+      const rec = recordAt(i);
+      const row = document.createElement("div");
+      row.style.cssText =
+        `height:${VSEQ_ROW_H}px;line-height:${VSEQ_ROW_H}px;padding:0 6px;white-space:nowrap;overflow:hidden;` +
+        `text-overflow:ellipsis;cursor:pointer;${String(rec.id) === value ? "background:#3a5a8a;" : ""}`;
+      row.textContent = rec.header;
+      row.addEventListener("mouseenter", () => (row.style.background = "#3a5a8a"));
+      row.addEventListener("mouseleave", () => {
+        if (String(rec.id) !== value) row.style.background = "";
+      });
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // keep focus, a blur would close the panel before the pick lands
+        value = String(rec.id);
+        close();
+        root.dispatchEvent(new Event("change"));
+      });
+      win.appendChild(row);
+    }
+  }
+
+  function openPanel() {
+    if (open || disabled) return;
+    open = true;
+    panel.style.display = "block";
+    display.readOnly = false;
+    display.value = "";
+    display.placeholder = headerOf(value) || "Type to filter…";
+    matches = null;
+    panel.scrollTop = 0;
+    renderWindow();
+    // center the current selection when unfiltered
+    const idx = records.findIndex((r) => String(r.id) === value);
+    if (idx >= 0) {
+      panel.scrollTop = Math.max(0, idx * VSEQ_ROW_H - panel.clientHeight / 2);
+      renderWindow();
+    }
+    docHandler = (e) => {
+      if (!root.isConnected || !root.contains(e.target)) close();
+    };
+    setTimeout(() => document.addEventListener("mousedown", docHandler), 0);
+  }
+
+  function close() {
+    if (!open) return;
+    open = false;
+    panel.style.display = "none";
+    display.readOnly = true;
+    syncDisplay();
+    if (docHandler) {
+      document.removeEventListener("mousedown", docHandler);
+      docHandler = null;
+    }
+  }
+
+  display.addEventListener("mousedown", () => {
+    if (open) return;
+    openPanel();
+  });
+  display.addEventListener("input", () => {
+    if (!open) return;
+    const term = display.value.trim().toLowerCase();
+    if (!term) matches = null;
+    else {
+      matches = [];
+      for (let i = 0; i < records.length; i++) if (records[i].header.toLowerCase().includes(term)) matches.push(i);
+    }
+    panel.scrollTop = 0;
+    renderWindow();
+  });
+  display.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.stopPropagation(); // close the panel, not the modal
+      close();
+    } else if (e.key === "Enter" && open && matchCount() > 0) {
+      value = String(recordAt(0).id);
+      close();
+      root.dispatchEvent(new Event("change"));
+    }
+  });
+  panel.addEventListener("scroll", renderWindow, { passive: true });
+
+  Object.defineProperty(root, "value", {
+    get: () => value,
+    set: (v) => {
+      value = String(v);
+      syncDisplay();
+    }
+  });
+  Object.defineProperty(root, "disabled", {
+    get: () => disabled,
+    set: (v) => {
+      disabled = !!v;
+      display.disabled = disabled;
+      if (disabled) close();
+    }
+  });
+  syncDisplay();
+  return root;
+}
+
 //  Substitution matrix shading modal
 function showMatrixShadeModal(tabState, ctx) {
   const cfg = tabState.shadeConfig.matrix;
@@ -4399,14 +6086,7 @@ function showMatrixShadeModal(tabState, ctx) {
   seqRow.className = "shade-row";
   const seqLabel = document.createElement("label");
   seqLabel.textContent = "Sequence to shade to: ";
-  const seqSelect = document.createElement("select");
-  tabState.records.forEach((r) => {
-    const opt = document.createElement("option");
-    opt.value = r.id;
-    opt.textContent = r.header;
-    seqSelect.appendChild(opt);
-  });
-  seqSelect.value = cfg.refSeqId;
+  const seqSelect = makeVirtualSeqSelect(tabState.records, cfg.refSeqId); // windowed: no 500k-option DOM
   const sortBtn = document.createElement("button");
   sortBtn.textContent = "Sort by this sequence";
   seqRow.append(seqLabel, seqSelect, sortBtn);
@@ -4430,7 +6110,7 @@ function showMatrixShadeModal(tabState, ctx) {
   freqSlider.type = "range";
   freqSlider.min = "0.5";
   freqSlider.max = "1";
-  freqSlider.step = "0.05";
+  freqSlider.step = "0.01";
   freqSlider.value = cfg.frequency;
   const freqValue = document.createElement("span");
   freqValue.textContent = Number(cfg.frequency).toFixed(2);
@@ -4465,6 +6145,11 @@ function showMatrixShadeModal(tabState, ctx) {
     masterCheck.disabled = !seqMode;
     freqSlider.disabled = seqMode;
   }
+
+  let warmed = false; // first apply warms; slider/config tweaks reuse the cache
+
+  let warmedSeq = false; // sequence mode warms once (trivial); majority re-derives per apply
+
   function apply() {
     cfg.mode = radioSeq.checked ? "sequence" : "majority";
     cfg.refSeqId = Number(seqSelect.value);
@@ -4474,7 +6159,19 @@ function showMatrixShadeModal(tabState, ctx) {
     cfg.matchHex = matchColorInput.value;
     cfg.mismatchHex = mismatchColorInput.value;
     cfg.matrixName = matrixSelect.value;
-    ctx.setShadeMode("matrix");
+    if (cfg.mode === "majority") {
+      // refs depend on the threshold, so every majority apply re-derives them.
+      // cheap: loadPlane/planeReuse tiers are O(cols x slots), no row rescan.
+      // the FIRST majority apply on a sweep tab does one parallel pass and
+      // retains the plane; every tweak after that is planeReuse.
+      applyShadeWithWarmup(tabState, ctx, "matrix", "Preparing matrix shading");
+    } else if (!warmedSeq) {
+      warmedSeq = true;
+      applyShadeWithWarmup(tabState, ctx, "matrix", "Preparing matrix shading");
+    } else {
+      ctx.setShadeMode("matrix");
+    }
+    updateEnabled();
   }
   updateEnabled();
   [radioSeq, radioMaj].forEach((r) =>
@@ -4490,7 +6187,7 @@ function showMatrixShadeModal(tabState, ctx) {
   matchColorInput.addEventListener("input", apply);
   mismatchColorInput.addEventListener("input", apply);
   sortBtn.addEventListener("click", () =>
-    sortBySequenceSimilarity(tabState, Number(seqSelect.value), ctx.rebuildAfterReorder)
+    sortBySequenceSimilarity(tabState, Number(seqSelect.value), ctx.rebuildAfterReorder, cfg.matrixName)
   );
 
   const closeBtn = document.createElement("button");
@@ -4520,14 +6217,7 @@ function showSequenceShadeModal(tabState, ctx) {
   seqRow.className = "shade-row";
   const seqLabel = document.createElement("label");
   seqLabel.textContent = "(Master sequence) ";
-  const seqSelect = document.createElement("select");
-  tabState.records.forEach((r) => {
-    const opt = document.createElement("option");
-    opt.value = r.id;
-    opt.textContent = r.header;
-    seqSelect.appendChild(opt);
-  });
-  seqSelect.value = cfg.refSeqId;
+  const seqSelect = makeVirtualSeqSelect(tabState.records, cfg.refSeqId); // windowed: no 500k-option DOM
   const sortBtn = document.createElement("button");
   sortBtn.textContent = "Sort by this sequence";
   seqRow.append(seqSelect, seqLabel, sortBtn);
@@ -4643,6 +6333,7 @@ function showRtfExportModal(tabState, onExport) {
   execBtn.textContent = "Save to RTF";
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
+    if (virtualGate(tabState, "Export")) return;
     runWithLoading(execBtn, () => {
       const fontSize = Number(fontSelect.value);
       const maxNameCharsCap = nameInput.value === "" ? 20 : Number(nameInput.value);
@@ -4857,7 +6548,7 @@ function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
     current.canvases.forEach((c) => scrollWrap.appendChild(c));
     pageLabel.textContent =
       current.totalPages > 1
-        ? `Page ${current.page + 1} / ${current.totalPages} — columns ${current.startCol + 1}–${current.endCol} of ${current.colCount}`
+        ? `Page ${current.page + 1} / ${current.totalPages}, columns ${current.startCol + 1}–${current.endCol} of ${current.colCount}`
         : `${current.colCount} columns`;
     prevBtn.disabled = current.page <= 0;
     nextBtn.disabled = current.page >= current.totalPages - 1;
@@ -4882,6 +6573,7 @@ function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
   saveBtn.textContent = "Save as PNG";
   saveBtn.className = "modal-close-btn";
   saveBtn.addEventListener("click", () => {
+    if (virtualGate(tabState, "Export")) return;
     const gap = 8; // matches the canvases' marginBottom
     const rawW = Math.max(...current.canvases.map((c) => c.width));
     const rawH = current.canvases.reduce((sum, c) => sum + c.height, 0) + gap * (current.canvases.length - 1);
@@ -4899,7 +6591,7 @@ function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
     });
     combined.toBlob((blob) => {
       if (!blob) {
-        alert("Could not encode the PNG — the image exceeds this browser's canvas limits.");
+        alert("Could not encode the PNG, the image exceeds this browser's canvas limits.");
         return;
       }
       const url = URL.createObjectURL(blob);
@@ -4914,6 +6606,7 @@ function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
   svgBtn.textContent = "Save as SVG";
   svgBtn.className = "modal-close-btn";
   svgBtn.addEventListener("click", () => {
+    if (virtualGate(tabState, "Export")) return;
     const svg = renderSvg(current);
     const blob = new Blob([svg], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
@@ -5058,7 +6751,7 @@ function buildSeqLogoSvg(tabState, colCount, opts) {
   }
 
   // columns (mirrors drawLogoColumn, with the glyph's measured ink box mapped
-  // onto the cell — the same squeeze/stretch as drawScaledGlyph, but vector)
+  // onto the cell, the same squeeze/stretch as drawScaledGlyph, but vector)
   for (let index = 0; index < colCount; index++) {
     const column = [];
     for (const seq of seqs) column.push(seq[index + colOffset] || "-");
@@ -5149,6 +6842,7 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
   saveBtn.textContent = "Save as PNG";
   saveBtn.className = "modal-close-btn";
   saveBtn.addEventListener("click", () => {
+    if (virtualGate(tabState, "Export")) return;
     canvas.toBlob((blob) => {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -5162,6 +6856,7 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
   svgBtn.textContent = "Save as SVG";
   svgBtn.className = "modal-close-btn";
   svgBtn.addEventListener("click", () => {
+    if (virtualGate(tabState, "Export")) return;
     const svg = buildSeqLogoSvg(tabState, colCount, opts);
     const blob = new Blob([svg], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
@@ -5276,6 +6971,7 @@ function clustalClausePass(counts, clause, rows) {
 }
 
 function computeClustalXColumnColor(tabState, col) {
+  if (tabState.virtual) return {}; // no plane path, every lookup falls back to white on paged tabs
   const records = tabState.records;
   const rows = records.length;
   const white = [1, 1, 1];
@@ -5283,7 +6979,7 @@ function computeClustalXColumnColor(tabState, col) {
   for (let r = 0; r < rows; r++) {
     let code = colCodeAt(records[r], col);
     if (code >= 97 && code <= 122) code -= 32; // what toUpperCase did
-    const ch = charOfCode(code); // shared 1-char strings — no per-cell allocation
+    const ch = charOfCode(code); // shared 1-char strings, no per-cell allocation
     counts[ch] = (counts[ch] || 0) + 1;
   }
   const colColors = {};
@@ -5319,41 +7015,62 @@ const CLUSTAL_GROUP_THRESHOLD = 0.5; // fraction of the column a group must cove
 async function computeClustalConsensus(tabState, colCount, onProgress) {
   const records = tabState.records;
   const rows = records.length;
+
+  // decision-only when the retained load plane covers this width, no re-sweep
+  const lp = tabState.loadPlane && tabState.loadPlane.cols >= colCount ? tabState.loadPlane : null;
+  const wide = lp ? null : await columnCountsPlane(records, colCount, onProgress);
+
   const result = [];
-  let last = performance.now();
+  const groupCover = (counts, groups) =>
+    groups.some((g) => {
+      let sum = 0;
+      for (const ch of g) sum += counts[ch] || 0;
+      return sum / rows >= CLUSTAL_GROUP_THRESHOLD;
+    });
+
   for (let c = 0; c < colCount; c++) {
-    if (performance.now() - last > 40) {
-      if (typeof onProgress === "function") onProgress(c, colCount);
-      await new Promise((r) => setTimeout(r, 0));
-      last = performance.now();
-    }
     if (rows === 0) {
       result.push(" ");
       continue;
     }
-    const counts = {};
-    for (let r = 0; r < rows; r++) {
-      const seq = records[r].seq;
-      const ch = c < seq.length ? seq[c].toUpperCase() : "-";
-      if (ch !== "-" && ch !== ".") counts[ch] = (counts[ch] || 0) + 1;
+    let counts = null;
+    if (lp) {
+      const base = c << lp.shift;
+      if (lp.counts[base + lp.otherSlot] === 0) {
+        counts = {};
+        for (let k = 0; k < lp.otherSlot; k++) {
+          const n = lp.counts[base + k];
+          if (!n) continue;
+          const code = lp.denseChar[k];
+          if (code === 45 || code === 46) continue; // clustal counts exclude '-' and '.'
+          counts[String.fromCharCode(code)] = n;
+        }
+      } // else: an unnamed char is present, the bucket can't name it, fall through to exact
+    } else {
+      counts = {};
+      const base = c << 8;
+      for (let k = 0; k < 256; k++) {
+        if (k === 45 || k === 46) continue;
+        const n = wide[base | k];
+        if (n > 0) counts[String.fromCharCode(k)] = n;
+      }
     }
+    if (!counts) {
+      // exact per-column fallback, the original per-row scan, verbatim semantics
+      counts = {};
+      for (let r = 0; r < rows; r++) {
+        const ch = (records[r].seq[c] || "-").toUpperCase();
+        if (ch !== "-" && ch !== ".") counts[ch] = (counts[ch] || 0) + 1;
+      }
+    }
+    // decision logic unchanged: identity → *, strong group → *, weak group → .
     const chars = Object.keys(counts);
     let symbol = " ";
-    if (chars.length === 1 && counts[chars[0]] === rows) {
-      symbol = "*";
-    } else {
-      const groupCover = (groups) =>
-        groups.some((g) => {
-          let sum = 0;
-          for (const ch of g) sum += counts[ch] || 0;
-          return sum / rows > CLUSTAL_GROUP_THRESHOLD;
-        });
-      if (groupCover(CLUSTAL_STRONG_GROUPS)) symbol = ":";
-      else if (groupCover(CLUSTAL_WEAK_GROUPS)) symbol = ".";
-    }
+    if (chars.length === 1 && counts[chars[0]] === rows) symbol = "*";
+    else if (groupCover(counts, CLUSTAL_STRONG_GROUPS)) symbol = "*";
+    else if (groupCover(counts, CLUSTAL_WEAK_GROUPS)) symbol = ".";
     result.push(symbol);
   }
-  if (onProgress) onProgress(colCount, colCount); // land on 100%
   return result;
 }
 
@@ -5471,11 +7188,11 @@ function showRegexShadeModal(tabState, ctx) {
       rowEntries.forEach((e) => {
         const bad = e.patternInput.value.trim() !== "" && !safeCompile(e.patternInput.value);
         e.patternInput.style.background = bad ? "#ffd6d6" : "";
-        e.patternInput.title = bad ? "Invalid regular expression — skipped" : "";
+        e.patternInput.title = bad ? "Invalid regular expression, skipped" : "";
         if (bad) invalidCount++;
       });
 
-      // time-based yield + progress reporter, shared by all three stages below
+      // time-based yield + progress reporter, shared by the stages below
       const breathe = async (last, done, total) => {
         const now = performance.now();
         if (now - last > 50) {
@@ -5489,7 +7206,10 @@ function showRegexShadeModal(tabState, ctx) {
       const prog = showProgressOverlay("Searching alignment");
       try {
         try {
-          await computeRegexHits(tabState, (done, total) => prog.setProgress(done, total));
+          await computeRegexHits(tabState, (d, t, phase) => {
+            if (prog.setLabel) prog.setLabel(phase === "dedup" ? "Deduplicating…" : "Scanning unique sequences…");
+            prog.setProgress(phase === "dedup" ? (d / t) * 0.3 : 0.3 + (d / t) * 0.7, 1);
+          });
         } catch (err) {
           // defensive: unreachable once computeRegexHits has the per-pattern try/catch
           errorRow.textContent = "Invalid regex: " + err.message;
@@ -5505,7 +7225,7 @@ function showRegexShadeModal(tabState, ctx) {
         }
 
         // sanity check: a multi-million-cell hit set is usually a too-loose pattern,
-        // and painting it costs real time even chunked — let the user opt out
+        // and painting it costs real time even chunked, let the user opt out
         let totalHits = 0;
         cfg.hitsByRow.forEach((m) => (totalHits += m.size));
         if (totalHits > 3000000) {
@@ -5515,40 +7235,18 @@ function showRegexShadeModal(tabState, ctx) {
           if (!ok) return; // finally closes the overlay; previous shading is untouched
         }
 
-        // Stage 2: revert the previous run's cells, in yielded batches.
-        // (the old `const revert = cfg.appliedHits.map(...)` was computed and never
-        // used — dead code, dropped here)
-        const prev = cfg.appliedHits || [];
-        let last = performance.now();
-        let revertBatch = [];
-        for (let i = 0; i < prev.length; i++) {
-          const { row, col } = prev[i];
-          const rec = tabState.records[row];
-          if (recordColorAt(rec, col) !== undefined) {
-            clearRecordColor(rec, col);
-            revertBatch.push({ row, col, color: getShadeColor(tabState, row, col, rec.seq[col] || "-") });
-          }
-          if (revertBatch.length >= 65536) {
-            ctx.applyColorOverrides(revertBatch);
-            revertBatch = [];
-          }
-          last = await breathe(last, i + 1, prev.length);
-        }
-        if (revertBatch.length) ctx.applyColorOverrides(revertBatch);
-
-        // Stage 3: paint the new hits, in yielded batches
-        const newHits = [];
+        // paint the hits, in yielded batches. Paint-over semantics: previous
+        // strokes stay, new strokes land on top. No revert, no bookkeeping —
+        // Clear shading is the eraser, and it belongs to the user.
         let pending = [];
         const rows = cfg.hitsByRow;
-        last = performance.now();
+        let last = performance.now();
         for (let r = 0; r < rows.length; r++) {
           const rec = tabState.records[r];
           rows[r].forEach((colorHex, col) => {
             const hex = "#" + colorHex.replace("#", "");
             setRecordColor(rec, col, hex);
-            const hit = { row: r, col, color: hexToRgbFloat(hex) };
-            newHits.push(hit);
-            pending.push(hit);
+            pending.push({ row: r, col, color: hexToRgbFloat(hex) });
           });
           if (pending.length >= 65536) {
             ctx.applyColorOverrides(pending);
@@ -5557,9 +7255,8 @@ function showRegexShadeModal(tabState, ctx) {
           last = await breathe(last, r + 1, rows.length);
         }
         if (pending.length) ctx.applyColorOverrides(pending);
-        cfg.appliedHits = newHits;
       } finally {
-        prog.close(); // the overlay now survives all three stages and always closes
+        prog.close(); // the overlay survives and always closes
       }
     });
   });
@@ -5895,7 +7592,7 @@ function showConsensusOptionsModal(tabState, onGenerate) {
   execBtn.className = "modal-close-btn";
   execBtn.addEventListener("click", () => {
     const checked = box.querySelector(`input[name="${radioName}"]:checked`);
-    overlay.remove(); // close the options modal first — the progress overlay replaces it
+    overlay.remove(); // close the options modal first, the progress overlay replaces it
     // onGenerate is now async (chunked compute + progress); surface failures instead of
     // swallowing them as unhandled rejections
     Promise.resolve(onGenerate(checked ? checked.value : "simple")).catch((err) => {
@@ -5974,49 +7671,72 @@ async function computeSimpleConsensusJava(tabState, colCount, onProgress) {
   const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
   const charSet = alphaList.map((e) => e.code);
   const seqNum = tabState.records.length;
-  const plane = await columnCountsPlane(tabState.records, colCount, onProgress); // the expensive part, once
+
+  // decision-only when the retained load plane covers this width, no re-sweep
+  const lp = tabState.loadPlane && tabState.loadPlane.cols >= colCount ? tabState.loadPlane : null;
+  const wide = lp ? null : await columnCountsPlane(tabState.records, colCount, onProgress);
   const setCodes = charSet.map((ch) => ch.toUpperCase().charCodeAt(0));
   const result = [];
   for (let c = 0; c < colCount; c++) {
     const counts = {};
-    const base = c << 8;
-    for (let i = 0; i < charSet.length; i++) counts[charSet[i]] = plane[base | setCodes[i]];
-    // decision logic unchanged — only where `counts` comes from changed
-    let mostIncidences = [];
-    let maxIncidenceCounter = 0;
-    charSet.forEach((ch) => {
-      if (counts[ch] === maxIncidenceCounter) {
-        mostIncidences.push(ch);
-      } else if (counts[ch] > maxIncidenceCounter) {
-        maxIncidenceCounter = counts[ch];
-        mostIncidences = [ch];
-      }
-    });
-    const maxIncidenceRatio = maxIncidenceCounter / seqNum;
-    const oneOffRatio = (seqNum - 1) / seqNum;
-    if (mostIncidences.length === 1 && maxIncidenceRatio >= oneOffRatio) {
-      result.push(mostIncidences[0]);
-    } else if (mostIncidences.length === 1 && maxIncidenceRatio < oneOffRatio) {
-      result.push(mostIncidences[0].toLowerCase());
+    if (lp) {
+      const base = c << lp.shift;
+      for (let i = 0; i < charSet.length; i++) counts[charSet[i]] = lp.counts[base + lp.toDense[setCodes[i]]];
     } else {
-      result.push(" ");
+      const base = c << 8;
+      for (let i = 0; i < charSet.length; i++) counts[charSet[i]] = wide[base | setCodes[i]];
     }
+    // decision logic unchanged
+    result.push(
+      simpleConsensusDecision(
+        charSet.map((ch) => counts[ch]),
+        charSet,
+        seqNum
+      )
+    );
   }
   return result;
 }
 
 async function computeDotsAndIdentityConsensus(tabState, colCount, onProgress) {
-  const seqNum = tabState.records.length;
-  const plane = await columnCountsPlane(tabState.records, colCount, onProgress); // the expensive part, once
+  const records = tabState.records;
+  const seqNum = records.length;
+
+  // decision-only when the retained load plane covers this width, no re-sweep
+  const lp = tabState.loadPlane && tabState.loadPlane.cols >= colCount ? tabState.loadPlane : null;
+  const wide = lp ? null : await columnCountsPlane(records, colCount, onProgress);
+
   const result = [];
   for (let c = 0; c < colCount; c++) {
-    const counts = {};
-    const base = c << 8;
-    for (let k = 0; k < 256; k++) {
-      const n = plane[base | k];
-      if (n > 0) counts[String.fromCharCode(k)] = n;
+    let counts = null;
+    if (lp) {
+      const base = c << lp.shift;
+      if (lp.counts[base + lp.otherSlot] === 0) {
+        // dots counts EVERYTHING, gaps included, so unlike clustal, no slot is excluded
+        counts = {};
+        for (let k = 0; k < lp.otherSlot; k++) {
+          const n = lp.counts[base + k];
+          if (n > 0) counts[String.fromCharCode(lp.denseChar[k])] = n;
+        }
+      } // else: an unnamed char is present, it could BE the max or the unanimous
+      // identity char, and the bucket can't name it, fall through to exact
+    } else {
+      counts = {};
+      const base = c << 8;
+      for (let k = 0; k < 256; k++) {
+        const n = wide[base | k];
+        if (n > 0) counts[String.fromCharCode(k)] = n;
+      }
     }
-    // decision logic unchanged — max-finding and the identity check are order-independent
+    if (!counts) {
+      // exact per-column fallback, the original per-row scan, verbatim semantics
+      counts = {};
+      for (let r = 0; r < seqNum; r++) {
+        const ch = (records[r].seq[c] || "-").toUpperCase();
+        counts[ch] = (counts[ch] || 0) + 1;
+      }
+    }
+    // decision logic unchanged, max-finding and the identity check are order-independent
     let maxFreq = 0;
     let identityChar = null;
     for (const ch of Object.keys(counts)) {
@@ -6305,7 +8025,7 @@ function initTrackRenderer(canvas, wrapperEl, config) {
   let glSuspended = false;
   const loseExt = gl.getExtension("WEBGL_lose_context");
 
-  // full GL object (re)creation — runs on init and after every context restore
+  // full GL object (re)creation, runs on init and after every context restore
   function setupGL() {
     const compiled = compileMsaProgram(gl);
     prog = compiled.prog;
@@ -6514,7 +8234,7 @@ function initTrackRenderer(canvas, wrapperEl, config) {
       gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
       sizeCanvas();
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      // cell data is unchanged by a resize/zoom — only rebuild if the
+      // cell data is unchanged by a resize/zoom, only rebuild if the
       // viewport outgrew the buffered window (same gate onScroll uses)
       if (windowNeedsRebuild()) rebuildWindow();
       else {
@@ -6562,7 +8282,8 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
 
   function sizeCanvasAndSpacer() {
     spacer.style.width = cols * CELL_W + "px";
-    spacer.style.height = rows * CELL_H + "px";
+    // Do NOT assign spacer.style.height here. createTab owns vertical virtual
+    // scrolling and applies a capped physical height through updateVScrollSpacers().
     canvas.width = alignPanel.clientWidth * dpr;
     canvas.height = alignPanel.clientHeight * dpr;
     canvas.style.width = alignPanel.clientWidth + "px";
@@ -6645,7 +8366,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     const records = config.getRecords();
     rows = records.length;
     cols = config.getColCount();
-    
+
     // unique and frequency rely on cached column statistics that may have changed while their modals were closed
     if (config.getShadeMode() === "unique" && config.recomputeUniqueColors) {
       //config.recomputeUniqueColors(cols);
@@ -6845,33 +8566,44 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     if (!cellPos) return;
     const record = config.getRecords()[cellPos.row];
     //if (!record.charColors) record.charColors = {};
-    const currentChar = record.seq[cellPos.col] || "-";
+    let currentChar = record.seq[cellPos.col] || "-"; // let: the virtual patch below updates these
     const overrideHex = recordColorAt(record, cellPos.col);
-    const currentColorHex = overrideHex || rgbFloatToHex(config.getColor(cellPos.row, cellPos.col, currentChar));
+    let currentColorHex = overrideHex || rgbFloatToHex(config.getColor(cellPos.row, cellPos.col, currentChar));
     showCellEditPopup(
       e.clientX,
       e.clientY,
       currentChar,
       currentColorHex,
       (newChar, newColorHex) => {
+        if (record.vsrc) {
+          // virtual row: sequence bytes live in the File, color-only edits until
+          // the Phase 3 edit overlay. Char writes would crash on the facade.
+          setRecordColor(record, cellPos.col, newColorHex);
+          applyColorOverrides([
+            { row: cellPos.row, col: cellPos.col, ch: currentChar, color: hexToRgbFloat(newColorHex) }
+          ]);
+          return;
+        }
         const codes = record.seqCodes;
         const code = newChar.charCodeAt(0);
+        let oldCode = 45; // '-', the pad-extended case
         if (codes && cellPos.col < codes.length && code <= 255) {
-          codes[cellPos.col] = code; // byte row: in-place write — no 250MB string rebuild per edit
+          oldCode = codes[cellPos.col]; // capture BEFORE the write
+          codes[cellPos.col] = code; // byte row: in-place write
         } else {
-          // string path (sub-gate alignments) — or widen a byte row back to a string
-          // for the two rare cases: edit past the row end, or a non-Latin-1 character
+          // string path, or widen a byte row back to a string
           if (codes) {
             record.seq = SEQ_FACADE_DECODER.decode(codes);
             delete record.seqCodes;
           }
           let seq = record.seq;
+          oldCode = cellPos.col < seq.length ? seq.charCodeAt(cellPos.col) : 45;
           if (seq.length <= cellPos.col) seq = seq.padEnd(cellPos.col + 1, "-");
           record.seq = seq.substring(0, cellPos.col) + newChar + seq.substring(cellPos.col + 1);
         }
         setRecordColor(record, cellPos.col, newColorHex);
         applyColorOverrides([{ row: cellPos.row, col: cellPos.col, ch: newChar, color: hexToRgbFloat(newColorHex) }]);
-        config.onDataChanged(cellPos.col);
+        config.onDataChanged(cellPos.col, oldCode, code);
       },
       () => {
         clearRecordColor(record, cellPos.col);
@@ -6881,6 +8613,22 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
         ]);
       }
     );
+    // virtual tab, row not resident yet: the popup opened on placeholder data —
+    // fetch the page and patch the popup in place when the real bytes land
+    if (record.vsrc && !record.vsrc.peekRowQuiet(cellPos.row)) {
+      const popup = document.querySelector(".cell-edit-popup");
+      record.vsrc.ensureRow(cellPos.row).then(() => {
+        const realChar = record.seq[cellPos.col] || "-";
+        const realHex =
+          recordColorAt(record, cellPos.col) || rgbFloatToHex(config.getColor(cellPos.row, cellPos.col, realChar));
+        currentChar = realChar; // the Apply closure reads these, keep them honest too
+        currentColorHex = realHex;
+        const ci = popup && popup.querySelector(".cell-edit-char-input");
+        const co = popup && popup.querySelector('input[type="color"]');
+        if (ci) ci.value = realChar;
+        if (co) co.value = realHex;
+      });
+    }
   });
 
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -6944,9 +8692,11 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   let touchSelTimer = null;
   let touchSelActive = false;
   let suppressNextClick = false;
-  let touchStartX = 0,
-    touchStartY = 0,
-    lastTouchX = 0;
+  let touchStartX = null,
+    touchStartY = null,
+    touchStartScrollLeft = 0,
+    touchStartScrollTop = 0,
+    touchStartRealV = 0; // logical scroll at gesture start
   let touchAutoScrollInterval = null;
 
   function stopTouchAutoScroll() {
@@ -7021,7 +8771,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
     touchSelActive = false;
     stopTouchAutoScroll();
     selClearSuppressUntil = performance.now() + 150;
-    suppressNextClick = true; // a click fires after touchend — don't let it open the cell editor
+    suppressNextClick = true; // a click fires after touchend, don't let it open the cell editor
     const t = e.changedTouches[0];
     const lo = Math.min(selStartCol, selEndCol);
     const hi = Math.max(selStartCol, selEndCol);
@@ -7117,7 +8867,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
       gl.uniform2f(uni.cellSize, CELL_W * dpr, CELL_H * dpr);
       sizeCanvasAndSpacer();
       gl.uniform2f(uni.res, canvas.width, canvas.height);
-      // cell data is unchanged by a resize/zoom — only rebuild if the
+      // cell data is unchanged by a resize/zoom, only rebuild if the
       // viewport outgrew the buffered window (same gate onScroll uses)
       if (windowNeedsRebuild()) rebuildWindow();
       else {
@@ -7155,7 +8905,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
   };
 }
 
-// Per-column sequence logo strip 
+// Per-column sequence logo strip
 function initLogoStrip(cfg) {
   const { tabState, stripEl, canvasEl, alignPanel, hScrollTrack, getColCount, getCellDims, realHScroll } = cfg;
   const ctx = canvasEl.getContext("2d");
@@ -7190,7 +8940,7 @@ function initLogoStrip(cfg) {
     const viewCols = Math.ceil(W / cw) + 2 * PAD;
     const needPx = viewCols * cw;
     // keep the buffer only if it's wide enough in PIXELS for the current cell
-    // width — a buffer allocated at a smaller cw clips when zoomed in
+    // width, a buffer allocated at a smaller cw clips when zoomed in
     if (img && img.width >= needPx && img.height === Math.max(1, H)) return;
     imgCols = viewCols + PAD * 2;
     img = document.createElement("canvas");
@@ -7199,15 +8949,48 @@ function initLogoStrip(cfg) {
     blitScrollX = null;
   }
 
+  // Virtual tabs: exact per-column frequencies from the retained load plane —
+  // never touches paged rows (a sampled scan through facades would kick a fetch
+  // per sampled row and storm the pager)
+  function computeColFromPlane(col) {
+    const lp = tabState.loadPlane;
+    const rows = tabState.records.length;
+    if (!lp || !rows) return null;
+    const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
+    const keys = alphaList.map((e) => e.code).filter((k) => k !== "-");
+    const base = col << lp.shift;
+    const freq = {};
+    for (const ch of keys) {
+      const n = lp.counts[base + lp.toDense[ch.charCodeAt(0)]];
+      freq[ch] = n / rows; // plane folds lowercase; gaps/dots aren't in keys
+    }
+    let uncertainty = 0;
+    for (const ch of keys) {
+      const f = freq[ch];
+      if (f > 0) uncertainty -= f * Math.log2(f);
+    }
+    const maxInfo = Math.log2(keys.length);
+    const infoContent = Math.max(0, Math.min(maxInfo - uncertainty, maxInfo)); // useError=false ⇒ no errest
+    return {
+      stack: keys
+        .map((ch) => ({ ch, f: freq[ch] || 0 }))
+        .filter((e) => e.f > 0.001)
+        .sort((a, b) => a.f - b.f),
+      frac: maxInfo > 0 ? infoContent / maxInfo : 0,
+      colorMap: tabState.colors[tabState.alphabet]
+    };
+  }
+
   function computeCol(col) {
     const rows = tabState.records.length;
     if (!rows) return null;
+    if (tabState.virtual) return computeColFromPlane(col); // plane-exact, zero page traffic
     const stride = Math.max(1, Math.floor(rows / ROW_SAMPLE));
     const column = [];
     for (let r = 0; r < rows; r += stride) {
       let code = colCodeAt(tabState.records[r], col);
       if (code >= 97 && code <= 122) code -= 32; // uppercase a-z
-      column.push(charOfCode(code)); // shared 1-char strings — no allocation
+      column.push(charOfCode(code)); // shared 1-char strings, no allocation
     }
     const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
     const keys = alphaList.map((e) => e.code).filter((k) => k !== "-");
@@ -7279,7 +9062,7 @@ function initLogoStrip(cfg) {
   alignPanel.addEventListener("scroll", scheduleDraw, { passive: true });
   hScrollTrack.addEventListener("scroll", scheduleDraw, { passive: true });
 
-  // periodic draw for resize/layout self-heal only — the column cache is never
+  // periodic draw for resize/layout self-heal only, the column cache is never
   // cleared here; edits invalidate explicitly via invalidate()
   const timer = setInterval(() => {
     if (!cfg.isActive()) return;
@@ -7303,7 +9086,7 @@ function initLogoStrip(cfg) {
   };
 }
 
-// Conservation bars (per visible column) 
+// Conservation bars (per visible column)
 function initConservationStrip(cfg) {
   const {
     tabState,
@@ -7347,7 +9130,7 @@ function initConservationStrip(cfg) {
     const viewCols = Math.ceil(W / cw) + 2 * PAD;
     const needPx = viewCols * cw;
     // keep the buffer only if it's wide enough in PIXELS for the current cell
-    // width — a buffer allocated at a smaller cw clips when zoomed in
+    // width, a buffer allocated at a smaller cw clips when zoomed in
     if (img && img.width >= needPx && img.height === Math.max(1, H)) return;
     imgCols = viewCols + PAD * 2;
     img = document.createElement("canvas");
@@ -7356,9 +9139,33 @@ function initConservationStrip(cfg) {
     blitScrollX = null;
   }
   // % identity of most common non-gap char in col; returns {ch, pct} or null
-  const statCache = new Map(); // col -> {ch, pct} | null — depends on data only, never on scroll or zoom
+  const statCache = new Map(); // col -> {ch, pct} | null, depends on data only, never on scroll or zoom
 
-  // identity of most common non-gap char in col — returns {ch, pct} or null.
+  // Virtual tabs: exact majority from the retained load plane, never touches
+  // paged rows. Columns where the OTHER bucket (exotic bytes the plane can't
+  // name) would win return null, same as all-gap columns: the bar is omitted.
+  function colStatsFromPlane(col) {
+    const lp = tabState.loadPlane;
+    const rows = tabState.records.length;
+    if (!lp || !rows) return null;
+    const base = col << lp.shift;
+    let bestSlot = -1,
+      bestCount = 0;
+    for (let s = 0; s < lp.otherSlot; s++) {
+      const code = lp.denseChar[s];
+      if (code === 45 || code === 46) continue; // gaps don't count, same as the sampled path
+      const n = lp.counts[base + s];
+      if (n > bestCount) {
+        bestCount = n;
+        bestSlot = s;
+      }
+    }
+    if (bestSlot < 0) return null;
+    if (lp.counts[base + lp.otherSlot] > bestCount) return null;
+    return { ch: String.fromCharCode(lp.denseChar[bestSlot]), pct: (100 * bestCount) / rows };
+  }
+
+  // identity of most common non-gap char in col, returns {ch, pct} or null.
   // Row-sampled (same cap as the logo strip) and allocation-free: at 20k rows a
   // full scan was 20k string allocations per column; now ≤1000 sampled reads.
   const ROW_SAMPLE = 1000;
@@ -7366,7 +9173,9 @@ function initConservationStrip(cfg) {
     if (statCache.has(col)) return statCache.get(col);
     const rows = tabState.records.length;
     let result = null;
-    if (rows) {
+    if (rows && tabState.virtual) {
+      result = colStatsFromPlane(col); // plane-exact, zero page traffic
+    } else if (rows) {
       const stride = Math.max(1, Math.floor(rows / ROW_SAMPLE));
       const counts = new Int32Array(256); // ASCII char codes
       let sampled = 0;
@@ -7463,7 +9272,7 @@ function initConservationStrip(cfg) {
   // every 5th tick, drop cached column stats so edits self-heal
   // (same cadence as the logo strip's colCache clear)
   let tick = 0;
-  // periodic draw for resize/layout self-heal only — the stat cache is NEVER
+  // periodic draw for resize/layout self-heal only, the stat cache is NEVER
   // cleared here; edits invalidate explicitly via invalidate()
   const timer = setInterval(() => {
     if (!cfg.isActive()) return;
@@ -7490,7 +9299,7 @@ function initConservationStrip(cfg) {
   };
 }
 
-// Bottom overview strip (birds-eye + viewport connectors) 
+// Bottom overview strip (birds-eye + viewport connectors)
 function initOverviewStrip(cfg) {
   const {
     tabState,
@@ -7537,7 +9346,11 @@ function initOverviewStrip(cfg) {
     for (let py = 0; py < H; py++) {
       const r = Math.min(rows - 1, Math.floor((py * rows) / H));
       const rec = tabState.records[r];
-      const codes = rec.seqCodes; // byte rows: raw reads — no facade trap per pixel
+      let codes = rec.seqCodes; // byte rows: raw reads, no facade trap per pixel
+      if (!codes && tabState.virtual) {
+        codes = tabState.virtual.peekRowQuiet(r); // cache-only, a strip never kicks fetches
+        if (!codes) continue; // non-resident row: transparent pixels until its page lands
+      }
       for (let px = 0; px < W; px++) {
         const c = Math.min(cols - 1, Math.floor((px * cols) / W));
         const override = recordColorAt(rec, c);
@@ -7571,7 +9384,7 @@ function initOverviewStrip(cfg) {
     const rw = Math.min(W, Math.max(6, (alignPanel.clientWidth / totalW) * W));
     const rh = Math.min(H, Math.max(6, (alignPanel.clientHeight / totalH) * H));
     const mx = Math.min(W - rw, Math.max(0, (realHScroll() / totalW) * W));
-    const my = Math.min(H - rh, Math.max(0, (alignPanel.scrollTop / totalH) * H));
+    const my = Math.min(H - rh, Math.max(0, (cfg.realVScroll() / totalH) * H));
     markerEl.style.left = mx + "px";
     markerEl.style.top = my + "px";
     markerEl.style.width = rw + "px";
@@ -7601,7 +9414,7 @@ function initOverviewStrip(cfg) {
     hScrollTrack.scrollLeft = trackFromReal(
       Math.min(maxRealX, Math.max(0, fx * getColCount() * cw - alignPanel.clientWidth / 2))
     );
-    alignPanel.scrollTop = Math.min(maxY, Math.max(0, fy * tabState.records.length * ch - alignPanel.clientHeight / 2));
+    cfg.setRealVScroll(Math.min(maxY, Math.max(0, fy * tabState.records.length * ch - alignPanel.clientHeight / 2)));
     scheduleOverlay();
   }
 
@@ -7697,7 +9510,11 @@ function showViewportModal(tabState, vp) {
     for (let py = 0; py < OH; py++) {
       const r = Math.min(rows - 1, Math.floor((py * rows) / OH));
       const rec = tabState.records[r];
-      const codes = rec.seqCodes;
+      let codes = rec.seqCodes; // byte rows: raw reads, no facade trap per pixel
+      if (!codes && tabState.virtual) {
+        codes = tabState.virtual.peekRowQuiet(r); // cache-only, a strip never kicks fetches
+        if (!codes) continue; // non-resident row: transparent pixels until its page lands
+      }
       for (let px = 0; px < OW; px++) {
         const c = Math.min(cols - 1, Math.floor((px * cols) / OW));
         const override = recordColorAt(rec, c);
@@ -7728,7 +9545,7 @@ function showViewportModal(tabState, vp) {
     const totalW = Math.max(1, cols * cw);
     const totalH = Math.max(1, rows * ch);
     const x = (vp.realHScroll() / totalW) * OW;
-    const y = (vp.alignPanel.scrollTop / totalH) * OH;
+    const y = (vp.realVScroll() / totalH) * OH;
     const rw = Math.min(OW, Math.max(6, (vp.alignPanel.clientWidth / totalW) * OW));
     const rh = Math.min(OH, Math.max(6, (vp.alignPanel.clientHeight / totalH) * OH));
     rect.style.left = `${Math.min(OW - rw, Math.max(0, x))}px`;
@@ -7750,7 +9567,7 @@ function showViewportModal(tabState, vp) {
     const targetX = Math.min(maxRealX, Math.max(0, fx * cols * cw - vp.alignPanel.clientWidth / 2));
     const targetY = Math.min(maxY, Math.max(0, fy * rows * ch - vp.alignPanel.clientHeight / 2));
     vp.hScrollTrack.scrollLeft = trackFromReal(targetX); // its scroll listener syncs everything
-    vp.alignPanel.scrollTop = targetY;
+    vp.setRealVScroll(targetY);
     updateRect();
   }
 
@@ -7869,6 +9686,9 @@ function createTab(name, records, presetState = null) {
     refreshDelay: presetState ? presetState.refreshDelay : 0,
     shadeCleared: !!(presetState && presetState.shadeCleared), // .blim loads: colors are baked, base shading renders white
     consensusBaked: (presetState && presetState.consensusBaked) || null, // baked consensus planes from .blim
+    loadPlane: presetState && presetState.loadPlane ? presetState.loadPlane : null, // dense counts plane from the load sweep
+    colorPack: presetState && presetState.colorPack ? presetState.colorPack : null,
+    virtual: presetState && presetState.virtual ? presetState.virtual : null, // virtual-row pager, rows live in the File, paged on demand
     uniqueColCounts: [],
     matrixCache: null,
     clustalXColors: null
@@ -7878,8 +9698,8 @@ function createTab(name, records, presetState = null) {
     for (const key of ["regex", "scanprosite"]) {
       const cfg = tabState.shadeConfig[key];
       if (!cfg) continue;
-      cfg.hitsByRow = null; // cached hit positions — wrong after any structural edit
-      cfg.appliedHits = []; // revert list — reverting at stale coordinates corrupts colors
+      cfg.hitsByRow = null; // cached hit positions, wrong after any structural edit
+      cfg.appliedHits = []; // revert list, reverting at stale coordinates corrupts colors
     }
   };
 
@@ -7912,6 +9732,8 @@ function createTab(name, records, presetState = null) {
     tabState.shadeCleared = false;
     tabState.records.forEach((rec) => {
       rec.colorIdx = null;
+      rec.colorPacked = null; // baked layer wiped too, shade covers all, per the layering contract
+      rec.colorSparse = null;
     });
     tabState.shadeMode = mode;
     scheduleRebuild();
@@ -7923,7 +9745,7 @@ function createTab(name, records, presetState = null) {
     const recs = tabState.records;
     for (let i = 0; i < recs.length; i++) {
       const rec = recs[i];
-      const l = rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // raw read — no facade trap
+      const l = rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // raw read, no facade trap
       if (l > n) n = l;
     }
     const anns = tabState.annotations;
@@ -8065,12 +9887,68 @@ function createTab(name, records, presetState = null) {
   applyFixedHeights();
 
   let hScrollScale = 1; // <1 when content would exceed the browser's element-width cap
+
+  // Vertical counterpart to hScrollScale. Firefox becomes unreliable around
+  // ~8.95M CSS px of scrollable height; keep the physical DOM span safely below
+  // that, while all renderer math continues to use real alignment pixels.
+  const MAX_V_SCROLL_SPAN = 8000000;
+  let vScrollScale = 1;
+
+  function realAlignmentHeight() {
+    return Math.max(0, tabState.records.length * getCellDims().h);
+  }
+
+  // Rebuild both vertical spacers to the same capped physical height. The
+  // alignment and names panels must have identical physical scroll geometry so
+  // raw scrollTop can be copied between them without drifting.
+  function updateVScrollSpacers() {
+    const realHeight = realAlignmentHeight();
+    vScrollScale = realHeight > MAX_V_SCROLL_SPAN ? MAX_V_SCROLL_SPAN / realHeight : 1;
+    const physicalHeight = Math.max(1, realHeight * vScrollScale) + "px";
+
+    spacer.style.height = physicalHeight;
+    namesPanel._vScrollScale = vScrollScale; //<- this line! without it, renderNameWindow's
+    //   (namesPanel._vScrollScale || 1) regenerates the
+    //   full-height spacer on every render
+
+    if (namesPanel.vstate && namesPanel.vstate.spacer) {
+      namesPanel.vstate.spacer.style.height = physicalHeight;
+    }
+  }
+
+  // Physical DOM scrollTop -> logical alignment pixel offset. This is what the
+  // WebGL renderer, row picker, and names virtualizer must use.
+  function realVScroll() {
+    if (vScrollScale === 1) return alignPanel.scrollTop;
+
+    const physicalMax = alignPanel.scrollHeight - alignPanel.clientHeight;
+    const realMax = Math.max(0, realAlignmentHeight() - alignPanel.clientHeight);
+    return physicalMax > 0 ? (alignPanel.scrollTop * realMax) / physicalMax : 0;
+  }
+
+  // Logical alignment pixel offset -> physical DOM scrollTop. Use this for any
+  // programmatic vertical navigation; never assign logical pixels directly to
+  // `.scrollTop` once vScrollScale is below 1.
+  function setRealVScroll(realY) {
+    const realMax = Math.max(0, realAlignmentHeight() - alignPanel.clientHeight);
+    const clamped = Math.max(0, Math.min(realMax, realY));
+
+    if (vScrollScale === 1) {
+      alignPanel.scrollTop = clamped;
+      return;
+    }
+
+    const physicalMax = alignPanel.scrollHeight - alignPanel.clientHeight;
+    alignPanel.scrollTop = realMax > 0 ? (clamped * physicalMax) / realMax : 0;
+  }
+
   function updateHScrollSpacer() {
     const { w } = getCellDims();
     const realWidth = getColCount() * w;
     const MAX_SPAN = 30000000; // stay under the 2^25px (~33.5M) element-width limit
     hScrollScale = realWidth > MAX_SPAN ? MAX_SPAN / realWidth : 1;
     hScrollSpacer.style.width = `${realWidth * hScrollScale}px`;
+    updateVScrollSpacers();
   }
   // map the (possibly compressed) scrollbar position back to real content pixels
   function realHScroll() {
@@ -8182,7 +10060,7 @@ function createTab(name, records, presetState = null) {
     if (typeof alignmentCtl !== "undefined") alignmentCtl.onResize();
   }
 
-  // consensus is computed per column on demand — windowed rendering means only
+  // consensus is computed per column on demand, windowed rendering means only
   // visible columns are ever computed, so tab loading is O(1) in columns.
   // The Proxy keeps every existing `consensusStr[c]` / `.length` read working.
   const consensusCache = new Map();
@@ -8214,11 +10092,11 @@ function createTab(name, records, presetState = null) {
 
   function refreshConsensus() {
     consensusCache.clear(); // outer memo (the Proxy's Map)
-    tabState.consensusCols = null; // inner memo (consensusCharAt's array) — without this, stale chars survive
+    tabState.consensusCols = null; // inner memo (consensusCharAt's array), without this, stale chars survive
   }
 
   // the .blim loader stores consensusBaked.colors as null when the plane is entirely
-  // default (saves ~2 bytes/column at chromosome scale) — null reads as 0 everywhere
+  // default (saves ~2 bytes/column at chromosome scale), null reads as 0 everywhere
   const bakedColorAt = (c) =>
     tabState.consensusBaked && tabState.consensusBaked.colors ? tabState.consensusBaked.colors[c] : 0;
 
@@ -8398,10 +10276,12 @@ function createTab(name, records, presetState = null) {
     onHoverEnd: () => handleHoverEnd()
   });
 
+  tabState._repaintConsensus = () => consensusCtl.rebuildBuffer(); // module-scope helpers can't see consensusCtl, hand them the capability
+
   function openConsensusOptions() {
     showConsensusOptionsModal(tabState, async (algorithm) => {
       const colCount = getColCount();
-      const rowCount = tabState.records.length; // the plane sweep reports ROWS — that's the expensive part now
+      const rowCount = tabState.records.length; // the plane sweep reports ROWS, that's the expensive part now
       const prog = showProgressOverlay("Computing consensus");
       prog.setLabel("Computing consensus…");
       prog.setProgress(0, rowCount);
@@ -8444,7 +10324,7 @@ function createTab(name, records, presetState = null) {
     getLuminance,
     getColor: (r, c, ch) => getShadeColor(tabState, r, c, ch),
     getShadeMode: () => tabState.shadeMode,
-    // was: () => { tabState.uniqueColCounts = null; } — that wiped freshly warmed
+    // was: () => { tabState.uniqueColCounts = null; }, that wiped freshly warmed
     // caches on every rebuild. invalidate only when the shade config actually changed.
     recomputeUniqueColors: () => {
       // counts are content; config tweaks are derived live in computeUniqueShadeColor,
@@ -8458,29 +10338,31 @@ function createTab(name, records, presetState = null) {
         tabState.frequencyColumns = { header: frequencyContentHeader(tabState), cols: {}, counts: {}, maps: {}, n: 0 };
     },
     recomputeMatrixColors: () => {
-      tabState.matrixCache = null;
+      // never wipe: the warm owns colRef; config tweaks self-heal via the
+      // cfgKey stamp inside computeMatrixShadeColor
+      if (!tabState.matrixCache || !tabState.matrixCache.colRef)
+        tabState.matrixCache = { header: matrixCacheHeader(tabState), colRef: {}, tables: {}, cfgKey: null };
     },
     recomputeClustalXColors: () => {
       tabState.clustalXColors = null;
     },
-    onDataChanged: (col) => {
+    onDataChanged: (col, oldCode, newCode) => {
       consensusCache.delete(col); // recompute this column on next read
       if (tabState.consensusCols) tabState.consensusCols[col] = undefined; // inner memo layer too
       const ch =
         tabState.consensusOverrides[col] !== undefined ? tabState.consensusOverrides[col] : consensusStr[col] || "-";
       const overrideHex = tabState.consensusColors[col];
-      // mirror the track's cellForFn coloring: tinted mode colors plain cells too
       const color = overrideHex
         ? hexToRgbFloat(overrideHex)
         : tabState.consensusTinted
           ? getColorForChar(tabState, ch)
           : [1, 1, 1];
       consensusCtl.applyColorOverrides([{ row: 0, col, ch, color }]);
-      // strips: one column of stats went stale — invalidate just it
+      // strips: one column of stats went stale, invalidate just it
       conservationStrip.invalidate(col);
       logoStrip.invalidate(col);
       overviewStrip.invalidate();
-      // one column of shade stats went stale — drop just it (stats caches self-validate cfg)
+      // one column of shade stats went stale, drop just it
       if (tabState.uniqueColCounts && tabState.uniqueColCounts.cols) delete tabState.uniqueColCounts.cols[col];
       if (tabState.frequencyColumns) {
         if (tabState.frequencyColumns.counts) delete tabState.frequencyColumns.counts[col];
@@ -8490,7 +10372,15 @@ function createTab(name, records, presetState = null) {
       if (tabState.matrixCache && tabState.matrixCache.colRef) delete tabState.matrixCache.colRef[col];
       if (tabState.consensusBaked) {
         tabState.consensusBaked.chars[col] = 0; // fall back to computed for this column
-        if (tabState.consensusBaked.colors) tabState.consensusBaked.colors[col] = 0; // null plane already means default
+        if (tabState.consensusBaked.colors) tabState.consensusBaked.colors[col] = 0;
+      }
+      // keep the retained plane in lockstep: decrement the old char's slot,
+      // increment the new one, modal consensus stays instant AND exact
+      const lp = tabState.loadPlane;
+      if (lp && typeof oldCode === "number" && typeof newCode === "number" && col < lp.cols) {
+        const base = col << lp.shift;
+        lp.counts[base + (oldCode < 256 ? lp.toDense[oldCode] : lp.otherSlot)]--;
+        lp.counts[base + (newCode < 256 ? lp.toDense[newCode] : lp.otherSlot)]++;
       }
       updateHScrollSpacer();
     },
@@ -8522,7 +10412,36 @@ function createTab(name, records, presetState = null) {
             rec.colorIdx = next;
           }
         }
+        if (rec.colorPacked) {
+          const pack = rec.colorPack;
+          const L = pack.cols;
+          if (L > lo) {
+            const del = Math.min(hi, L - 1) - lo + 1;
+            const next = new Uint8Array(Math.ceil(((L - del) * pack.bits) / 8));
+            let dst = 0;
+            for (let c = 0; c < lo; c++, dst++)
+              blimCodeSet(next, dst, pack.bits, blimCodeAt(rec.colorPacked, c, pack.bits));
+            for (let c = Math.min(hi + 1, L); c < L; c++, dst++)
+              blimCodeSet(next, dst, pack.bits, blimCodeAt(rec.colorPacked, c, pack.bits));
+            rec.colorPacked = next;
+          }
+        }
+        if (rec.colorSparse) reindexSparseColorMap(rec.colorSparse, lo, hi);
+        if (tabState.colorPack && tabState.colorPack.cols > lo)
+          tabState.colorPack.cols -= Math.min(hi, tabState.colorPack.cols - 1) - lo + 1;
+        if (tabState.loadPlane) {
+          const lp = tabState.loadPlane;
+          if (lp.cols > lo) {
+            const del = Math.min(hi, lp.cols - 1) - lo + 1;
+            const next = new Int32Array((lp.cols - del) << lp.shift);
+            next.set(lp.counts.subarray(0, lo << lp.shift), 0);
+            next.set(lp.counts.subarray(Math.min(hi + 1, lp.cols) << lp.shift), lo << lp.shift);
+            lp.counts = next;
+            lp.cols -= del;
+          }
+        }
       });
+
       tabState.annotations.forEach((entry) => {
         if (entry.data.length > lo) {
           entry.data = entry.data.slice(0, lo) + entry.data.slice(hi + 1);
@@ -8538,7 +10457,7 @@ function createTab(name, records, presetState = null) {
       reindexColumnCacheMap(consensusCache, lo, hi); // the Proxy's outer memo
       if (tabState.consensusCols) tabState.consensusCols.splice(lo, hi - lo + 1); // inner memo: splice shifts in place
       if (tabState.consensusBaked) {
-        // baked planes are typed arrays — same shift, clamped like the row layers
+        // baked planes are typed arrays, same shift, clamped like the row layers
         const shiftPlane = (arr) => {
           if (!arr) return null;
           const L = arr.length;
@@ -8706,7 +10625,7 @@ function createTab(name, records, presetState = null) {
 
   const allTrackCtls = [annotationCtl, numberingCtl, alignmentCtl, consensusCtl];
 
-  // the strip initializers return destroy functions — hold on to them so
+  // the strip initializers return destroy functions, hold on to them so
   // closeTab can stop their interval timers instead of leaking them
   // Mini strips (overview / conservation / logo)
   // created BEFORE the alignment renderer: its onDataChanged / onDeleteColumns
@@ -8726,6 +10645,8 @@ function createTab(name, records, presetState = null) {
     getColCount,
     getCellDims,
     realHScroll,
+    realVScroll, // <- updateOverlay/jumpTo now call these through cfg
+    setRealVScroll,
     getHScrollScale: () => hScrollScale,
     isActive: () => panel.classList.contains("active")
   });
@@ -8959,9 +10880,9 @@ function createTab(name, records, presetState = null) {
   }
 
   // Sequence names panel
-  function refreshAfterRecordsChanged() {
-    refreshConsensus(); // clears both consensus cache layers — rows changed, every column's stats are stale
-    tabState.consensusBaked = null; // rows changed — baked consensus is stale
+  function refreshAfterRecordsChanged(opts) {
+    refreshConsensus(); // clears both consensus cache layers, rows changed, every column's stats are stale
+    if (!opts || !opts.keepConsensus) tabState.consensusBaked = null; // reorder changes neither column counts nor the consensus they imply
     conservationStrip.invalidate();
     logoStrip.invalidate();
     overviewStrip.invalidate();
@@ -8972,34 +10893,43 @@ function createTab(name, records, presetState = null) {
     tabState.matrixCache = null;
     tabState.frequencyColumns = null;
     tabState.uniqueColCounts = null;
+    // row membership normally changes counts, but callers that adjust the plane
+    // exactly (delete's row-delta) pass keepPlane so warmups stay instant
+    if (!opts || !opts.keepPlane) tabState.loadPlane = null;
     consensusCtl.rebuildBuffer();
     numberingCtl.rebuildBuffer();
     alignmentCtl.rebuildBuffer();
-    updateHScrollSpacer();
+    updateHScrollSpacer(); // refreshes both horizontal and vertical compressed spacers
     updateAlignmentHeight();
+    updateHScrollSpacer(); // viewport height may have changed, so refresh mapping once more
+    alignmentCtl.onScroll(realVScroll(), realHScroll());
     buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
   }
   buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
 
   // Scroll sync
   let syncingV = false;
-  namesPanel.addEventListener("scroll", () => {
+
+  function syncVerticalFrom(source) {
     if (syncingV) return;
     syncingV = true;
-    alignPanel.scrollTop = namesPanel.scrollTop;
+
+    // Both panels have the same compressed physical geometry, so physical
+    // scrollTop copies exactly. The renderer receives the logical value.
+    const target = source === alignPanel ? namesPanel : alignPanel;
+    target.scrollTop = source.scrollTop;
+
+    alignmentCtl.onScroll(realVScroll(), realHScroll());
+    renderNameWindow(namesPanel, tabState, refreshAfterRecordsChanged, true);
+
     syncingV = false;
-    alignmentCtl.onScroll(alignPanel.scrollTop, realHScroll());
-  });
-  alignPanel.addEventListener("scroll", () => {
-    if (syncingV) return;
-    syncingV = true;
-    namesPanel.scrollTop = alignPanel.scrollTop;
-    syncingV = false;
-    alignmentCtl.onScroll(alignPanel.scrollTop, realHScroll());
-  });
+  }
+
+  namesPanel.addEventListener("scroll", () => syncVerticalFrom(namesPanel), { passive: true });
+  alignPanel.addEventListener("scroll", () => syncVerticalFrom(alignPanel), { passive: true });
   hScrollTrack.addEventListener("scroll", () => {
     const left = realHScroll();
-    alignmentCtl.onScroll(alignPanel.scrollTop, left);
+    alignmentCtl.onScroll(realVScroll(), left); // logical vertical, not raw scrollTop
     annotationCtl.onScroll(left);
     numberingCtl.onScroll(left);
     consensusCtl.onScroll(left);
@@ -9022,7 +10952,7 @@ function createTab(name, records, presetState = null) {
         const my = e.clientY - rect.top;
         const dims = getCellDims();
         const anchorCol = (realHScroll() + mx) / dims.w;
-        const anchorRow = (alignPanel.scrollTop + my) / dims.h;
+        const anchorRow = (realVScroll() + my) / dims.h;
 
         tabState.fontSize = next;
         fontSizeInput.value = next;
@@ -9032,7 +10962,7 @@ function createTab(name, records, presetState = null) {
         // re-place the anchor point under the pointer, post-zoom
         const d2 = getCellDims();
         setRealHScroll(anchorCol * d2.w - mx);
-        alignPanel.scrollTop = Math.max(0, anchorRow * d2.h - my);
+        setRealVScroll(Math.max(0, anchorRow * d2.h - my));
         return;
       }
       if (e.deltaX !== 0) {
@@ -9056,6 +10986,7 @@ function createTab(name, records, presetState = null) {
     touchStartY = e.touches[0].clientY;
     touchStartScrollLeft = hScrollTrack.scrollLeft;
     touchStartScrollTop = alignPanel.scrollTop;
+    touchStartRealV = realVScroll(); // captured once, here, not per move
     touchDirection = null;
   });
 
@@ -9072,7 +11003,7 @@ function createTab(name, records, presetState = null) {
       if (touchDirection === "h") {
         hScrollTrack.scrollLeft = touchStartScrollLeft + dx * hScrollScale;
       } else {
-        alignPanel.scrollTop = touchStartScrollTop + dy;
+        setRealVScroll(touchStartRealV + dy); // logical start + physical finger delta
       }
       e.preventDefault();
     },
@@ -9083,7 +11014,7 @@ function createTab(name, records, presetState = null) {
     touchStartX = null;
     touchDirection = null;
   });
-  // Divider drag 
+  // Divider drag
   let dragging = false;
   dividerEl.addEventListener("mousedown", (e) => {
     dragging = true;
@@ -9124,7 +11055,7 @@ function createTab(name, records, presetState = null) {
     },
     { signal }
   );
-  // Window resize 
+  // Window resize
   window.addEventListener(
     "resize",
     () => {
@@ -9170,7 +11101,7 @@ function createTab(name, records, presetState = null) {
     { signal }
   );
 
-  // Settings wiring 
+  // Settings wiring
   const fontSizeInput = panel.querySelector(".fontSizeInput");
   const fontSizeLabel = panel.querySelector(".fontSizeLabel");
   const luminanceInput = panel.querySelector(".luminanceInput");
@@ -9232,17 +11163,21 @@ function createTab(name, records, presetState = null) {
     return nameSpan.textContent || "alignment";
   }
 
-  // File menu 
+  // File menu
   fileMenuBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     showDropdown(fileMenuBtn, [
       {
         label: "Export to FASTA",
-        onClick: () => exportFastaStreaming(tabState.records, getTabDisplayName() + ".fasta")
+        onClick: () => {
+          if (virtualGate(tabState, "Export")) return; // Phase 2: stream through the pager
+          exportFastaStreaming(tabState.records, getTabDisplayName() + ".fasta");
+        }
       },
       {
         label: "Save as project",
         onClick: () => {
+          if (virtualGate(tabState, "Export")) return;
           const colCount = getColCount();
           const saveSlim = () =>
             exportSlimStreaming(
@@ -9398,21 +11333,24 @@ function createTab(name, records, presetState = null) {
             getCellDims,
             getHScrollScale: () => hScrollScale,
             realHScroll,
+            realVScroll,
+            setRealVScroll,
             hScrollTrack,
             alignPanel
           })
-      }
+      },
+      { label: "Dereplicate", onClick: () => runDereplication(tabState, refreshAfterRecordsChanged) }
     ]);
   });
 
-  // Shade menu 
+  // Shade menu
   shadeMenuBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     const shadeCtx = {
       rebuildAlignment: scheduleRebuild,
       rebuildAfterReorder: () => {
         buildNamesPanel(namesPanel, tabState, refreshAfterRecordsChanged);
-        refreshAfterRecordsChanged();
+        refreshAfterRecordsChanged({ keepPlane: true, keepConsensus: true }); // sort is a permutation too
       },
       setShadeMode,
       applyColorOverrides: alignmentCtl.applyColorOverrides,
@@ -9431,7 +11369,15 @@ function createTab(name, records, presetState = null) {
         overviewStrip.invalidate();
       }
     };
-    const mark = () => ""; // actions, not state — no checkmarks
+    // virtual tabs: a paged row arriving from disk makes placeholder cells real —
+    // repaint. Every read path (colCodeAt → facade → peekRow) kicks its own fetch;
+    // this is the only callback the pager needs.
+    if (tabState.virtual)
+      tabState.virtual.onMiss = () => {
+        scheduleRebuild();
+        overviewStrip.invalidate(); // now safe: strips only paint resident pages
+      };
+    const mark = () => ""; // actions, not state, no checkmarks
     const isNucleotide = tabState.alphabet === "nucleotide";
     showDropdown(shadeMenuBtn, [
       {
@@ -9504,7 +11450,7 @@ function createTab(name, records, presetState = null) {
         }
       },
       {
-        label: mark("sequence") + "By sequence",
+        label: mark("sequence") + "Shade by sequence",
         onClick: () => {
           showSequenceShadeModal(tabState, shadeCtx);
         }
@@ -9536,13 +11482,15 @@ function createTab(name, records, presetState = null) {
 
   updateHScrollSpacer();
   updateAlignmentHeight();
+  updateHScrollSpacer();
+  alignmentCtl.onScroll(realVScroll(), realHScroll());
 
   return { refreshAfterRecordsChanged, tabState }; // tabState lets callers operate on the exact array the tab renders
 }
 
 // tab limit used to be 4 prior to this; suspend inacive tabs
 function activateTab(tabId, btnEl) {
-  // free the outgoing tab's GL contexts before switching — browsers cap the
+  // free the outgoing tab's GL contexts before switching, browsers cap the
   // number of live WebGL contexts per page to 4 and evict the oldest past it
   const prevPanel = document.querySelector(".tab-panel.active");
   if (prevPanel && prevPanel.id !== tabId) {
@@ -9557,7 +11505,7 @@ function activateTab(tabId, btnEl) {
   if (entry) {
     entry.ctls.forEach((ctl) => ctl.resume());
     // the panel was display:none, so window resizes while it was hidden left
-    // its canvases stale or zero-sized — re-measure and repaint now that it's visible
+    // its canvases stale or zero-sized, re-measure and repaint now that it's visible
     entry.onActivate();
   }
 }
@@ -9595,7 +11543,7 @@ function reindexColumnMap(map, lo, hi) {
   return newMap;
 }
 
-// Map variant of reindexColumnMap — the strip/consensus stat caches are Maps keyed by column
+// Map variant of reindexColumnMap, the strip/consensus stat caches are Maps keyed by column
 function reindexColumnCacheMap(map, lo, hi) {
   const removed = hi - lo + 1;
   const entries = Array.from(map.entries());
@@ -9633,27 +11581,42 @@ function renderNameWindow(namesPanel, tabState, onStructureChanged, force) {
   if (!st) return;
   const h = cellDimsFor(tabState.fontSize).h;
   const rows = tabState.records.length;
-  st.spacer.style.height = `${rows * h}px`;
+  // The names panel uses the same capped physical row span as the alignment
+  // panel. `vScrollScale` belongs to the tab; store it on the panel so this
+  // standalone helper does not need a new positional argument.
+  // same capped physical span as the alignment panel
+  const scale = namesPanel._vScrollScale || 1;
+  const realHeight = rows * h;
+  st.spacer.style.height = Math.max(1, realHeight * scale) + "px";
+
+  // the same max-normalized physical->logical mapping realVScroll uses —
+  // NOT a linear divide-by-scale (they differ by the viewport height)
+  const physicalMax = Math.max(0, realHeight * scale - namesPanel.clientHeight);
+  const realMax = Math.max(0, realHeight - namesPanel.clientHeight);
+  const physicalTop = namesPanel.scrollTop;
+  const logicalScrollTop = physicalMax > 0 ? (physicalTop * realMax) / physicalMax : 0;
+
   const MARGIN = 8; // rows of buffer above and below the viewport
-  const first = Math.max(0, Math.floor(namesPanel.scrollTop / h) - MARGIN);
-  const last = Math.min(rows, Math.ceil((namesPanel.scrollTop + namesPanel.clientHeight) / h) + MARGIN);
+  const first = Math.max(0, Math.floor(logicalScrollTop / h - MARGIN));
+  const last = Math.min(rows, Math.ceil((logicalScrollTop + namesPanel.clientHeight) / h + MARGIN));
   if (!force && first === st.firstRow && last === st.lastRow && h === st.renderedH) return; // nothing moved
   st.firstRow = first;
   st.lastRow = last;
   st.renderedH = h;
-  st.win.style.transform = `translateY(${first * h}px)`;
+
+  // place the window so logical row `first` sits at the same viewport offset
+  // the canvas is drawing, reduces to the original `first * h` when scale === 1
+  st.win.style.transform = `translateY(${physicalTop + first * h - logicalScrollTop}px)`;
   st.win.innerHTML = "";
-  for (let i = first; i < last; i++) {
+  for (let i = first; i < last; i++)
     st.win.appendChild(buildNameRow(tabState.records[i], tabState, onStructureChanged));
-  }
 }
 
 function buildNameRow(record, tabState, onStructureChanged) {
   const row = document.createElement("div");
   row.className = "name-row";
   row.dataset.id = record.id;
-  row.style.height = `${cellDimsFor(tabState.fontSize).h}px`; // fixed — the window math depends on it
-
+  row.style.height = cellDimsFor(tabState.fontSize).h + "px"; // fixed: full logical row height
   const text = document.createElement("span");
   text.className = "name-text";
   text.textContent = record.header;
@@ -9686,7 +11649,7 @@ function buildNameRow(record, tabState, onStructureChanged) {
       const tmp = tabState.records[i - 1];
       tabState.records[i - 1] = tabState.records[i];
       tabState.records[i] = tmp;
-      onStructureChanged();
+      onStructureChanged({ keepPlane: true, keepConsensus: true }); // pure permutation, stats survive
     }
   });
   const topBtn = mkBtn("\u2912", "Move to top", () => {
@@ -9694,7 +11657,7 @@ function buildNameRow(record, tabState, onStructureChanged) {
     if (i > 0) {
       const [item] = tabState.records.splice(i, 1);
       tabState.records.unshift(item);
-      onStructureChanged();
+      onStructureChanged({ keepPlane: true, keepConsensus: true });
     }
   });
   const bottomBtn = mkBtn("\u2913", "Move to bottom", () => {
@@ -9702,7 +11665,7 @@ function buildNameRow(record, tabState, onStructureChanged) {
     if (i >= 0 && i < tabState.records.length - 1) {
       const [item] = tabState.records.splice(i, 1);
       tabState.records.push(item);
-      onStructureChanged();
+      onStructureChanged({ keepPlane: true, keepConsensus: true });
     }
   });
   const deleteBtn = mkBtn("🗑", "Delete sequence", () => {
@@ -9712,8 +11675,28 @@ function buildNameRow(record, tabState, onStructureChanged) {
     }
     showConfirmDeleteModal(`sequence "${record.header}"`, () => {
       const i = idxOf();
-      if (i !== -1) tabState.records.splice(i, 1);
-      onStructureChanged();
+      if (i === -1) return;
+      const prog = showProgressOverlay("Deleting sequence");
+      prog.setLabel("Updating column statistics…");
+      setTimeout(() => {
+        try {
+          adjustLoadPlaneForRows(tabState, [tabState.records[i]], -1); // plane stays exact, no stale stats
+          tabState.records.splice(i, 1);
+          onStructureChanged({ keepPlane: true }); // plane was adjusted exactly, don't null it
+          prog.setLabel("Recomputing consensus…");
+          setTimeout(() => {
+            try {
+              recomputeSimpleConsensus(tabState, prog); // re-bakes Simple consensus post-delete
+              if (tabState._repaintConsensus) tabState._repaintConsensus();
+            } finally {
+              prog.close();
+            }
+          }, 30);
+        } catch (e) {
+          prog.close();
+          throw e;
+        }
+      }, 30);
     });
   });
   deleteBtn.classList.add("delete-btn");
@@ -9744,7 +11727,7 @@ function showSaveProjectModal(onBlim, onSlim) {
   const blimBtn = document.createElement("button");
   blimBtn.textContent = ".blim";
   blimBtn.className = "modal-close-btn";
-  blimBtn.title = "Binary format — far smaller files";
+  blimBtn.title = "Binary format, far smaller files";
   blimBtn.addEventListener("click", () => {
     overlay.remove();
     onBlim();
@@ -9753,7 +11736,7 @@ function showSaveProjectModal(onBlim, onSlim) {
   const slimBtn = document.createElement("button");
   slimBtn.textContent = ".slim";
   slimBtn.className = "modal-close-btn";
-  slimBtn.title = "Text format — readable by the original SlimShadey";
+  slimBtn.title = "Text format, readable by the original SlimShadey";
   slimBtn.addEventListener("click", () => {
     overlay.remove();
     onSlim();
@@ -9961,50 +11944,67 @@ async function parseFastaAsync(text, onProgress) {
   return records;
 }
 
-//  Duplicate-sequence dereplication
-async function maybeOfferDereplication(tabApi) {
-  if (!tabApi || !tabApi.tabState) return;
-  const records = tabApi.tabState.records; // the exact array the tab renders from
-  if (records.length < 2) return;
-
-  const dupeIndices = [];
-  if (records[0].seqCodes) {
-    const eq = (a, b) => {
-      if (a.length !== b.length) return false;
-      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-      return true;
-    };
-    const hashOf = (rec) => {
-      if (rec.h !== undefined) return rec.h; // precomputed by the load pass — free
-      const codes = rec.seqCodes;
-      let h = 0x811c9dc5;
-      for (let k = 0; k < codes.length; k++) h = Math.imul(h ^ codes[k], 0x01000193);
-      return (rec.h = h >>> 0); // cache on the record — a second open of this modal is instant
-    };
-    const buckets = new Map();
-    let last = performance.now();
-    for (let i = 0; i < records.length; i++) {
-      const rec = records[i];
-      if (!rec.seqCodes) return; // mixed row types — bail rather than compare across representations
-      const h = hashOf(rec);
-      const bucket = buckets.get(h);
-      if (bucket && bucket.some((j) => eq(records[j].seqCodes, rec.seqCodes))) dupeIndices.push(i);
-      else if (bucket) bucket.push(i);
-      else buckets.set(h, [i]);
-      if (performance.now() - last > 30) {
-        await new Promise((r) => setTimeout(r, 0)); // rows without a precomputed hash (.blim) — keep scrolling smooth
-        last = performance.now();
-      }
-    }
-  } else {
-    const seen = new Set(); // sequence strings already claimed by a first occurrence
-    for (let i = 0; i < records.length; i++) {
-      if (seen.has(records[i].seq)) dupeIndices.push(i);
-      else seen.add(records[i].seq);
-    }
+// Word-wise FNV-1a: one op per 4 bytes via a Uint32 view. Collisions don't matter —
+// the bucket's eq() compare is the arbiter, so this exists purely to group fast.
+function hashCodes(codes) {
+  let h = 0x811c9dc5;
+  let k = 0;
+  if ((codes.byteOffset & 3) === 0) {
+    const words = new Uint32Array(codes.buffer, codes.byteOffset, codes.length >> 2);
+    for (let w = 0; w < words.length; w++) h = Math.imul(h ^ words[w], 0x01000193);
+    k = words.length << 2; // resume byte-wise for the 0–3 tail bytes
   }
-  if (dupeIndices.length === 0) return;
+  for (; k < codes.length; k++) h = Math.imul(h ^ codes[k], 0x01000193);
+  return h >>> 0;
+}
 
+// File ▸ Dereplicate: the scan runs on demand, never at load, and the offer
+// modal only appears when duplicates actually exist.
+async function runDereplication(tabState, refreshFn) {
+  if (virtualGate(tabState, "Dereplication")) return;
+  const records = tabState.records;
+  if (!records || records.length < 2) return;
+  const prog = showProgressOverlay("Dereplicating");
+  prog.setLabel("Scanning for duplicates…");
+  prog.setProgress(0, records.length);
+  await new Promise((r) => setTimeout(r, 50)); // let the overlay paint
+  let dupes;
+  try {
+    dupes = await findDuplicateRows(records, (done, total) => prog.setProgress(done, total));
+  } finally {
+    prog.close();
+  }
+  if (dupes === null) return; // mixed-representation tab, unsupported, as before
+  if (!dupes.length) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box shade-modal";
+    box.innerHTML = `<h3>Dereplicate</h3>`;
+    const msgRow = document.createElement("div");
+    msgRow.className = "shade-row";
+    msgRow.textContent = "No duplicate sequences found.";
+    box.appendChild(msgRow);
+    const btnRow = document.createElement("div");
+    btnRow.className = "shade-row";
+    const okBtn = document.createElement("button");
+    okBtn.textContent = "OK";
+    okBtn.className = "modal-close-btn";
+    okBtn.addEventListener("click", () => overlay.remove());
+    btnRow.appendChild(okBtn);
+    box.appendChild(btnRow);
+    overlay.appendChild(box);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+    return;
+  }
+  showDereplicationModal(tabState, refreshFn, dupes);
+}
+
+function showDereplicationModal(tabState, refreshFn, dupeIndices) {
+  const records = tabState.records; // the exact array the tab renders from
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   const box = document.createElement("div");
@@ -10030,21 +12030,11 @@ async function maybeOfferDereplication(tabApi) {
   yesBtn.className = "modal-close-btn";
   yesBtn.addEventListener("click", () => {
     overlay.remove();
-    console.log("[derep] before:", records.length, "removing", dupeIndices.length);
     const dupeSet = new Set(dupeIndices);
     const keep = records.filter((_, i) => !dupeSet.has(i));
-    records.length = 0; // same array object — identity preserved for the tab
+    records.length = 0; // same array object, identity preserved for the tab
     records.push(...keep);
-    console.log("[derep] after splice:", records.length);
-    try {
-      tabApi.refreshAfterRecordsChanged();
-      console.log(
-        "[derep] refresh OK; name rows now:",
-        document.querySelector(".tab-panel.active .names-panel").childElementCount
-      );
-    } catch (err) {
-      console.error("[derep] refresh failed:", err);
-    }
+    refreshFn();
   });
 
   const noBtn = document.createElement("button");
@@ -10059,6 +12049,61 @@ async function maybeOfferDereplication(tabApi) {
     if (e.target === overlay) overlay.remove();
   });
   document.body.appendChild(overlay);
+}
+
+// The dereplication scan, chunked and progress-reporting. Hash buckets group rows;
+// full byte-compare only runs between bucket-mates. Returns dupe row indices,
+// [] when clean, or null for mixed-representation tabs (bail, as before).
+async function findDuplicateRows(records, onProgress) {
+  const N = records.length;
+  if (N < 2) return [];
+  const dupeIndices = [];
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  if (records[0].seqCodes) {
+    const eq = (a, b) => {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      return true;
+    };
+    const hashOf = (rec) => {
+      if (rec.h !== undefined) return rec.h; // cached on the record, a second run is hash-free
+      return (rec.h = hashCodes(rec.seqCodes)); // the word-wise FNV helper
+    };
+    const buckets = new Map();
+    let last = performance.now();
+    for (let i = 0; i < N; i++) {
+      const rec = records[i];
+      if (!rec.seqCodes) return null; // mixed row types, don't compare across representations
+      const h = hashOf(rec);
+      const bucket = buckets.get(h);
+      if (bucket && bucket.some((j) => eq(records[j].seqCodes, rec.seqCodes))) dupeIndices.push(i);
+      else if (bucket) bucket.push(i);
+      else buckets.set(h, [i]);
+      if ((i & 255) === 255) {
+        if (onProgress) onProgress(i + 1, N);
+        if (performance.now() - last > 30) {
+          await tick();
+          last = performance.now();
+        }
+      }
+    }
+    if (onProgress) onProgress(N, N);
+  } else {
+    const seen = new Set(); // string rows: engine-native string hashing
+    let last = performance.now();
+    for (let i = 0; i < N; i++) {
+      if (seen.has(records[i].seq)) dupeIndices.push(i);
+      else seen.add(records[i].seq);
+      if ((i & 255) === 255 && performance.now() - last > 30) {
+        if (onProgress) onProgress(i + 1, N);
+        await tick();
+        last = performance.now();
+      }
+    }
+    if (onProgress) onProgress(N, N);
+  }
+  return dupeIndices;
 }
 
 function readFileWithProgress(file, onProgress) {
@@ -10093,7 +12138,7 @@ async function* readFileLines(file, onProgress) {
   if (leftover) yield leftover;
 }
 
-// Same streamer, but yields arrays of lines — one promise per chunk instead of
+// Same streamer, but yields arrays of lines, one promise per chunk instead of
 // one per line. On a 10GB .slim (~600M lines) this is the difference between
 // a snack and a weekend :)
 async function* readFileLineBatches(file, onProgress) {
@@ -10111,33 +12156,850 @@ async function* readFileLineBatches(file, onProgress) {
     leftover = lines.pop();
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i];
-      if (l.charCodeAt(l.length - 1) === 13) lines[i] = l.slice(0, -1); // tolerate \r\n files, 
+      if (l.charCodeAt(l.length - 1) === 13) lines[i] = l.slice(0, -1); // tolerate \r\n files,
     }
     yield lines;
   }
   if (leftover) yield [leftover];
 }
 
-// FASTA parse straight off the file stream into byte rows — same representation
-// parseBlimStream emits, so FASTA loads get the .blim path's zero-lag scrolling.
-// No giant joined strings, no slices pinning decoded chunks: peak memory is the
-// byte rows themselves.
-async function parseFastaStream(file, onProgress) {
-  const records = [];
-  let cur = null; // { header, codes, len, cap } — or { header, parts } if a wide char appeared
-  const WIDE = /[^\x00-\xFF]/;
+// Dense per-column counting plane constants, shared by precomputeLoadPass, the
+// parallel FASTA workers, and plane merging. 32 int32 slots per column: 29 named
+// chars (* - . A-Z) in ascending code order, OTHER bucket last.
+const DENSE_SHIFT = 5;
+const DENSE_SLOTS = 1 << DENSE_SHIFT;
+const DENSE_OTHER = DENSE_SLOTS - 1;
+const DENSE_CHARS = [];
+const DENSE_TO = (() => {
+  const t = new Uint8Array(256).fill(DENSE_OTHER);
+  for (const code of [42, 45, 46]) {
+    t[code] = DENSE_CHARS.length;
+    DENSE_CHARS.push(code);
+  }
+  for (let k = 65; k <= 90; k++) {
+    t[k] = DENSE_CHARS.length;
+    DENSE_CHARS.push(k);
+  }
+  for (let k = 97; k <= 122; k++) t[k] = t[k - 32]; // lowercase folds up
+  return t;
+})();
+const DENSE_GAP = DENSE_TO[45];
+const DENSE_DOT = DENSE_TO[46];
 
-  const ensure = (row, extra) => {
-    if (row.len + extra <= row.cap) return;
-    const next = new Uint8Array(Math.max(row.cap * 2, row.len + extra));
-    next.set(row.codes.subarray(0, row.len));
-    row.codes = next;
-    row.cap = next.length;
+const PARALLEL_PARSE_MIN = 256 * 1024 * 1024; // below this, worker startup isn't worth it
+
+// Pool sizing for every worker fan-out: all cores but one (the main thread renders
+// and merges). Cap at 128 for hpc: past that, streaming workloads are memory-bandwidth-bound
+// and extra workers mostly add clone/merge overhead, so those are capped at 16 (hardcoded)
+const workerPoolSize = () => Math.max(2, Math.min(128, (navigator.hardwareConcurrency || 4) - 1));
+
+// The parse worker, self-contained (no app references). Each worker parses the
+// records whose headers START inside its byte stripe, reading past the stripe end
+// only to finish the last such record. Rows flush home in ~256MB batches via
+// transfer lists, worker-side memory stays flat no matter how big the stripe is.
+const FASTA_WORKER_SOURCE = `
+"use strict";
+const SHIFT = 5, SLOTS = 32, OTHER = 31, PLANE_MAX_COLS = 262144, FLUSH_BYTES = 256 << 20;
+const toDense = new Uint8Array(256).fill(OTHER);
+for (const code of [42, 45, 46]) { toDense[code] = code === 42 ? 0 : code === 45 ? 1 : 2; }
+for (let k = 65; k <= 90; k++) toDense[k] = 3 + (k - 65);
+for (let k = 97; k <= 122; k++) toDense[k] = toDense[k - 32];
+
+async function parseStripe(file, start, end, report, emitRows) {
+  const textDec = new TextDecoder("utf-8");
+  const wideDec = new TextDecoder("utf-8");
+  const headers = [], codes = [], strings = [];
+  let hadWide = false, maxLen = 0, totalRows = 0, batchBytes = 0;
+
+  const flushRows = () => {
+    if (!headers.length) return;
+    const transfers = [];
+    for (const c of codes) if (c) transfers.push(c.buffer);
+    emitRows(headers.slice(), codes.slice(), strings.slice(), transfers);
+    headers.length = 0; codes.length = 0; strings.length = 0; batchBytes = 0;
   };
 
-  const finishCurrent = () => {
+  let planeCounts = new Int32Array(1024 << SHIFT), planeCols = 1024, planeOn = true;
+  const ensurePlane = (need) => {
+    if (!planeOn || need <= planeCols) return;
+    if (need > PLANE_MAX_COLS) { planeOn = false; planeCounts = null; return; } // chromosome-wide: skip the plane
+    const next = new Int32Array(Math.max(planeCols * 2, need) << SHIFT);
+    next.set(planeCounts);
+    planeCounts = next; planeCols = next.length >> SHIFT;
+  };
+
+  const reader = file.slice(start, file.size).stream().getReader();
+  let abs = start; // absolute file offset of the current chunk's first byte
+  let cur = null, inHeader = false, pendWs = null, stopped = false;
+  let lineFresh = start === 0 || (new Uint8Array(await file.slice(start - 1, start).arrayBuffer()))[0] === 10;
+  let hdr = new Uint8Array(256), hdrLen = 0;
+  let lastReport = 0;
+
+  const ensureRow = (extra) => {
+    if (cur.len + extra <= cur.cap) return;
+    const next = new Uint8Array(Math.max(cur.cap * 2, cur.len + extra));
+    next.set(cur.codes.subarray(0, cur.len));
+    cur.codes = next; cur.cap = next.length;
+  };
+  const ensureHdr = (extra) => {
+    if (hdrLen + extra <= hdr.length) return;
+    const next = new Uint8Array(Math.max(hdr.length * 2, hdrLen + extra));
+    next.set(hdr.subarray(0, hdrLen)); hdr = next;
+  };
+  const finishRecord = () => {
     if (!cur) return;
+    pendWs = null; // line-final whitespace withheld at a chunk boundary is dropped
     if (cur.parts) {
+      cur.parts.push(wideDec.decode());
+      strings.push(cur.parts.join(""));
+      codes.push(null);
+    } else {
+      codes.push(cur.len === cur.cap ? cur.codes : cur.codes.slice(0, cur.len));
+      strings.push(null);
+    }
+    if (cur.len > maxLen) maxLen = cur.len;
+    headers.push(cur.header);
+    totalRows++;
+    batchBytes += cur.len;
+    cur = null;
+    if (batchBytes >= FLUSH_BYTES) flushRows();
+  };
+  const finishHeader = () => {
+    while (hdrLen > 0 && hdr[hdrLen - 1] <= 32) hdrLen--;
+    cur = { header: textDec.decode(hdr.subarray(0, hdrLen)), codes: new Uint8Array(1024), len: 0, cap: 1024, parts: null };
+    hdrLen = 0;
+  };
+  const goWide = (frag) => {
+    hadWide = true;
+    let s = "";
+    const head = cur.codes.subarray(0, cur.len);
+    for (let off = 0; off < head.length; off += 8192)
+      s += String.fromCharCode.apply(null, head.subarray(off, off + 8192));
+    cur.parts = [s, wideDec.decode(frag, { stream: true })];
+    cur.codes = null;
+  };
+  const appendSeq = (frag, checkHigh) => {
+    if (!cur || !frag.length) return;
+    if (cur.parts) { cur.parts.push(wideDec.decode(frag, { stream: true })); return; }
+    if (checkHigh) {
+      for (let i = 0; i < frag.length; i++) if (frag[i] > 127) { goWide(frag); return; }
+    }
+    ensureRow(frag.length);
+    cur.codes.set(frag, cur.len);
+    if (planeOn) {
+      ensurePlane(cur.len + frag.length);
+      if (planeOn) {
+        const base0 = cur.len;
+        for (let i = 0; i < frag.length; i++) planeCounts[((base0 + i) << SHIFT) + toDense[frag[i]]]++;
+      }
+    }
+    cur.len += frag.length;
+  };
+  const stashWs = (bytes) => {
+    if (!pendWs) pendWs = bytes.slice();
+    else {
+      const m = new Uint8Array(pendWs.length + bytes.length);
+      m.set(pendWs); m.set(bytes, pendWs.length); pendWs = m;
+    }
+  };
+  const flushWs = () => { if (pendWs) appendSeq(pendWs, false); pendWs = null; };
+
+  for (;;) {
+    if (stopped) break;
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = value, n = chunk.length, chunkStart = abs;
+    abs += n;
+    const now = performance.now();
+    if (now - lastReport > 150) {
+      lastReport = now;
+      report(Math.min(abs, end) - start); // overread past the stripe never inflates the bar
+    }
+    let hasHigh = false;
+    for (let i = 0; i < n; i++) if (chunk[i] > 127) { hasHigh = true; break; }
+
+    let pos = 0;
+    while (pos < n) {
+      if (lineFresh) {
+        while (pos < n && chunk[pos] <= 32 && chunk[pos] !== 10) pos++;
+        if (pos >= n) break;
+        if (chunk[pos] === 10) { pos++; continue; }
+        if (chunk[pos] === 62) { // '>'
+          const headerAbs = chunkStart + pos;
+          if (headerAbs >= end) { // belongs to the next stripe, stop without emitting
+            finishRecord();
+            stopped = true;
+            break;
+          }
+          finishRecord();
+          inHeader = true; hdrLen = 0; pos++; lineFresh = false;
+          continue;
+        }
+        inHeader = false; lineFresh = false;
+      }
+      const nl = chunk.indexOf(10, pos);
+      const eol = nl === -1 ? n : nl;
+      if (inHeader) {
+        ensureHdr(eol - pos);
+        hdr.set(chunk.subarray(pos, eol), hdrLen);
+        hdrLen += eol - pos;
+        if (nl !== -1) { finishHeader(); inHeader = false; }
+      } else {
+        let e = eol;
+        if (nl !== -1) {
+          while (e > pos && chunk[e - 1] <= 32) e--;
+          pendWs = null;
+        } else {
+          while (e > pos && chunk[e - 1] <= 32) e--;
+        }
+        if (e > pos) {
+          if (pendWs) flushWs();
+          appendSeq(chunk.subarray(pos, e), hasHigh);
+        }
+        if (nl === -1 && e < eol) stashWs(chunk.subarray(e, eol));
+      }
+      if (nl === -1) break;
+      pos = nl + 1;
+      lineFresh = true;
+    }
+  }
+  try { await reader.cancel(); } catch (_) {}
+  finishRecord();
+  flushRows(); // the final partial batch
+
+  return {
+    hadWide, maxLen, rowCount: totalRows,
+    planeCounts, planeCols,
+    transfers: planeCounts ? [planeCounts.buffer] : []
+  };
+}
+
+onmessage = async (e) => {
+  const { file, start, end, index } = e.data;
+  try {
+    const r = await parseStripe(
+      file, start, end,
+      (done) => postMessage({ type: "progress", index, done }),
+      (headers, codes, strings, transfers) => postMessage({ type: "rows", index, headers, codes, strings }, transfers)
+    );
+    postMessage({
+      type: "done", index, start, end,
+      hadWide: r.hadWide, maxLen: r.maxLen, rowCount: r.rowCount,
+      planeCounts: r.planeCounts, planeCols: r.planeCols
+    }, r.transfers);
+  } catch (err) {
+    postMessage({ type: "error", index, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+let FASTA_WORKER_URL = null;
+function fastaWorkerUrl() {
+  if (!FASTA_WORKER_URL)
+    FASTA_WORKER_URL = URL.createObjectURL(new Blob([FASTA_WORKER_SOURCE], { type: "text/javascript" }));
+  return FASTA_WORKER_URL;
+}
+
+// Index-only FASTA scan: emits (header, header byte offset, decoded length) per row
+// instead of sequence data, so a file of ANY size indexes into ~tens of MB. Still
+// builds the dense load plane per stripe, virtual tabs get instant loadPlane-tier
+// warmups, identical to resident byte tabs.
+const FASTAINDEXWORKER_SOURCE = `
+"use strict";
+const SHIFT = 5, SLOTS = 32, OTHER = 31, PLANEMAXCOLS = 262144;
+const toDense = new Uint8Array(256).fill(OTHER);
+for (const code of [42, 45, 46]) toDense[code] = code === 42 ? 0 : code === 45 ? 1 : 2;
+for (let k = 65; k <= 90; k++) toDense[k] = 3 + (k - 65);
+for (let k = 97; k <= 122; k++) toDense[k] = toDense[k - 32];
+const NUC = new Uint8Array(256);
+for (const ch of "ACGTUNRYSWKMBDHVX-.") { NUC[ch.charCodeAt(0)] = 1; NUC[ch.toLowerCase().charCodeAt(0)] = 1; }
+
+async function indexStripe(file, start, end, report, emit) {
+  const textDec = new TextDecoder("utf-8");
+  let headers = [], offs = [], lens = [];
+  let hadWide = false, nonNuc = false, maxLen = 0, totalRows = 0;
+  let planeCounts = new Int32Array(1024 << SHIFT), planeCols = 1024, planeOn = true;
+  const ensurePlane = (need) => {
+    if (!planeOn || need <= planeCols) return;
+    if (need > PLANEMAXCOLS) { planeOn = false; planeCounts = null; return; }
+    const next = new Int32Array(Math.max(planeCols * 2, need) << SHIFT);
+    next.set(planeCounts); planeCounts = next; planeCols = next.length >> SHIFT;
+  };
+  const reader = file.slice(start, file.size).stream().getReader();
+  let abs = start;
+  let cur = null; // { off, len }, no sequence storage
+  let inHeader = false, pendWs = 0, stopped = false;
+  let lineFresh = start === 0 || new Uint8Array(await file.slice(start - 1, start).arrayBuffer())[0] === 10;
+  let hdr = new Uint8Array(256), hdrLen = 0, pendOff = 0;
+  const ensureHdr = (extra) => {
+    if (hdrLen + extra <= hdr.length) return;
+    const next = new Uint8Array(Math.max(hdr.length * 2, hdrLen + extra));
+    next.set(hdr.subarray(0, hdrLen)); hdr = next;
+  };
+  const flushIndex = () => {
+    if (!headers.length) return;
+    emit(headers, offs, lens);
+    headers = []; offs = []; lens = [];
+  };
+  const finishRecord = () => {
+    if (!cur) return;
+    pendWs = 0; // line-final whitespace withheld at a chunk boundary is dropped
+    headers.push(cur.header); offs.push(cur.off); lens.push(cur.len);
+    if (cur.len > maxLen) maxLen = cur.len;
+    totalRows++;
+    cur = null;
+    if (headers.length >= 65536) flushIndex();
+  };
+  const finishHeader = () => {
+    while (hdrLen > 0 && hdr[hdrLen - 1] <= 32) hdrLen--;
+    cur = { header: textDec.decode(hdr.subarray(0, hdrLen)), off: pendOff, len: 0 };
+    hdrLen = 0;
+  };
+  const appendSeq = (frag, checkHigh) => {
+    if (!cur || !frag.length) return;
+    if (checkHigh || !nonNuc) {
+      for (let i = 0; i < frag.length; i++) {
+        const b = frag[i];
+        if (b > 127) hadWide = true;
+        else if (!NUC[b]) nonNuc = true;
+      }
+    }
+    if (planeOn) {
+      ensurePlane(cur.len + frag.length);
+      if (planeOn) {
+        const base0 = cur.len;
+        for (let i = 0; i < frag.length; i++) planeCounts[(base0 + i) << SHIFT | toDense[frag[i]]]++;
+      }
+    }
+    cur.len += frag.length;
+  };
+  const stashWs = (n) => { pendWs += n; };
+  const flushWs = () => {
+    // withheld whitespace was INTERNAL to the line, it is sequence content
+    if (!pendWs || !cur) { pendWs = 0; return; }
+    nonNuc = true;
+    if (planeOn) {
+      ensurePlane(cur.len + pendWs);
+      if (planeOn) for (let k = 0; k < pendWs; k++) planeCounts[(cur.len + k) << SHIFT | OTHER]++;
+    }
+    cur.len += pendWs;
+    pendWs = 0;
+  };
+  let lastReport = 0;
+  for (;;) {
+    if (stopped) break;
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = value, n = chunk.length, chunkStart = abs;
+    abs += n;
+    const now = performance.now();
+    if (now - lastReport > 150) { lastReport = now; report(Math.min(abs, end) - start); }
+    let hasHigh = false;
+    for (let i = 0; i < n; i++) if (chunk[i] > 127) { hasHigh = true; break; }
+    let pos = 0;
+    while (pos < n) {
+      if (lineFresh) {
+        while (pos < n && chunk[pos] <= 32 && chunk[pos] !== 10) pos++;
+        if (pos >= n) break;
+        if (chunk[pos] === 10) { pos++; continue; }
+        if (chunk[pos] === 62) {
+          const headerAbs = chunkStart + pos;
+          if (headerAbs >= end) { finishRecord(); stopped = true; break; } // next stripe owns it
+          finishRecord();
+          pendOff = headerAbs;
+          inHeader = true; hdrLen = 0; pos++;
+          lineFresh = false;
+          continue;
+        }
+        inHeader = false; lineFresh = false;
+      }
+      let nl = chunk.indexOf(10, pos);
+      const eol = nl === -1 ? n : nl;
+      if (inHeader) {
+        ensureHdr(eol - pos);
+        hdr.set(chunk.subarray(pos, eol), hdrLen); hdrLen += eol - pos;
+        if (nl !== -1) { finishHeader(); inHeader = false; }
+      } else {
+        let e = eol;
+        if (nl !== -1) { while (e > pos && chunk[e - 1] <= 32) e--; pendWs = 0; }
+        else { while (e > pos && chunk[e - 1] <= 32) e--; }
+        if (e > pos) {
+          if (pendWs) flushWs();
+          appendSeq(chunk.subarray(pos, e), hasHigh);
+        }
+        if (nl === -1 && e < eol) stashWs(eol - e);
+      }
+      if (nl === -1) break; // chunk boundary mid-line, HEADER path too; resume next chunk
+      pos = nl + 1;
+      lineFresh = true;
+    }
+  }
+  try { await reader.cancel(); } catch {}
+  finishRecord(); flushIndex();
+  return { hadWide, nonNuc, maxLen, rowCount: totalRows, planeCounts, planeCols };
+}
+
+onmessage = async (e) => {
+  const { file, start, end, index } = e.data;
+  try {
+    const r = await indexStripe(file, start, end,
+      (done) => postMessage({ type: "progress", index, done }),
+      (headers, offs, lens) => postMessage({ type: "index", index, headers, offs, lens }));
+    postMessage({
+      type: "done", index, start, end,
+      hadWide: r.hadWide, nonNuc: r.nonNuc, maxLen: r.maxLen, rowCount: r.rowCount,
+      planeCounts: r.planeCounts, planeCols: r.planeCols
+    }, r.planeCounts ? [r.planeCounts.buffer] : []);
+  } catch (err) {
+    postMessage({ type: "error", index, message: String((err && err.message) || err) });
+  }
+};`;
+
+let FASTAINDEXWORKER_URL = null;
+function fastaIndexWorkerUrl() {
+  if (!FASTAINDEXWORKER_URL)
+    FASTAINDEXWORKER_URL = URL.createObjectURL(new Blob([FASTAINDEXWORKER_SOURCE], { type: "text/javascript" }));
+  return FASTAINDEXWORKER_URL;
+}
+
+// Driver: same stripe/assembly discipline as parseFastaParallel, then builds the
+// pager + facade records. Returns null (resident fallback) for files virtual can't
+// honor: wide characters, unaligned rows, or width past the plane cap.
+async function parseFastaVirtualIndex(file, onProgress) {
+  const size = file.size;
+  const W =
+    size > 8 * 2 ** 30
+      ? 4
+      : size > 2 * 2 ** 30
+        ? 8
+        : Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+  const stripe = Math.ceil(size / W);
+  const dones = new Float64Array(W);
+  const batches = new Array(W).fill(null);
+  const workers = [];
+  const report = () => {
+    let t = 0;
+    for (let i = 0; i < W; i++) t += dones[i];
+    if (onProgress) onProgress(t, size);
+  };
+  try {
+    const jobs = [];
+    for (let k = 0; k < W; k++) {
+      const w = new Worker(fastaIndexWorkerUrl());
+      workers.push(w);
+      const start = k * stripe,
+        end = Math.min(size, start + stripe);
+      jobs.push(
+        new Promise((resolve, reject) => {
+          w.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === "progress") {
+              dones[m.index] = m.done;
+              report();
+            } else if (m.type === "index") (batches[m.index] = batches[m.index] || []).push(m);
+            else if (m.type === "done") {
+              dones[m.index] = m.end - m.start;
+              report();
+              resolve(m);
+            } else if (m.type === "error") reject(new Error(m.message));
+          };
+          w.onerror = (err) => reject(new Error((err && err.message) || "worker error"));
+          w.postMessage({ file, start, end, index: k });
+        })
+      );
+    }
+    const parts = await Promise.all(jobs);
+    parts.sort((a, b) => a.index - b.index);
+    let total = 0,
+      hadWide = false,
+      nonNuc = false,
+      maxLen = 0;
+    for (const p of parts) {
+      total += p.rowCount;
+      hadWide = hadWide || p.hadWide;
+      nonNuc = nonNuc || p.nonNuc;
+      if (p.maxLen > maxLen) maxLen = p.maxLen;
+    }
+    if (!total) return null;
+    if (hadWide || parts.some((p) => !p.planeCounts) || maxLen > 262144) return null;
+    const headers = new Array(total);
+    const offs = new Float64Array(total);
+    const lens = new Uint32Array(total);
+    let o = 0;
+    for (const p of parts)
+      for (const b of batches[p.index] || [])
+        for (let i = 0; i < b.headers.length; i++) {
+          headers[o] = b.headers[i];
+          offs[o] = b.offs[i];
+          lens[o] = b.lens[i];
+          o++;
+        }
+    if (o !== total) return null;
+    for (let r = 0; r < N0(total); r++) if (lens[r] !== maxLen) return null; // unaligned → resident flow owns the warning
+    const plane = mergePlanes(parts, maxLen); // existing merger, same shape
+    const vsrc = makeVirtualRowSource(file, offs, lens);
+    const records = new Array(total);
+    for (let r = 0; r < total; r++)
+      records[r] = { id: r, header: headers[r], vsrc, seq: makeVirtualSeqFacade(vsrc, r, lens[r]) };
+    return { records, plane, alphabet: nonNuc ? "protein" : "nucleotide", maxLen, vsrc };
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (FASTAINDEXWORKER_URL) {
+      URL.revokeObjectURL(FASTAINDEXWORKER_URL);
+      FASTAINDEXWORKER_URL = null;
+    }
+  }
+}
+function N0(n) {
+  return n;
+} // keeps the aligned-check loop above readable
+
+// fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
+// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 -> 7 + 16 ≤ 24
+function blimCodeAt(bytes, i, bits) {
+  const bit = i * bits;
+  const byte = Math.floor(bit / 8); // not >> 3: i*bits overflows int32 past 2^31 (≈268M cols × 9 bits)
+  const shift = bit % 8; // not & 7: same reason
+  const win = (bytes[byte] << 16) | ((bytes[byte + 1] || 0) << 8) | (bytes[byte + 2] || 0);
+  return (win >>> (24 - shift - bits)) & ((1 << bits) - 1);
+}
+
+// setter twin of blimCodeAt, same MSB-first bit order
+function blimCodeSet(bytes, i, bits, v) {
+  const bit = i * bits;
+  for (let b = 0; b < bits; b++) {
+    const p = bit + b;
+    const byte = Math.floor(p / 8);
+    const mask = 1 << (7 - (p % 8));
+    if ((v >>> (bits - 1 - b)) & 1) bytes[byte] |= mask;
+    else bytes[byte] &= ~mask;
+  }
+}
+
+// column-deletion reindex for sparse color maps: drop [lo, hi], shift later keys down
+function reindexSparseColorMap(map, lo, hi) {
+  if (!map || !map.size) return;
+  const del = hi - lo + 1;
+  const next = new Map();
+  map.forEach((v, k) => {
+    if (k < lo) next.set(k, v);
+    else if (k > hi) next.set(k - del, v);
+  });
+  map.clear();
+  next.forEach((v, k) => map.set(k, v));
+}
+
+// Self-contained .blim/.bcmm row worker. Syncs onto validated "%name" row starts
+// inside its stripe, then decodes sequentially, flushing rows home in ~256MB
+// batches via transfer lists, worker-side memory stays flat no matter how big
+// the stripe is. .bcmm support: tag 0x00 rows are fixed-frame like .blim; tag 0x01
+// diff rows are applied against the reference vectors posted in the config (each
+// worker gets its own structured-clone copy, never aliased, never mutated). Any
+// framing anomaly stops the stripe quietly; the main thread's row-count check is
+// the sole arbiter of success. Colors stay at file precision: colorPacked planes
+// hold FILE color indices; the per-tab palette resolves them at read time.
+const BLIM_WORKER_SOURCE = `
+"use strict";
+const FLUSH_BYTES = 256 << 20;
+const codeAt = (bytes, i, bits) => { // MUST match blimCodeAt's bit order exactly
+  const bit = i * bits;
+  const byte = Math.floor(bit / 8); // not >> 3: i*bits overflows int32 past 2^31
+  const shift = bit % 8; // not & 7: same reason
+  const win = (bytes[byte] << 16) | ((bytes[byte + 1] || 0) << 8) | (bytes[byte + 2] || 0);
+  return (win >>> (24 - shift - bits)) & ((1 << bits) - 1);
+};
+const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+const codeSet = (bytes, i, bits, v) => { // setter twin, same MSB-first bit order
+  const bit = i * bits;
+  for (let b = 0; b < bits; b++) {
+    const p = bit + b;
+    const byte = Math.floor(p / 8);
+    const mask = 1 << (7 - (p % 8));
+    if ((v >>> (bits - 1 - b)) & 1) bytes[byte] |= mask;
+    else bytes[byte] &= ~mask;
+  }
+};
+
+async function run(cfg, report, emitRows) {
+  const { file, start, end, columns, charBits, colorBits, rowCharBytes, rowColorBytes,
+          charCodes, paletteMap, chardictIsByte, bcmm, refCharCodes, refFileColors } = cfg;
+  const dec = new TextDecoder();
+
+  // Sync: scan windows for a '%' at a line start, validate the candidate's name and
+  // frame terminator via random probes. Tag-dispatched for .bcmm: diff frames end at
+  // a computable offset because diff counts can never exceed the column count.
+  const sync = async () => {
+    let scanStart = start, win = 1 << 21;
+    for (;;) {
+      if (scanStart >= end) return -1;
+      const bytes = new Uint8Array(await file.slice(scanStart, Math.min(scanStart + win, file.size)).arrayBuffer());
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] !== 37) continue; // '%'
+        const P = scanStart + i;
+        let prevOk;
+        if (i > 0) prevOk = bytes[i - 1] === 10;
+        else prevOk = (new Uint8Array(await file.slice(P - 1, P).arrayBuffer()))[0] === 10;
+        if (!prevOk) continue;
+        const nl = bytes.indexOf(10, i + 1);
+        if (nl === -1) break; // name runs past the window, extend it
+        const nameLen = nl - i - 1;
+        if (nameLen === 0 || nameLen > 512) continue;
+        let ok = true;
+        for (let j = i + 1; j < nl; j++) {
+          const b = bytes[j];
+          if (b < 32 || b > 126) { ok = false; break; }
+        }
+        if (!ok) continue;
+        const frameStart = P + 1 + nameLen + 1;
+        if (!bcmm) { // plain .blim: fixed frame
+          const e = frameStart + rowCharBytes + rowColorBytes;
+          const probe = new Uint8Array(await file.slice(e, e + 2).arrayBuffer());
+          if (probe.length < 2) { if (probe[0] === 10) return P; continue; }
+          if (probe[0] === 10 && (probe[1] === 37 || probe[1] === 36)) return P;
+          continue;
+        }
+        const head = new Uint8Array(await file.slice(frameStart, frameStart + 5).arrayBuffer());
+        if (head.length < 1) continue;
+        const tag = head[0];
+        if (tag === 0) { // full planes, fixed size past the tag
+          const e = frameStart + 1 + rowCharBytes + rowColorBytes;
+          const probe = new Uint8Array(await file.slice(e, e + 2).arrayBuffer());
+          if (probe.length < 2) { if (probe[0] === 10) return P; continue; }
+          if (probe[0] === 10 && (probe[1] === 37 || probe[1] === 36)) return P;
+        } else if (tag === 1) { // diff row: bounded walk to the computed terminator
+          if (head.length < 5) continue;
+          const nChar = u32(head, 1);
+          if (nChar > columns) continue;
+          const p2 = new Uint8Array(await file.slice(frameStart + 5 + 6 * nChar, frameStart + 9 + 6 * nChar).arrayBuffer());
+          if (p2.length < 4) continue;
+          const nCol = u32(p2, 0);
+          if (nCol > columns) continue;
+          const e = frameStart + 9 + 6 * nChar + 6 * nCol;
+          const probe = new Uint8Array(await file.slice(e, e + 2).arrayBuffer());
+          if (probe.length < 2) { if (probe[0] === 10) return P; continue; }
+          if (probe[0] === 10 && (probe[1] === 37 || probe[1] === 36)) return P;
+        }
+      }
+      scanStart += win;
+      win <<= 1;
+    }
+  };
+
+  const startAbs = await sync();
+  if (startAbs < 0) return { stopAbs: -1, stopDollar: false };
+
+  const reader = file.slice(startAbs, file.size).stream().getReader();
+  let buf = new Uint8Array(0), pos = 0, abs = startAbs;
+  const pull = async () => {
+    const { value, done } = await reader.read();
+    if (done) return false;
+    const rem = buf.length - pos;
+    const next = new Uint8Array(rem + value.length);
+    next.set(buf.subarray(pos));
+    next.set(value, rem);
+    buf = next;
+    pos = 0;
+    return true;
+  };
+  const takeView = async (n) => { // a view, not a copy: decoded immediately, never retained
+    while (buf.length - pos < n) if (!(await pull())) throw new Error("eof");
+    const out = buf.subarray(pos, pos + n);
+    pos += n;
+    abs += n;
+    return out;
+  };
+  const takeLine = async () => {
+    for (;;) {
+      const idx = buf.indexOf(10, pos);
+      if (idx !== -1) {
+        const out = buf.slice(pos, idx);
+        abs += idx + 1 - pos;
+        pos = idx + 1;
+        return out;
+      }
+      if (!(await pull())) {
+        const out = buf.slice(pos);
+        abs += buf.length - pos;
+        pos = buf.length;
+        return out;
+      }
+    }
+  };
+  const peek = async () => {
+    while (buf.length - pos < 1) if (!(await pull())) return -1;
+    return buf[pos];
+  };
+
+  const rows = [];
+  let batchBytes = 0;
+  const flushRows = () => {
+    if (!rows.length) return;
+    const transfers = [];
+    for (const r of rows) {
+      if (r.seqCodes) transfers.push(r.seqCodes.buffer);
+      if (r.colorPacked) transfers.push(r.colorPacked.buffer);
+    }
+    emitRows(rows.slice(), transfers);
+    rows.length = 0;
+    batchBytes = 0;
+  };
+
+  let stopAbs = -1, stopDollar = false, lastReport = 0;
+  const emitProgress = () => {
+    const now = performance.now();
+    if (now - lastReport > 150) {
+      lastReport = now;
+      report(Math.min(abs, end) - startAbs); // overread past the stripe never inflates the bar
+    }
+  };
+
+  for (;;) {
+    const b = await peek();
+    if (b === -1 || abs >= end) { stopAbs = abs; break; }
+    if (b === 36) { stopAbs = abs; stopDollar = true; break; } // '$', a section line follows
+    const lineStart = abs;
+    const nameBytes = await takeLine();
+    if (nameBytes[0] !== 37) {
+      stopAbs = lineStart;
+      stopDollar = nameBytes[0] === 125; // '}', section closer; a section header line follows
+      break;
+    }
+
+    let codes = null, packed = null;
+    if (bcmm) {
+      const tag = (await takeView(1))[0];
+      if (tag === 1) {
+        const nb = await takeView(4);
+        const nChar = u32(nb, 0);
+        if (nChar > columns) { stopAbs = abs; break; }
+        const cd = await takeView(nChar * 6);
+        const kb = await takeView(4);
+        const nCol = u32(kb, 0);
+        if (nCol > columns) { stopAbs = abs; break; }
+        const kd = await takeView(nCol * 6);
+        const nl = await takeView(1);
+        if (nl[0] !== 10) { stopAbs = abs; break; }
+        const cc = refCharCodes.slice(); // fresh copies, never alias the reference,
+        const kk = refFileColors.slice(); // or edits would propagate across rows
+        let bad = false;
+        for (let j = 0; j < nChar; j++) {
+          const col = u32(cd, j * 6);
+          const ci = cd[j * 6 + 4] | (cd[j * 6 + 5] << 8);
+          if (col >= columns || ci >= charCodes.length) { bad = true; break; }
+          cc[col] = charCodes[ci];
+        }
+        for (let j = 0; j < nCol && !bad; j++) {
+          const col = u32(kd, j * 6);
+          const ki = kd[j * 6 + 4] | (kd[j * 6 + 5] << 8);
+          if (col >= columns || ki >= paletteMap.length) { bad = true; break; }
+          kk[col] = ki; // index 0 = white is a legal explicit value here
+        }
+        if (bad) { stopAbs = abs; break; }
+        codes = cc;
+        let anyColor = false;
+        for (let c = 0; c < columns; c++) if (kk[c] !== 0) { anyColor = true; break; }
+        if (anyColor) {
+          packed = new Uint8Array(rowColorBytes);
+          for (let c = 0; c < columns; c++) {
+            const fi = kk[c];
+            if (fi !== 0) codeSet(packed, c, colorBits, fi); // FILE indices, palette resolves at read time
+          }
+        }
+      } else if (tag !== 0) { stopAbs = abs; break; }
+      // tag 0: full planes follow, fall through
+    }
+    if (!codes) {
+      const cplane = await takeView(rowCharBytes);
+      const kplane = await takeView(rowColorBytes);
+      const nl = await takeView(1);
+      if (nl[0] !== 10) { stopAbs = abs; break; }
+      codes = chardictIsByte ? new Uint8Array(columns) : new Uint16Array(columns);
+      for (let c = 0; c < columns; c++) codes[c] = charCodes[codeAt(cplane, c, charBits)];
+      let nz = false;
+      for (let i = 0; i < kplane.length; i++) if (kplane[i] !== 0) { nz = true; break; }
+      if (nz) packed = kplane.slice(); // copy: a view would pin the whole stream chunk
+    }
+
+    const rec = { header: dec.decode(nameBytes.subarray(1)).replace(/^>+/, "") };
+    if (chardictIsByte) {
+      rec.seqCodes = codes; // facade attached on the main thread
+    } else {
+      let s = "";
+      for (let off = 0; off < columns; off += 8192) s += String.fromCharCode.apply(null, codes.subarray(off, off + 8192));
+      rec.seq = s;
+    }
+    if (packed) rec.colorPacked = packed; // flushRows collects its buffer for transfer
+    rows.push(rec);
+    batchBytes += columns * (chardictIsByte ? 1 : 2) + (packed ? packed.length : 0);
+    if (batchBytes >= FLUSH_BYTES) flushRows();
+    emitProgress();
+  }
+  try { await reader.cancel(); } catch (_) {}
+  flushRows(); // the final partial batch
+  return { stopAbs, stopDollar };
+}
+
+onmessage = async (e) => {
+  const cfg = e.data;
+  try {
+    const r = await run(
+      cfg,
+      (done) => postMessage({ type: "progress", index: cfg.index, done }),
+      (rows, transfers) => postMessage({ type: "rows", index: cfg.index, rows }, transfers)
+    );
+    postMessage({ type: "done", index: cfg.index, stopAbs: r.stopAbs, stopDollar: r.stopDollar });
+  } catch (err) {
+    postMessage({ type: "error", index: cfg.index, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+let BLIM_WORKER_URL = null;
+function blimWorkerUrl() {
+  if (!BLIM_WORKER_URL)
+    BLIM_WORKER_URL = URL.createObjectURL(new Blob([BLIM_WORKER_SOURCE], { type: "text/javascript" }));
+  return BLIM_WORKER_URL;
+}
+
+// FASTA parse straight off the file stream into byte rows, byte-level rewrite:
+// chunks are scanned as raw bytes (indexOf for newlines, memcpy for sequence
+// content), so massive files never pay for TextDecoder output, per-line string
+// slices, or per-char charCodeAt copies. Only header lines are decoded.
+async function parseFastaStream(file, onProgress) {
+  const records = [];
+  const reader = file.stream().getReader();
+  const textDec = new TextDecoder("utf-8"); // headers, and the wide-char fallback
+  const wideDec = new TextDecoder("utf-8"); // streaming decoder for rows that leave byte range
+  let doneBytes = 0;
+
+  let cur = null; // { header, codes, len, cap, parts }, parts !== null ⇒ string fallback row
+  let lineFresh = true; // next non-whitespace byte begins a new line
+  let inHeader = false;
+  let pendWs = null; // trailing-whitespace bytes of an unfinished content line, withheld
+  // because their newline may live in the next chunk
+
+  let hdr = new Uint8Array(256); // header bytes accumulate here (headers are short)
+  let hdrLen = 0;
+
+  const ensureRow = (extra) => {
+    if (cur.len + extra <= cur.cap) return;
+    const next = new Uint8Array(Math.max(cur.cap * 2, cur.len + extra));
+    next.set(cur.codes.subarray(0, cur.len));
+    cur.codes = next;
+    cur.cap = next.length;
+  };
+  const ensureHdr = (extra) => {
+    if (hdrLen + extra <= hdr.length) return;
+    const next = new Uint8Array(Math.max(hdr.length * 2, hdrLen + extra));
+    next.set(hdr.subarray(0, hdrLen));
+    hdr = next;
+  };
+
+  const finishRecord = () => {
+    if (!cur) return;
+    pendWs = null; // EOF ends the line: withheld whitespace is line-final, drop it
+    if (cur.parts) {
+      cur.parts.push(wideDec.decode()); // flush the streaming decoder's tail
       records.push({ header: cur.header, seq: cur.parts.join("") });
     } else {
       const codes = cur.len === cur.cap ? cur.codes : cur.codes.slice(0, cur.len);
@@ -10146,46 +13008,288 @@ async function parseFastaStream(file, onProgress) {
     cur = null;
   };
 
-  for await (const lines of readFileLineBatches(file, onProgress)) {
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      if (line.charCodeAt(0) === 62) {
-        // '>'
-        finishCurrent();
-        cur = { header: line.slice(1).split("").join(""), codes: new Uint8Array(1024), len: 0, cap: 1024, parts: null };
-      } else if (cur) {
-        if (cur.parts || WIDE.test(line)) {
-          // rare path: a char outside byte range — this row stays a string,
-          // exactly what the old parser would have produced
-          if (!cur.parts) {
-            const head = cur.codes.subarray(0, cur.len);
-            let s = "";
-            for (let off = 0; off < head.length; off += 8192)
-              s += String.fromCharCode.apply(null, head.subarray(off, off + 8192));
-            cur.parts = [s];
-            cur.codes = null;
-          }
-          cur.parts.push(line);
-        } else {
-          ensure(cur, line.length);
-          for (let i = 0; i < line.length; i++) cur.codes[cur.len++] = line.charCodeAt(i);
+  const finishHeader = () => {
+    while (hdrLen > 0 && hdr[hdrLen - 1] <= 32) hdrLen--; // trailing ws, \r included
+    const header = textDec.decode(hdr.subarray(0, hdrLen)); // fresh string, no chunk to pin
+    hdrLen = 0;
+    cur = { header, codes: new Uint8Array(1024), len: 0, cap: 1024, parts: null };
+  };
+
+  const goWide = (frag) => {
+    // convert what we have to string parts, exactly what the old parser produced
+    let s = "";
+    const head = cur.codes.subarray(0, cur.len);
+    for (let off = 0; off < head.length; off += 8192)
+      s += String.fromCharCode.apply(null, head.subarray(off, off + 8192));
+    cur.parts = [s, wideDec.decode(frag, { stream: true })];
+    cur.codes = null;
+  };
+
+  const appendSeq = (frag, checkHigh) => {
+    if (!cur || !frag.length) return; // sequence before the first '>' is ignored, as before
+    if (cur.parts) {
+      cur.parts.push(wideDec.decode(frag, { stream: true }));
+      return;
+    }
+    if (checkHigh) {
+      for (let i = 0; i < frag.length; i++) {
+        if (frag[i] > 127) {
+          goWide(frag);
+          return;
         }
       }
     }
+    ensureRow(frag.length);
+    cur.codes.set(frag, cur.len); // bulk memcpy, replaces the per-char charCodeAt loop
+    cur.len += frag.length;
+  };
+
+  const stashWs = (bytes) => {
+    // copy: the chunk is discarded after this iteration
+    if (!pendWs) pendWs = bytes.slice();
+    else {
+      const m = new Uint8Array(pendWs.length + bytes.length);
+      m.set(pendWs);
+      m.set(bytes, pendWs.length);
+      pendWs = m;
+    }
+  };
+  const flushWs = () => {
+    // content resumed after the run ⇒ the withheld bytes were INTERNAL to the
+    // line, and trim() parity says internal whitespace is sequence content
+    if (pendWs) appendSeq(pendWs, false);
+    pendWs = null;
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    doneBytes += value.byteLength;
+    if (onProgress) onProgress(doneBytes, file.size);
+    const chunk = value;
+    const n = chunk.length;
+
+    // one early-exit gate per chunk: pure-ASCII chunks skip the per-fragment wide scan
+    let hasHigh = false;
+    for (let i = 0; i < n; i++)
+      if (chunk[i] > 127) {
+        hasHigh = true;
+        break;
+      }
+
+    let pos = 0;
+    while (pos < n) {
+      if (lineFresh) {
+        while (pos < n && chunk[pos] <= 32 && chunk[pos] !== 10) pos++; // leading ws
+        if (pos >= n) break;
+        if (chunk[pos] === 10) {
+          pos++;
+          continue;
+        } // blank line, skipped, as before
+        if (chunk[pos] === 62) {
+          // '>'
+          finishRecord();
+          inHeader = true;
+          hdrLen = 0;
+          pos++;
+          lineFresh = false;
+          continue;
+        }
+        inHeader = false;
+        lineFresh = false;
+      }
+      const nl = chunk.indexOf(10, pos); // native scan
+      const end = nl === -1 ? n : nl;
+      if (inHeader) {
+        ensureHdr(end - pos);
+        hdr.set(chunk.subarray(pos, end), hdrLen);
+        hdrLen += end - pos;
+        if (nl !== -1) {
+          finishHeader();
+          inHeader = false;
+        }
+      } else {
+        let e = end;
+        if (nl !== -1) {
+          // the line ends here: trailing whitespace is line-final, trim it, and any
+          // withheld run from the previous chunk was line-final too
+          while (e > pos && chunk[e - 1] <= 32) e--;
+          pendWs = null;
+        } else {
+          // no newline in sight: withhold the trailing whitespace run, it may be
+          // line-final (newline in the next chunk) or internal (content resumes)
+          while (e > pos && chunk[e - 1] <= 32) e--;
+        }
+        if (e > pos) {
+          if (pendWs) flushWs(); // content resumed ⇒ the withheld run was internal
+          appendSeq(chunk.subarray(pos, e), hasHigh);
+        }
+        if (nl === -1 && e < end) stashWs(chunk.subarray(e, end));
+      }
+      if (nl === -1) break;
+      pos = nl + 1;
+      lineFresh = true;
+    }
   }
-  finishCurrent();
+  finishRecord();
   records.forEach((r, i) => (r.id = i));
   return records;
 }
 
-// One chunked sweep over freshly parsed byte rows, producing three load-time
-// products in a single pass:
-//   chars    — the baked consensus plane (kills lazy per-column consensus scans
-//              during scrolling; outcome byte-identical to computeConsensusColumn)
-//   alphabet — kills detectAlphabet's full-alignment toUpperCase scan
-//   rec.h    — per-row FNV-1a hashes (makes dereplication near-instant)
-// Returns null for tabs with any string/wide rows — those keep the legacy lazy paths.
+// Parallel FASTA parse: W workers (tapered by file size), static byte stripes,
+// rows arrive in ~256MB transferred batches, worker-side memory stays flat and
+// the main thread accumulates batches per worker, concatenating in stripe order.
+// Returns { records, plane|null, maxLen }, plane is null if any wide row appeared
+// or any stripe exceeded the plane column cap.
+async function parseFastaParallel(file, onProgress) {
+  const size = file.size;
+  // fewer workers for huge files: fewer planes, streams, and batches alive at once
+  const W =
+    size > 8 << 30 ? 4 : size > 2 << 30 ? 8 : Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+  const stripe = Math.ceil(size / W);
+  const dones = new Float64Array(W);
+  const batches = new Array(W).fill(null); // per-worker row batches, arrival order
+  const workers = [];
+  const report = () => {
+    let t = 0;
+    for (let i = 0; i < W; i++) t += dones[i];
+    if (onProgress) onProgress(t, size);
+  };
+  try {
+    const jobs = [];
+    for (let k = 0; k < W; k++) {
+      const w = new Worker(fastaWorkerUrl());
+      workers.push(w);
+      const start = k * stripe,
+        end = Math.min(size, start + stripe);
+      jobs.push(
+        new Promise((resolve, reject) => {
+          w.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === "progress") {
+              dones[m.index] = m.done;
+              report();
+            } else if (m.type === "rows") {
+              (batches[m.index] || (batches[m.index] = [])).push(m); // FIFO per worker, order preserved
+            } else if (m.type === "done") {
+              dones[m.index] = m.end - m.start; // exact completion, overread excluded
+              report();
+              resolve(m);
+            } else if (m.type === "error") {
+              reject(new Error(m.message));
+            }
+          };
+          w.onerror = (err) => {
+            console.error(
+              "[worker " +
+                k +
+                "] " +
+                (err.message || "error") +
+                " @ " +
+                (err.filename || "?") +
+                ":" +
+                (err.lineno || "?")
+            );
+            reject(new Error(err.message || "worker error"));
+          };
+          w.postMessage({ file, start, end, index: k }); // File is structured-cloneable
+        })
+      );
+    }
+    const parts = await Promise.all(jobs);
+    parts.sort((a, b) => a.index - b.index); // stripes are contiguous → row order is stripe order
+
+    let total = 0,
+      hadWide = false,
+      maxLen = 0;
+    for (const p of parts) {
+      total += p.rowCount;
+      hadWide = hadWide || p.hadWide;
+      if (p.maxLen > maxLen) maxLen = p.maxLen;
+    }
+    const records = new Array(total);
+    let o = 0;
+    for (const p of parts) {
+      const bs = batches[p.index] || [];
+      for (const m of bs) {
+        for (let i = 0; i < m.headers.length; i++) {
+          const cd = m.codes[i];
+          records[o++] = cd
+            ? { header: m.headers[i], seqCodes: cd, seq: makeSeqFacade(cd) }
+            : { header: m.headers[i], seq: m.strings[i] };
+        }
+      }
+    }
+    records.forEach((r, i) => (r.id = i));
+
+    const plane = hadWide || parts.some((p) => !p.planeCounts) ? null : mergePlanes(parts, maxLen);
+    return { records, plane, maxLen };
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (FASTA_WORKER_URL) {
+      URL.revokeObjectURL(FASTA_WORKER_URL);
+      FASTA_WORKER_URL = null;
+    }
+  }
+}
+
+function mergePlanes(parts, cols) {
+  const counts = new Int32Array(cols << DENSE_SHIFT);
+  for (const p of parts) {
+    const w = Math.min(p.planeCols, cols);
+    for (let c = 0; c < w; c++) {
+      const off = c << DENSE_SHIFT;
+      for (let s = 0; s < DENSE_SLOTS; s++) counts[off + s] += p.planeCounts[off + s];
+    }
+    // columns beyond this stripe's widest row are gaps for every one of its rows
+    for (let c = w; c < cols; c++) counts[(c << DENSE_SHIFT) + DENSE_GAP] += p.rowCount;
+  }
+  return {
+    counts,
+    toDense: DENSE_TO,
+    denseChar: DENSE_CHARS,
+    shift: DENSE_SHIFT,
+    slots: DENSE_SLOTS,
+    otherSlot: DENSE_OTHER,
+    gapSlot: DENSE_GAP,
+    dotSlot: DENSE_DOT,
+    cols,
+    rows: parts.reduce((t, p) => t + p.rowCount, 0) // lpFresh's staleness check reads this, it was never set
+  };
+}
+
+// argmax per column over a dense plane: strict >, ascending char codes —
+// computeConsensusColumn's tie-breaking. OTHER-bucket columns recompute exactly.
+function consensusCharsFromPlane(plane, records) {
+  const { counts, denseChar, shift, otherSlot, cols } = plane;
+  const chars = new Uint8Array(cols);
+  for (let c = 0; c < cols; c++) {
+    const base = c << shift;
+    let bestSlot = -1,
+      bestCount = -1;
+    for (let k = 0; k < otherSlot; k++) {
+      if (counts[base + k] > bestCount) {
+        bestCount = counts[base + k];
+        bestSlot = k;
+      }
+    }
+    chars[c] =
+      counts[base + otherSlot] > bestCount
+        ? records
+          ? computeConsensusColumn(records, c)
+          : 45
+        : String.fromCharCode(denseChar[bestSlot]).charCodeAt(0);
+  }
+  return chars;
+}
+
+// One chunked sweep over freshly parsed byte rows:
+//   chars   , the baked consensus plane (outcome identical to computeConsensusColumn)
+//   alphabet, kills detectAlphabet's full-alignment scan
+//   plane   , the dense counts plane, RETAINED on the tab: the simple/clustal
+//              consensus modals read it decision-only instead of re-sweeping
+// Returns null for tabs with any string/wide rows, those keep the legacy lazy paths.
+// (Row hashing no longer happens here: derep computes word-wise hashes on demand.)
 async function precomputeLoadPass(records, onProgress) {
   const N = records.length;
   if (!N) return null;
@@ -10193,29 +13297,25 @@ async function precomputeLoadPass(records, onProgress) {
 
   let cols = 1;
   for (let i = 0; i < N; i++) if (records[i].seqCodes.length > cols) cols = records[i].seqCodes.length;
-  if (cols << 10 > 256 * 1024 * 1024) return null; // counts plane would top 256MB — legacy lazy path
 
-  const counts = new Int32Array(cols << 8); // [col][uppercased code]
-  const NUC = new Uint8Array(256);
-  for (const ch of "ACGTUNRYSWKMBDHVX-.") NUC[ch.charCodeAt(0)] = 1;
-  let protein = false;
+  const alphabet = detectAlphabet(records); // single source of truth, sampled when huge, exact when small
+  if (cols > 262144) {
+    // the counts plane won't fit. Consensus stays lazy at this width, with
+    // hundreds of rows, per-column consensus is a few hundred reads.
+    return { chars: null, alphabet };
+  }
+
+  const counts = new Int32Array(cols << DENSE_SHIFT); // [col][slot], shared DENSE_* layout
 
   const tick = () => new Promise((r) => setTimeout(r, 0));
   let last = performance.now();
   for (let r = 0; r < N; r++) {
     const codes = records[r].seqCodes;
     const len = codes.length;
-    let h = 0x811c9dc5;
     for (let c = 0; c < len; c++) {
-      const code = codes[c];
-      h = Math.imul(h ^ code, 0x01000193);
-      const uc = code >= 97 && code <= 122 ? code - 32 : code; // what toUpperCase did
-      counts[(c << 8) | uc]++;
-      if (!protein && !NUC[uc]) protein = true;
+      counts[(c << DENSE_SHIFT) + DENSE_TO[codes[c]]]++;
     }
-    // missing tail cells count as '-' — computeConsensusColumn's semantics for short rows
-    for (let c = len; c < cols; c++) counts[(c << 8) | 45]++;
-    records[r].h = h >>> 0;
+    for (let c = len; c < cols; c++) counts[(c << DENSE_SHIFT) + DENSE_GAP]++;
     if (r % 512 === 511) {
       if (onProgress) onProgress(r + 1, N);
       if (performance.now() - last > 30) {
@@ -10225,27 +13325,28 @@ async function precomputeLoadPass(records, onProgress) {
     }
   }
 
-  // argmax per column: strict >, ascending codes, '-' (45) as the empty-column default —
-  // exactly computeConsensusColumn's tie-breaking
-  const chars = new Uint8Array(cols);
-  for (let c = 0; c < cols; c++) {
-    const base = c << 8;
-    let bestCode = 45,
-      bestCount = -1;
-    for (let k = 0; k < 256; k++) {
-      if (counts[base | k] > bestCount) {
-        bestCount = counts[base | k];
-        bestCode = k;
-      }
-    }
-    chars[c] = bestCode;
-  }
-  return { chars, alphabet: protein ? "protein" : "nucleotide" };
+  const plane = {
+    counts,
+    toDense: DENSE_TO,
+    denseChar: DENSE_CHARS,
+    shift: DENSE_SHIFT,
+    slots: DENSE_SLOTS,
+    otherSlot: DENSE_OTHER,
+    gapSlot: DENSE_GAP,
+    dotSlot: DENSE_DOT,
+    cols,
+    rows: N
+  };
+  return {
+    chars: simpleConsensusCharsFromPlane(plane, records, { alphabet }),
+    alphabet,
+    plane
+  };
 }
 
-// Per-column character histograms for the whole alignment in asingle sweep — the
+// Per-column character histograms for the whole alignment in asingle sweep, the
 // same trick as the load-time precompute pass. Returns an Int32Array indexed
-// (col << 8) | uppercasedCode. Missing tail cells count as '-' — the semantics
+// (col << 8) | uppercasedCode. Missing tail cells count as '-', the semantics
 // of (seq[c] || "-").toUpperCase() that the consensus algorithms were built on
 async function columnCountsPlane(records, colCount, onProgress) {
   const N = records.length;
@@ -10283,10 +13384,149 @@ async function columnCountsPlane(records, colCount, onProgress) {
   return plane;
 }
 
-// Whole-alignment unique-shading cache from a counts plane — same decision rules
+// Parallel twin of columnCountsPlane: identical plane shape (Int32Array, colCount << 8).
+// Workers persist and accumulate partial planes; rows stream through in bounded
+// batches, so total memory stays bounded regardless of dataset size. Returns null
+// whenever the preconditions don't hold, the caller then runs the original
+// single-threaded sweep.
+async function columnCountsPlaneParallel(records, colCount, onProgress) {
+  const N = records.length;
+  if (typeof Worker === "undefined" || N < 2) return null;
+  if (!records[0].seqCodes) {
+    console.warn("[counts] parallel skip: string tab");
+    return null;
+  }
+  for (let r = 0; r < N; r++) {
+    const sc = records[r].seqCodes;
+    if (!sc || sc.length !== colCount) {
+      console.warn("[counts] parallel skip: non-rectangular at row " + r);
+      return null;
+    }
+  }
+  if (colCount * 1024 > 32 * 1024 * 1024) {
+    // multiplication, << wraps int32 past 2M columns
+    console.warn("[counts] parallel skip: plane cap");
+    return null;
+  }
+
+  // Plain JS arrays have no .buffer: the transfer path silently skipped them and
+  // every batch was a multi-hundred-million-element structured CLONE serialized
+  // synchronously on the main thread (the recurring freeze; stall positions sat at
+  // exact multiples of the batch size). Normalize once and PERSIST back onto
+  // records, every later sweep and every other consumer then gets typed rows.
+  // Row 0 up front so batch sizing reads a real BYTES_PER_ELEMENT.
+  if (!(records[0].seqCodes.buffer instanceof ArrayBuffer)) {
+    records[0].seqCodes = new Uint32Array(records[0].seqCodes);
+  }
+  const BPE = records[0].seqCodes.BYTES_PER_ELEMENT;
+
+  const W = Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+  const BATCH_CAP = 256 << 20; // real bytes copied + transferred per batch
+  const batchRows = Math.max(W * 8, Math.floor(BATCH_CAP / (colCount * BPE)));
+
+  const workers = [];
+  try {
+    for (let k = 0; k < W; k++) {
+      const w = new Worker(countsWorkerUrl());
+      workers.push(w);
+      w.onerror = (err) => console.error("[counts worker " + k + "] " + (err.message || "error"));
+      w.postMessage({ type: "init", colCount, index: k });
+    }
+
+    for (let b = 0; b < N; b += batchRows) {
+      const hi = Math.min(N, b + batchRows);
+      const span = hi - b;
+      const batchDones = new Float64Array(W);
+      let failed = null;
+      await Promise.all(
+        workers.map((w, k) => {
+          const lo2 = b + Math.floor((k * span) / W);
+          const hi2 = b + Math.floor(((k + 1) * span) / W);
+          const rows = [];
+          const transfers = [];
+          for (let r = lo2; r < hi2; r++) {
+            let sc = records[r].seqCodes;
+            if (!(sc.buffer instanceof ArrayBuffer)) {
+              sc = records[r].seqCodes = new Uint32Array(sc); // one-time, persisted
+            }
+            const copy = sc.slice(); // native memcpy, the only main-thread cost
+            rows.push(copy);
+            transfers.push(copy.buffer);
+          }
+          return new Promise((resolve, reject) => {
+            w.onmessage = (e) => {
+              const m = e.data;
+              if (m.type === "batchProgress") {
+                batchDones[m.index] = m.rowsDone;
+                let t = 0;
+                for (let i = 0; i < W; i++) t += batchDones[i];
+                if (onProgress) onProgress(Math.min(b + t, N));
+              } else if (m.type === "batchDone") {
+                batchDones[m.index] = m.rowsDone;
+                resolve();
+              } else if (m.type === "error") {
+                reject(new Error(m.message));
+              }
+            };
+            w.postMessage({ type: "rows", rows, index: k }, transfers);
+          }).catch((err) => {
+            failed = err;
+          });
+        })
+      );
+      if (failed) throw failed;
+      if (onProgress) onProgress(hi);
+    }
+
+    const parts = await Promise.all(
+      workers.map(
+        (w, k) =>
+          new Promise((resolve, reject) => {
+            w.onmessage = (e) => {
+              const m = e.data;
+              if (m.type === "done") resolve(m.plane);
+              else if (m.type === "error") reject(new Error(m.message));
+            };
+            w.postMessage({ type: "flush", index: k });
+          })
+      )
+    );
+    const plane = new Int32Array(colCount << 8);
+    for (const p of parts) for (let i = 0; i < plane.length; i++) plane[i] += p[i];
+    return plane;
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (COUNTS_WORKER_URL) {
+      URL.revokeObjectURL(COUNTS_WORKER_URL);
+      COUNTS_WORKER_URL = null;
+    }
+  }
+}
+
+// Unique-mode warm straight from the retained dense load plane: exact for the 29
+// named slots (gaps and dots included, lowercase already folded). Columns whose
+// OTHER bucket is non-zero are left out, computeUniqueShadeColor counts those
+// exactly on demand. Same cache shape as uniqueCacheFromPlane: Map(code -> count).
+function uniqueCacheFromDensePlane(plane, colCount) {
+  const cols = {};
+  const { counts, denseChar, shift, otherSlot } = plane;
+  for (let c = 0; c < colCount; c++) {
+    const base = c << shift;
+    if (counts[base + otherSlot] > 0) continue; // exotic bytes present, the lazy exact path owns this column
+    const m = new Map();
+    for (let s = 0; s < otherSlot; s++) {
+      const n = counts[base + s];
+      if (n > 0) m.set(denseChar[s], n);
+    }
+    cols[c] = m;
+  }
+  return cols;
+}
+
+// Whole-alignment unique-shading cache from a counts plane, same decision rules
 // as computeUniqueColumnColor, with the per-column row scans already done by the sweep
 // the warm stores COUNTS, not colors: computeUniqueShadeColor reads cache.cols[col]
-// as a Map of uppercased char code -> count and derives colors live — so slider
+// as a Map of uppercased char code -> count and derives colors live so slider
 // tweaks after the warm never touch the cache at all
 function uniqueCacheFromPlane(plane, colCount) {
   const cols = {};
@@ -10295,7 +13535,7 @@ function uniqueCacheFromPlane(plane, colCount) {
     const counts = new Map();
     for (let k = 0; k < 256; k++) {
       const n = plane[base | k];
-      if (n > 0) counts.set(k, n); // every code counted, gaps included — as computeUniqueColumnCounts
+      if (n > 0) counts.set(k, n); // every code counted, gaps included, as computeUniqueColumnCounts
     }
     cols[c] = counts;
   }
@@ -10303,7 +13543,7 @@ function uniqueCacheFromPlane(plane, colCount) {
 }
 
 // Per-column residue/category counts for the whole alignment, derived from the
-// plane — identical to what the worker posted back, without cloning the rows
+// plane, identical to what the worker posted back, without cloning the rows
 function frequencyCountsFromPlane(plane, colCount, header) {
   const { charToRes, resToCat, residueKeys, categoryOrder } = header;
   const counts = {};
@@ -10325,8 +13565,575 @@ function frequencyCountsFromPlane(plane, colCount, header) {
   return counts;
 }
 
+// Streaming byte cursor over a Blob slice, shared by parseBlimStream and parseBlimParallel.
+function makeBlimCursor(file, fromOffset) {
+  const reader = file.slice(fromOffset).stream().getReader();
+  let chunks = [];
+  let buffered = 0;
+  let done = false;
+  let offset = fromOffset;
+
+  const fill = async () => {
+    const { value, done: d } = await reader.read();
+    if (d) {
+      done = true;
+      return;
+    }
+    chunks.push(value);
+    buffered += value.length;
+  };
+
+  // consume exactly n bytes as one contiguous Uint8Array
+  const need = async (n) => {
+    while (buffered < n && !done) await fill();
+    if (buffered < n) throw new Error("Unexpected end of .blim file");
+    const out = new Uint8Array(n);
+    let o = 0;
+    while (o < n) {
+      const head = chunks[0];
+      const take = Math.min(head.length, n - o);
+      out.set(head.subarray(0, take), o);
+      o += take;
+      offset += take;
+      if (take === head.length) chunks.shift();
+      else chunks[0] = head.subarray(take);
+      buffered -= take;
+    }
+    return out;
+  };
+
+  const dec = new TextDecoder();
+  const readLine = async () => {
+    for (;;) {
+      let scanned = 0;
+      for (const ch of chunks) {
+        const idx = ch.indexOf(10);
+        if (idx !== -1) {
+          const bytes = await need(scanned + idx);
+          await need(1); // the \n itself
+          let s = dec.decode(bytes);
+          if (s.endsWith("\r")) s = s.slice(0, -1);
+          return s;
+        }
+        scanned += ch.length;
+      }
+      if (done) {
+        if (buffered === 0) return null; // clean EOF
+        return dec.decode(await need(buffered)); // final line, no newline
+      }
+      await fill();
+    }
+  };
+
+  const readU32 = async () => {
+    const b = await need(4);
+    return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+  };
+  const readDiffRecords = async (n) => {
+    // -> flat [col, dictIdx, col, dictIdx, ...]
+    const b = await need(n * 6);
+    const out = new Array(n * 2);
+    for (let i = 0, j = 0; i < n; i++, j += 6) {
+      out[i * 2] = (b[j] | (b[j + 1] << 8) | (b[j + 2] << 16) | (b[j + 3] << 24)) >>> 0;
+      out[i * 2 + 1] = b[j + 4] | (b[j + 5] << 8);
+    }
+    return out;
+  };
+
+  return { need, readLine, readU32, readDiffRecords, offset: () => offset };
+}
+
+// Parses a .blim File/Blob in one streaming pass; memory stays flat (one row's
+// planes live at a time). Colors stay at file precision: rows keep the packed
+// color plane itself (rec.colorPacked + rec.colorPack) instead of a dense
+// Uint16Array per colored row. Returns { meta, annotations, records, consensusBaked, colorPack }.
+async function parseBlimStream(file, onProgress) {
+  const cur = makeBlimCursor(file, 0);
+  const { need, readLine, readU32, readDiffRecords } = cur;
+
+  const gcYield = (() => {
+    const ch = new MessageChannel();
+    return () =>
+      new Promise((r) => {
+        ch.port1.onmessage = r;
+        ch.port2.postMessage(0);
+      });
+  })();
+
+  // header
+  const magic = await readLine();
+  if (magic !== ".blim" && magic !== ".bcmm") throw new Error("Not a .blim file");
+  const isBcmm = magic === ".bcmm"; // subtype only changes $sequence_data (spec §4)
+  const meta = { fontSize: 18, luminance: 0.5, alphabet: "protein" };
+  let columns = 0,
+    annoCount = 0,
+    seqCount = 0,
+    charBits = 0,
+    colorBits = 0;
+  let charCodes = [],
+    colorList = [];
+  let section = null;
+  const fieldRe = /^\$([a-z]+)((?:\{[^}]*\})+)$/;
+  for (;;) {
+    const line = await readLine();
+    if (line === null) throw new Error(".blim ended in the header");
+    if (line === "$annotation_data{" || line === "$sequence_data{" || line === "$consensus_data{") {
+      section = line.slice(1, -1);
+      break;
+    }
+    const m = line.match(fieldRe);
+    if (!m) throw new Error("Bad .blim header line: " + line);
+    const vals = [];
+    const vm = /\{([^}]*)\}/g;
+    let v;
+    while ((v = vm.exec(m[2])) !== null) vals.push(v[1]);
+    const key = m[1];
+    if (key === "version") {
+      if (+vals[0] !== 1) throw new Error("Unsupported .blim version: " + vals[0]);
+    } else if (key === "columns") columns = +vals[0];
+    else if (key === "rows") {
+      annoCount = +vals[0];
+      seqCount = +vals[1];
+    } else if (key === "chardict") {
+      charBits = +vals[0];
+      charCodes = vals[1].split(",").map(Number);
+    } else if (key === "colordict") {
+      colorBits = +vals[0];
+      colorList = vals[1] ? vals[1].split(",") : [];
+    } else if (key === "fontsize") meta.fontSize = +vals[0];
+    else if (key === "luminance") meta.luminance = +vals[0];
+    else if (key === "alphabetdef") meta.alphabet = vals[0] === "Nucleotide" ? "nucleotide" : "protein";
+  }
+  if (!columns || !charBits || !colorBits) throw new Error(".blim header missing columns/dictionaries");
+
+  const chardictIsByte = charCodes.every((code) => code <= 255); // byte rows + 1-byte consensus chars when true
+  // file color index -> app palette index (paletteIndexFor is the global palette store)
+  const paletteMap = new Uint16Array(colorList.length + 1);
+  colorList.forEach((hex, i) => (paletteMap[i + 1] = paletteIndexFor(hex)));
+  const colorPack = { bits: colorBits, palette: paletteMap, cols: columns }; // packed planes resolve through this
+
+  const rowCharBytes = Math.ceil((columns * charBits) / 8);
+  const rowColorBytes = Math.ceil((columns * colorBits) / 8);
+
+  const readRow = async () => {
+    const name = await readLine();
+    if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+    const cplane = await need(rowCharBytes);
+    const kplane = await need(rowColorBytes);
+    const nl = await need(1); // framing checkpoint (spec 3)
+    if (nl[0] !== 10) throw new Error(".blim framing error, row payload length mismatch");
+    return { name: name.slice(1), cplane, kplane };
+  };
+
+  const scratch = new Uint16Array(columns);
+  const decodeCharCodes = (plane, target) => {
+    for (let c = 0; c < columns; c++) target[c] = charCodes[blimCodeAt(plane, c, charBits)];
+    return target;
+  };
+  const codesToString = (arr) => {
+    let s = "";
+    for (let off = 0; off < columns; off += 8192) s += String.fromCharCode.apply(null, arr.subarray(off, off + 8192));
+    return s;
+  };
+  const decodeChars = (plane) => codesToString(decodeCharCodes(plane, scratch));
+
+  const annotations = [];
+  const records = [];
+  let consensusBaked = null;
+
+  for (;;) {
+    if (section === "annotation_data") {
+      for (let i = 0; i < annoCount; i++) {
+        const { name, cplane, kplane } = await readRow();
+        let data = decodeChars(cplane);
+        // .blim stores annotation planes full-width; a fresh tab's are "" (createTab).
+        // Compact: right-trim spaces, all-space rows collapse to "".
+        const t = data.replace(/ +$/, "");
+        data = t === data ? data : t.split("").join(""); // flatten: a substring slice would pin the whole 250MB rope
+        const ann = { name, data, colors: {} };
+        for (let c = 0; c < columns; c++) {
+          const fi = blimCodeAt(kplane, c, colorBits);
+          if (fi !== 0) ann.colors[c] = colorList[fi - 1];
+        }
+        annotations.push(ann);
+        if (onProgress) onProgress(cur.offset(), file.size);
+      }
+    } else if (section === "sequence_data") {
+      let refCharCodes = null; // .bcmm reference row: decoded char codes (Uint8 or Uint16)
+      let refFileColors = null; // .bcmm reference row: file color indices (0 = white)
+      for (let i = 0; i < seqCount; i++) {
+        const name = await readLine();
+        if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+
+        if (isBcmm && i > 0) {
+          const tag = (await need(1))[0];
+          if (tag === 1) {
+            // diff row: copy the reference vectors, apply records (spec §4)
+            if (!refCharCodes) throw new Error(".bcmm diff row before reference row");
+            const cd = await readDiffRecords(await readU32());
+            const kd = await readDiffRecords(await readU32());
+            const nl = await need(1);
+            if (nl[0] !== 10) throw new Error(".bcmm framing error at sequence row " + i);
+            const codes = refCharCodes.slice(); // fresh copies, never alias the reference,
+            const kcol = refFileColors.slice(); // or edits would propagate across rows
+            for (let j = 0; j < cd.length; j += 2) {
+              const col = cd[j],
+                ci = cd[j + 1];
+              if (col >= columns || ci >= charCodes.length)
+                throw new Error(".bcmm char diff out of range, sequence row " + i);
+              codes[col] = charCodes[ci];
+            }
+            for (let j = 0; j < kd.length; j += 2) {
+              const col = kd[j],
+                ki = kd[j + 1];
+              if (col >= columns || ki > colorList.length)
+                throw new Error(".bcmm color diff out of range, sequence row " + i);
+              kcol[col] = ki; // index 0 = white is a legal explicit value here
+            }
+            const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
+            if (chardictIsByte) {
+              rec.seqCodes = codes; // refCharCodes is Uint8, so .slice() gave us Uint8
+              rec.seq = makeSeqFacade(codes);
+            } else {
+              rec.seq = codesToString(codes);
+            }
+            // packed storage: rebuild the row's color plane at file precision
+            let anyColor = false;
+            for (let c = 0; c < columns; c++)
+              if (kcol[c] !== 0) {
+                anyColor = true;
+                break;
+              }
+            if (anyColor) {
+              const pk = new Uint8Array(rowColorBytes);
+              for (let c = 0; c < columns; c++) {
+                const fi = kcol[c];
+                if (fi !== 0) blimCodeSet(pk, c, colorBits, fi); // FILE indices, paletteMap resolves at read time
+              }
+              rec.colorPacked = pk;
+              rec.colorPack = colorPack;
+            }
+            records.push(rec);
+            if (onProgress) onProgress(cur.offset(), file.size);
+            await gcYield(); // GC window between rows
+            continue;
+          }
+          if (tag !== 0) throw new Error("Bad .bcmm row tag " + tag + " at sequence row " + i);
+          // tag 0x00: full planes follow, base-format shape
+        }
+
+        const cplane = await need(rowCharBytes);
+        const kplane = await need(rowColorBytes);
+        const nl = await need(1); // framing checkpoint (spec 3)
+        if (nl[0] !== 10) throw new Error(".blim framing error, row payload length mismatch");
+        const keepRef = isBcmm && i === 0;
+        const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
+        if (chardictIsByte) {
+          const codes = new Uint8Array(columns);
+          for (let c = 0; c < columns; c++) codes[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+          rec.seqCodes = codes;
+          rec.seq = makeSeqFacade(codes);
+          if (keepRef) refCharCodes = codes;
+        } else {
+          const codes = keepRef ? decodeCharCodes(cplane, new Uint16Array(columns)) : null;
+          rec.seq = codes ? codesToString(codes) : decodeChars(cplane);
+          if (keepRef) refCharCodes = codes;
+        }
+        if (keepRef) {
+          const kcol = new Uint16Array(columns); // .bcmm reference vector for diff application
+          for (let c = 0; c < columns; c++) kcol[c] = blimCodeAt(kplane, c, colorBits);
+          refFileColors = kcol;
+        }
+        // packed storage: the row keeps the file's own color plane, no 2-bytes-per-cell inflation
+        if (kplane.some((b) => b !== 0)) {
+          rec.colorPacked = kplane;
+          rec.colorPack = colorPack;
+        }
+        records.push(rec);
+        if (onProgress) onProgress(cur.offset(), file.size);
+        await gcYield(); // GC window between rows
+      }
+    } else if (section === "consensus_data") {
+      const { cplane, kplane } = await readRow(); // the single %consensus row
+      const chars = chardictIsByte ? new Uint8Array(columns) : new Uint16Array(columns);
+      let colors = null; // null = plane was entirely default, allocate only if real color appears
+      for (let c = 0; c < columns; c++) chars[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+      for (let c = 0; c < columns; c++) {
+        const fi = blimCodeAt(kplane, c, colorBits);
+        if (fi !== 0) {
+          if (!colors) colors = new Uint16Array(columns);
+          colors[c] = paletteMap[fi];
+        }
+      }
+      consensusBaked = { chars, colors }; // colors: null means all-default; within a non-null plane, 0 = "no baked value" sentinel
+    }
+    if ((await readLine()) !== "}") throw new Error("Expected } closing $" + section);
+    const next = await readLine();
+    if (next === null) break;
+    if (next === "$annotation_data{" || next === "$sequence_data{" || next === "$consensus_data{") {
+      section = next.slice(1, -1);
+    } else {
+      throw new Error("Unknown .blim section: " + next);
+    }
+  }
+  return { meta, annotations, records, consensusBaked, colorPack };
+}
+
+// Parallel .blim/.bcmm parse. Main thread does header + annotations sequentially,
+// parses the .bcmm reference row (row 0) itself and broadcasts its decoded vectors
+// in each worker's config; workers stripe the rows from seqStart onward, flushing
+// ~256MB row batches home via transfer lists. Assembly keeps the first seqCount
+// records in stripe order (trailing stripes may emit the row-shaped %consensus row —
+// capped away), then the single consensus row is parsed on the main thread at the
+// offset the boundary worker reported. Any irregularity throws, the caller falls
+// back to parseBlimStream.
+async function parseBlimParallel(file, onProgress) {
+  const cur = makeBlimCursor(file, 0);
+  const { need, readLine } = cur;
+
+  const magic = await readLine();
+  if (magic !== ".blim" && magic !== ".bcmm") throw new Error("Not a .blim file");
+  const isBcmm = magic === ".bcmm";
+  const meta = { fontSize: 18, luminance: 0.5, alphabet: "protein" };
+  let columns = 0,
+    annoCount = 0,
+    seqCount = 0,
+    charBits = 0,
+    colorBits = 0;
+  let charCodes = [],
+    colorList = [],
+    section = null;
+  const fieldRe = /^\$([a-z]+)((?:\{[^}]*\})+)$/;
+  for (;;) {
+    const line = await readLine();
+    if (line === null) throw new Error(".blim ended in the header");
+    if (line === "$annotation_data{" || line === "$sequence_data{" || line === "$consensus_data{") {
+      section = line.slice(1, -1);
+      break;
+    }
+    const m = line.match(fieldRe);
+    if (!m) throw new Error("Bad .blim header line: " + line);
+    const vals = [];
+    const vm = /\{([^}]*)\}/g;
+    let v;
+    while ((v = vm.exec(m[2])) !== null) vals.push(v[1]);
+    const key = m[1];
+    if (key === "version") {
+      if (+vals[0] !== 1) throw new Error("Unsupported .blim version: " + vals[0]);
+    } else if (key === "columns") columns = +vals[0];
+    else if (key === "rows") {
+      annoCount = +vals[0];
+      seqCount = +vals[1];
+    } else if (key === "chardict") {
+      charBits = +vals[0];
+      charCodes = vals[1].split(",").map(Number);
+    } else if (key === "colordict") {
+      colorBits = +vals[0];
+      colorList = vals[1] ? vals[1].split(",") : [];
+    } else if (key === "fontsize") meta.fontSize = +vals[0];
+    else if (key === "luminance") meta.luminance = +vals[0];
+    else if (key === "alphabetdef") meta.alphabet = vals[0] === "Nucleotide" ? "nucleotide" : "protein";
+  }
+  if (!columns || !charBits || !colorBits) throw new Error(".blim header missing columns/dictionaries");
+
+  const chardictIsByte = charCodes.every((code) => code <= 255);
+  const paletteMap = new Uint16Array(colorList.length + 1);
+  colorList.forEach((hex, i) => (paletteMap[i + 1] = paletteIndexFor(hex))); // palette stays main-thread
+  const colorPack = { bits: colorBits, palette: paletteMap, cols: columns };
+
+  const rowCharBytes = Math.ceil((columns * charBits) / 8);
+  const rowColorBytes = Math.ceil((columns * colorBits) / 8);
+
+  // annotations: few rows, parse sequentially with the same semantics as parseBlimStream
+  const annotations = [];
+  if (section === "annotation_data") {
+    const scratch = new Uint16Array(columns);
+    for (let i = 0; i < annoCount; i++) {
+      const name = await readLine();
+      if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+      const cplane = await need(rowCharBytes);
+      const kplane = await need(rowColorBytes);
+      const nl = await need(1);
+      if (nl[0] !== 10) throw new Error(".blim framing error, row payload length mismatch");
+      for (let c = 0; c < columns; c++) scratch[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+      let data = "";
+      for (let off = 0; off < columns; off += 8192)
+        data += String.fromCharCode.apply(null, scratch.subarray(off, off + 8192));
+      const t = data.replace(/ +$/, "");
+      data = t === data ? data : t.split("").join("");
+      const ann = { name: name.slice(1), data, colors: {} };
+      for (let c = 0; c < columns; c++) {
+        const fi = blimCodeAt(kplane, c, colorBits);
+        if (fi !== 0) ann.colors[c] = colorList[fi - 1];
+      }
+      annotations.push(ann);
+      if (onProgress) onProgress(cur.offset(), file.size);
+    }
+    if ((await readLine()) !== "}") throw new Error("Expected } closing $annotation_data");
+    if ((await readLine()) !== "$sequence_data{") throw new Error("parallel path expects $sequence_data next");
+  } else if (section !== "sequence_data") {
+    throw new Error("parallel path expects annotation_data or sequence_data first");
+  }
+  const seqStart0 = cur.offset();
+
+  // .bcmm: row 0 is the tag-less reference row, parse it here, broadcast its vectors
+  let refRec = null,
+    refCharCodes = null,
+    refFileColors = null,
+    seqStart = seqStart0;
+  if (isBcmm) {
+    if (seqCount < 2) throw new Error(".bcmm too small to parallelize"); // single-thread handles it
+    const name = await readLine();
+    if (name === null || !name.startsWith("%")) throw new Error("Expected %row name, got: " + name);
+    const cplane = await need(rowCharBytes);
+    const kplane = await need(rowColorBytes);
+    if ((await need(1))[0] !== 10) throw new Error(".bcmm framing error at reference row");
+    refRec = { header: name.slice(1).replace(/^>+/, "") };
+    if (chardictIsByte) {
+      refCharCodes = new Uint8Array(columns);
+      for (let c = 0; c < columns; c++) refCharCodes[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+      refRec.seqCodes = refCharCodes;
+    } else {
+      refCharCodes = new Uint16Array(columns);
+      for (let c = 0; c < columns; c++) refCharCodes[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+      let s = "";
+      for (let off = 0; off < columns; off += 8192)
+        s += String.fromCharCode.apply(null, refCharCodes.subarray(off, off + 8192));
+      refRec.seq = s;
+    }
+    refFileColors = new Uint16Array(columns);
+    for (let c = 0; c < columns; c++) refFileColors[c] = blimCodeAt(kplane, c, colorBits); // diff rows seed from this vector, decode, not just allocate
+    if (kplane.some((b) => b !== 0)) {
+      refRec.colorPacked = kplane;
+      refRec.colorPack = colorPack;
+    }
+    seqStart = cur.offset(); // workers stripe from row 1 onward, every row there has a tag
+  }
+  if (onProgress) onProgress(seqStart, file.size);
+
+  // sequence rows: striped across workers, W tapers by file size like the FASTA path,
+  // because decoded rows can exceed the packed file's size
+  const size = file.size;
+  const W =
+    size > 8 << 30 ? 4 : size > 2 << 30 ? 8 : Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+  const region = file.size - seqStart;
+  const stripe = Math.ceil(region / W);
+  const dones = new Float64Array(W);
+  const batches = new Array(W).fill(null); // per-worker row batches, arrival order
+  const workers = [];
+  const report = () => {
+    let t = 0;
+    for (let i = 0; i < W; i++) t += dones[i];
+    if (onProgress) onProgress(seqStart + Math.min(t, region), file.size);
+  };
+  const charCodesArr = Uint16Array.from(charCodes);
+  try {
+    const jobs = [];
+    for (let k = 0; k < W; k++) {
+      const w = new Worker(blimWorkerUrl());
+      workers.push(w);
+      const start = seqStart + k * stripe,
+        end = Math.min(file.size, start + stripe);
+      jobs.push(
+        new Promise((resolve, reject) => {
+          w.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === "progress") {
+              dones[m.index] = m.done;
+              report();
+            } else if (m.type === "rows") {
+              (batches[m.index] || (batches[m.index] = [])).push(m.rows); // FIFO per worker, order preserved
+            } else if (m.type === "done") {
+              dones[m.index] = end - start; // exact completion, overread excluded
+              report();
+              resolve(m);
+            } else {
+              reject(new Error(m.message));
+            }
+          };
+          w.onerror = (err) => reject(err);
+          w.postMessage({
+            file,
+            start,
+            end,
+            index: k,
+            columns,
+            charBits,
+            colorBits,
+            rowCharBytes,
+            rowColorBytes,
+            charCodes: charCodesArr,
+            paletteMap,
+            chardictIsByte,
+            bcmm: isBcmm,
+            refCharCodes,
+            refFileColors
+          });
+        })
+      );
+    }
+    const parts = await Promise.all(jobs);
+    parts.sort((a, b) => a.index - b.index);
+
+    const records = [];
+    if (refRec) records.push(refRec);
+    let consensusOffset = -1;
+    for (const p of parts) {
+      const bs = batches[p.index] || [];
+      for (const rows of bs) for (const r of rows) if (records.length < seqCount) records.push(r);
+      if (p.stopDollar) consensusOffset = p.stopAbs;
+    }
+    records.forEach((r, i) => {
+      r.id = i;
+      if (r.seqCodes && !r.seq) r.seq = makeSeqFacade(r.seqCodes); // facades are main-thread
+      if (r.colorPacked) r.colorPack = colorPack; // per-tab pack: bits + palette + cols
+    });
+    if (records.length !== seqCount)
+      throw new Error(".blim row count mismatch: got " + records.length + ", expected " + seqCount);
+
+    // consensus: a single row, parse it on the main thread
+    let consensusBaked = null;
+    if (consensusOffset >= 0) {
+      const c2 = makeBlimCursor(file, consensusOffset);
+      let line = await c2.readLine();
+      if (line === "}") line = await c2.readLine(); // offset may point at the closer or the header
+      if (line === "$consensus_data{") {
+        await c2.readLine(); // %consensus
+        const cplane = await c2.need(rowCharBytes);
+        const kplane = await c2.need(rowColorBytes);
+        await c2.need(1);
+        const chars = chardictIsByte ? new Uint8Array(columns) : new Uint16Array(columns);
+        for (let c = 0; c < columns; c++) chars[c] = charCodes[blimCodeAt(cplane, c, charBits)];
+        let colors = null;
+        for (let c = 0; c < columns; c++) {
+          const fi = blimCodeAt(kplane, c, colorBits);
+          if (fi !== 0) {
+            if (!colors) colors = new Uint16Array(columns);
+            colors[c] = paletteMap[fi];
+          }
+        }
+        consensusBaked = { chars, colors };
+      } else if (line === null) {
+        console.warn("[blim] file has no consensus section, consensus will be lazy");
+      } else {
+        throw new Error("parallel .blim: expected $consensus_data{ near offset " + consensusOffset + ", got: " + line);
+      }
+    } else {
+      console.warn("[blim] workers reported no section boundary, consensus will be lazy");
+    }
+    if (onProgress) onProgress(file.size, file.size);
+    return { meta, annotations, records, consensusBaked };
+  } finally {
+    workers.forEach((w) => w.terminate());
+    if (BLIM_WORKER_URL) {
+      URL.revokeObjectURL(BLIM_WORKER_URL);
+      BLIM_WORKER_URL = null;
+    }
+  }
+}
+
 // Streaming .slim parser: same state machine as parseSlim, but consumes lines
-// from readFileLines — a multi-GB project never becomes one giant string.
+// from readFileLines, a multi-GB project never becomes one giant string.
 // Cells whose saved background equals the alphabet default are not stored as
 // per-cell overrides, which is what keeps huge projects inside the heap.
 async function parseSlimStream(file, onProgress) {
@@ -10429,7 +14236,7 @@ async function parseSlimStream(file, onProgress) {
       }
       if (section !== "consensus" && line[0] === "%") {
         finishRow();
-        // flat header copy — a substring slice would pin its 1MB read chunk
+        // flat header copy, a substring slice would pin its 1MB read chunk
         cur = { key: line.substring(1).split("").join(""), chars: [], colors: {}, pairs: [] };
         col = 0;
         continue;
@@ -10447,7 +14254,7 @@ async function parseSlimStream(file, onProgress) {
         const def = defaults()[ch.toUpperCase()] || "#FFFFFF";
         if (bgHex !== def) cur.pairs.push(col, paletteIndexFor(bgHex)); // only genuine overrides are stored
       }
-      col++; // per LINE — one column per cell line
+      col++; // per LINE, one column per cell line
     }
   }
   finishRow(); // tolerate a missing final "}"
@@ -10459,8 +14266,125 @@ async function parseSlimStream(file, onProgress) {
   return { records, annotations, consensusOverrides, consensusColors, ...meta };
 }
 
+// adjust the retained dense load plane for rows about to be REMOVED (sign -1) or
+// ADDED (sign +1). Keeps lp.rows exact so applyShadeWithWarmup's freshness check
+// and every decision-only plane consumer stay valid through row edits.
+function adjustLoadPlaneForRows(tabState, rows, sign) {
+  const lp = tabState.loadPlane;
+  if (!lp) return;
+  for (const rec of rows) {
+    const len = rec.seq.length;
+    if (len > lp.cols) lp.cols = len; // widen: columns past the old width were all-gap until now
+    for (let c = 0; c < len; c++) {
+      let code = colCodeAt(rec, c);
+      lp.counts[(c << lp.shift) + lp.toDense[code < 256 ? code : 255]] += sign;
+    }
+    for (let c = len; c < lp.cols; c++) lp.counts[(c << lp.shift) + lp.gapSlot] += sign;
+  }
+  lp.rows += sign * rows.length;
+}
+
+// THE Simple (default) consensus rule, computed plane-direct: unique argmax over
+// the alphabet → uppercase when its share ≥ (rows−1)/rows, else lowercase; a tie
+// for the top count → space; OTHER-bucket columns fall back to an exact row scan
+// (null on virtual tabs, no lazy O(rows) there). charSet order decides ties, so
+// keep alphabet order here. Shared by read-in, post-delete recompute, and the modal.
+function simpleConsensusDecision(counts, charSet, seqNum, alphabet) {
+  let bestI = -1,
+    bestCount = -1,
+    tie = false;
+  for (let i = 0; i < charSet.length; i++) {
+    const n = counts[i];
+    if (n > bestCount) {
+      bestCount = n;
+      bestI = i;
+      tie = false;
+    } else if (n === bestCount) tie = true;
+  }
+  if (bestI < 0 || tie || bestCount <= 0) return " ";
+  const ch = charSet[bestI];
+  return bestCount >= seqNum - 1 ? ch : ch.toLowerCase(); // ≥ (N−1)/N, integer-exact
+}
+
+const tabState0 = (records) => ({ alphabet: detectAlphabet(records) }); // pre-tab alphabet for load-time consensus
+
+// per-column Simple chars from the dense load plane. OTHER-bucket columns get an
+// exact scan (or " " on virtual tabs). Returns Uint8Array of char codes.
+function simpleConsensusCharsFromPlane(plane, records, tabState) {
+  const { counts, shift, toDense, otherSlot, cols, rows: seqNum } = plane;
+  const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
+  const charSet = alphaList.map((e) => e.code);
+  const setSlots = charSet.map((ch) => toDense[ch.toUpperCase().charCodeAt(0)]);
+  const chars = new Uint8Array(cols);
+  for (let c = 0; c < cols; c++) {
+    const base = c << shift;
+    let ch;
+    if (counts[base + otherSlot] > 0) {
+      ch = records ? simpleConsensusColumnExact(records, c, charSet, seqNum) : " "; // virtual: no lazy scan
+    } else {
+      const colCounts = new Array(charSet.length);
+      for (let i = 0; i < charSet.length; i++) colCounts[i] = counts[base + setSlots[i]];
+      ch = simpleConsensusDecision(colCounts, charSet, seqNum, tabState.alphabet);
+    }
+    chars[c] = ch.charCodeAt(0);
+  }
+  return chars;
+}
+
+// exact per-column Simple char by row scan, dense-OTHER columns only (rare).
+function simpleConsensusColumnExact(records, col, charSet, seqNum) {
+  const counts = charSet.map(() => 0);
+  for (const rec of records) {
+    let code = colCodeAt(rec, col);
+    if (code >= 97 && code <= 122) code -= 32;
+    const i = charSet.indexOf(String.fromCharCode(code));
+    if (i >= 0) counts[i]++;
+  }
+  return simpleConsensusDecision(counts, charSet, seqNum);
+}
+
+// Recompute Simple consensus after row edits and re-bake the tab. Dense plane when
+// fresh (instant), 256-slot sweep otherwise (progress over rows). Caller owns the
+// overlay, this never blocks long enough for a watchdog on its own.
+function recomputeSimpleConsensus(tabState, prog) {
+  const records = tabState.records;
+  const rowCount = records.length;
+  let colCount = 1;
+  for (const rec of records) if (rec.seq.length > colCount) colCount = rec.seq.length;
+  const lp = tabState.loadPlane;
+  const lpFresh = lp && lp.rows === rowCount && lp.cols >= colCount;
+  let chars;
+  if (lpFresh) {
+    chars = simpleConsensusCharsFromPlane(lp, records, tabState);
+  } else {
+    const plane = columnCountsPlane(records, colCount, (d) => prog && prog.setProgress(d, rowCount));
+    chars = simpleConsensusCharsFromPlane256(plane, colCount, records, tabState);
+  }
+  tabState.consensusBaked = { chars, colors: null };
+  tabState.consensusOverrides = {};
+  tabState.consensusCols = null; // drop the per-column memo so the new bake shows
+}
+
+// 256-slot sweep-plane twin of simpleConsensusCharsFromPlane (no OTHER bucket —
+// every code is exact; >255 codes read as " ").
+function simpleConsensusCharsFromPlane256(plane, cols, records, tabState) {
+  const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
+  const charSet = alphaList.map((e) => e.code);
+  const setCodes = charSet.map((ch) => ch.toUpperCase().charCodeAt(0));
+  const seqNum = records.length;
+  const chars = new Uint8Array(cols);
+  for (let c = 0; c < cols; c++) {
+    const base = c << 8;
+    const colCounts = new Array(charSet.length);
+    for (let i = 0; i < charSet.length; i++) colCounts[i] = plane[base + setCodes[i]];
+    chars[c] = simpleConsensusDecision(colCounts, charSet, seqNum).charCodeAt(0);
+  }
+  return chars;
+}
+
 async function openFileContent(displayName, fileOrText) {
   const prog = showProgressOverlay("Loading " + displayName);
+  const t0 = performance.now();
   const tick = () => new Promise((r) => setTimeout(r, 0));
   try {
     prog.setLabel("Reading file...");
@@ -10469,13 +14393,14 @@ async function openFileContent(displayName, fileOrText) {
 
     let text = null;
     let records = null;
+    let parallelPlane = null;
 
     if (typeof fileOrText === "string") {
       text = fileOrText.replace(/\r/g, "");
     } else if (fileOrText.stream) {
       const head = await fileOrText.slice(0, 5).text();
       if (head === ".slim") {
-        // projects stream too — multi-GB .slim files never become one string
+        // projects stream too, multi-GB .slim files never become one string
         prog.setLabel("Parsing project...");
         const parsed = await parseSlimStream(fileOrText, (done, total) =>
           prog.setProgress(0.2 + (done / total) * 0.5, 1)
@@ -10492,12 +14417,60 @@ async function openFileContent(displayName, fileOrText) {
         return;
       } else if (head === ".blim" || head === ".bcmm") {
         prog.setLabel("Parsing project...");
-        const parsed = await parseBlimStream(fileOrText, (doneBytes, total) =>
-          prog.setProgress(0.2 + (doneBytes / total) * 0.5, 1)
-        );
+        let parsed = null;
+        if (typeof Worker !== "undefined" && fileOrText.size >= PARALLEL_PARSE_MIN) {
+          try {
+            parsed = await parseBlimParallel(fileOrText, (doneBytes, total) =>
+              prog.setProgress(0.2 + (doneBytes / total) * 0.5, 1)
+            );
+          } catch (err) {
+            console.warn("[blim] parallel parse failed, falling back to single-thread:", err);
+          }
+        }
+        if (!parsed) {
+          parsed = await parseBlimStream(fileOrText, (doneBytes, total) =>
+            prog.setProgress(0.2 + (doneBytes / total) * 0.5, 1)
+          );
+        }
         prog.setLabel("Building tab...");
         prog.setProgress(0.75, 1);
         await tick();
+        console.log(
+          "[blim] consensusBaked:",
+          parsed.consensusBaked ? "yes (" + parsed.consensusBaked.chars.length + " cols)" : "NULL, lazy consensus",
+          "| seqCodes:",
+          parsed.records[0] && parsed.records[0].seqCodes ? "bytes" : "string",
+          "| rows:",
+          parsed.records.length
+        );
+        let seqMB = 0,
+          colMB = 0,
+          colRows = 0;
+        for (const r of parsed.records) {
+          if (r.seqCodes) seqMB += r.seqCodes.byteLength;
+          if (r.colorIdx) {
+            colMB += r.colorIdx.byteLength;
+            colRows++;
+          }
+          if (r.colorPacked) {
+            colMB += r.colorPacked.byteLength;
+            colRows++;
+          }
+        }
+        console.log(
+          "[blim] consensusBaked:",
+          parsed.consensusBaked ? "yes (" + parsed.consensusBaked.chars.length + " cols)" : "NULL, lazy consensus",
+          "| rows:",
+          parsed.records.length,
+          "| seq:",
+          (seqMB / 2 ** 20) | 0,
+          "MB",
+          "| colorIdx:",
+          (colMB / 2 ** 20) | 0,
+          "MB across",
+          colRows,
+          "rows"
+        );
         createTab(displayName.replace(/\.blim$/i, ""), parsed.records, {
           annotations: parsed.annotations,
           consensusOverrides: {},
@@ -10510,16 +14483,63 @@ async function openFileContent(displayName, fileOrText) {
           liveHover: true,
           refreshDelay: 0,
           shadeCleared: true, // baked colors: white cells render white, everything else is an explicit override
-          consensusBaked: parsed.consensusBaked
+          consensusBaked: parsed.consensusBaked,
+          colorPack: parsed.colorPack || null // packed color planes resolve through this palette
         });
         prog.setProgress(1, 1);
         return;
       } else {
+        if (fileOrText.size >= (window.SS_VIRTUAL_MIN || VIRTUAL_MIN_BYTES) && typeof Worker !== "undefined") {
+          try {
+            prog.setLabel("Indexing sequences…");
+            const vix = await parseFastaVirtualIndex(fileOrText, (done, total) =>
+              prog.setProgress(0.2 + (done / total) * 0.5, 1)
+            );
+            if (vix) {
+              prog.setLabel("Building tab…");
+              prog.setProgress(0.75, 1);
+              await tick;
+              createTab(displayName, vix.records, {
+                alphabet: vix.alphabet,
+                refreshDelay: 0,
+                consensusBaked: {
+                  chars: simpleConsensusCharsFromPlane(vix.plane, null, { alphabet: vix.alphabet }), // Simple parity; records=null → OTHER columns " "
+                  colors: new Uint16Array(vix.maxLen)
+                },
+                loadPlane: vix.plane, // virtual tabs warm every shade mode from this
+                virtual: vix.vsrc
+              });
+              for (let r = 0; r < Math.min(200, vix.vsrc.rowCount); r++) vix.vsrc.peekRow(r); // pre-warm the first viewport, initial paint won't be placeholders
+              prog.setProgress(1, 1);
+              return;
+            }
+            console.warn("[virtual] index declined (wide chars / unaligned / >262144 cols), resident load");
+          } catch (err) {
+            console.warn("[virtual] index failed, loading resident", err);
+          }
+        }
         prog.setLabel("Parsing sequences...");
-        records = await parseFastaStream(fileOrText, (done, total) => prog.setProgress(0.2 + (done / total) * 0.5, 1));
+        if (typeof Worker !== "undefined" && fileOrText.size >= PARALLEL_PARSE_MIN) {
+          try {
+            const out = await parseFastaParallel(fileOrText, (done, total) =>
+              prog.setProgress(0.2 + (done / total) * 0.5, 1)
+            );
+            records = out.records;
+            parallelPlane = out.plane;
+          } catch (err) {
+            console.warn("[fasta] parallel parse failed, falling back to single-thread:", err);
+            records = await parseFastaStream(fileOrText, (done, total) =>
+              prog.setProgress(0.2 + (done / total) * 0.5, 1)
+            );
+          }
+        } else {
+          records = await parseFastaStream(fileOrText, (done, total) =>
+            prog.setProgress(0.2 + (done / total) * 0.5, 1)
+          );
+        }
       }
     } else {
-      // ancient browser without File.stream — whole-read fallback
+      // ancient browser without File.stream, whole-read fallback
       text = await readFileWithProgress(fileOrText, (done, total) => prog.setProgress((done / total) * 0.2, 1));
     }
 
@@ -10590,11 +14610,16 @@ async function openFileContent(displayName, fileOrText) {
             ? createTab(displayName, records, {
                 alphabet: pre.alphabet,
                 refreshDelay: 0,
-                consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) }
+                ...(pre.chars
+                  ? {
+                      consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) },
+                      loadPlane: pre.plane // retained: simple/clustal modal never re-sweeps
+                    }
+                  : {})
               })
             : createTab(displayName, records);
           prog2.setProgress(1, 1);
-          setTimeout(() => maybeOfferDereplication(tabApi), 0);
+          //setTimeout(() => maybeOfferDereplication(tabApi), 0);
         } finally {
           prog2.close();
         }
@@ -10603,23 +14628,40 @@ async function openFileContent(displayName, fileOrText) {
     }
 
     prog.setLabel("Computing consensus...");
-    const pre = await precomputeLoadPass(records, (done, total) => prog.setProgress(0.7 + (done / total) * 0.05, 1));
-    prog.setLabel("Building tab...");
+    if (parallelPlane && parallelPlane.cols !== maxLen) parallelPlane = null; // defensive: plane width must match
+    const pre = parallelPlane
+      ? {
+          chars: simpleConsensusCharsFromPlane(parallelPlane, records, tabState0(records)),
+          alphabet: detectAlphabet(records),
+          plane: parallelPlane
+        }
+      : await precomputeLoadPass(records, (done, total) => prog.setProgress(0.7 + (done / total) * 0.05, 1));
     prog.setProgress(0.75, 1);
     await tick();
     const tabApi = pre
       ? createTab(displayName, records, {
           alphabet: pre.alphabet,
           refreshDelay: 0,
-          // zero colors plane: 0 is the "no baked value" sentinel everywhere, so no
-          // null-guards needed in the consensus track or onDataChanged
-          consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) }
+          ...(pre.chars
+            ? {
+                consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) },
+                loadPlane: pre.plane // retained!!! simple/clustal modals never re-sweep
+              }
+            : {})
         })
-      : createTab(displayName, records); // string rows: legacy lazy everything
+      : createTab(displayName, records);
     prog.setProgress(1, 1);
-    setTimeout(() => maybeOfferDereplication(tabApi), 0);
+    //setTimeout(() => maybeOfferDereplication(tabApi), 0);
   } finally {
     prog.close();
+    const bytes = typeof fileOrText === "string" ? fileOrText.length : fileOrText.size || 0;
+    console.log(
+      "[load]",
+      displayName,
+      bytes ? "(" + (bytes / 2 ** 20).toFixed(0) + " MB)" : "",
+      "in",
+      ((performance.now() - t0) / 1000).toFixed(1) + "s"
+    );
   }
 }
 
@@ -10745,7 +14787,7 @@ document.getElementById("fileInput").onchange = (e) => {
 
 document.getElementById("useExamplesBtn").addEventListener("click", showExamplesModal);
 
-// Startup flourish 
+// Startup flourish
 (() => {
   const titleLink = document.getElementById("titleLink");
   const halo = document.getElementById("clickMeHalo");
@@ -10792,7 +14834,7 @@ document.getElementById("useExamplesBtn").addEventListener("click", showExamples
   });
 })();
 
-// Color picker memory (recent colors, app-wide) 
+// Color picker memory (recent colors, app-wide)
 const RECENT_COLORS_MAX = 12;
 let recentColors = []; // in-memory only: per tab, cleared on reload
 
@@ -10841,7 +14883,7 @@ function buildColorMemoryStrip(input) {
     input.value = sw.dataset.hex;
     input.dispatchEvent(new Event("input", { bubbles: true })); // live-apply modals (shade, regex, legend)
     input.dispatchEvent(new Event("change", { bubbles: true }));
-    // cell editor applies on its Apply button — click it for one-swatch application
+    // cell editor applies on its Apply button, click it for one-swatch application
     const popup = input.closest(".cell-edit-popup");
     const applyBtn = popup && popup.querySelector(".cell-edit-apply-btn");
     if (applyBtn) applyBtn.click();
