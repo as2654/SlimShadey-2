@@ -597,6 +597,14 @@ const SUBSTITUTION_MATRICES = {
   }
 };
 
+// Loading-diagnostic safety net: surface errors that escape the page's own handlers
+window.addEventListener("error", (e) =>
+  console.error("[load-watch] uncaught:", e.message, e.filename + ":" + e.lineno)
+);
+window.addEventListener("unhandledrejection", (e) =>
+  console.error("[load-watch] unhandled rejection:", e.reason && e.reason.stack ? e.reason.stack : e.reason)
+);
+
 function getSubstitutionScore(matrixName, charA, charB) {
   const m = SUBSTITUTION_MATRICES[matrixName];
   if (!m) return 0;
@@ -859,7 +867,10 @@ function detectAlphabet(records) {
   const N = records.length;
   if (!N) return "nucleotide";
   let total = 0;
-  for (let i = 0; i < N; i++) total += records[i].seq.length; // facades: O(1) reads
+  for (let i = 0; i < N; i++) {
+    const rec = records[i];
+    total += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first — .seq fires the lazy facade getter on every row
+  }
   const exact = total <= 50e6; // same gate as the byte-row conversion: below it, exactness is free
   const stride = exact ? 1 : Math.max(1, Math.floor(N / DETECT_MAX_ROWS));
   const cap = exact ? Infinity : DETECT_BASES_PER_ROW;
@@ -1969,12 +1980,10 @@ async function scanOnMain(records, reps, patterns, degap, overlap, onProgress) {
     let text,
       colMap = null;
     if (degap) {
-      const d = degapWithColMap(rec.seq, rec.seqCodes);
+      const d = degapWithColMap(rec.seqCodes ? null : rec.seq, rec.seqCodes); // argument evaluation fires the facade — gate it
       text = d.degapped.toUpperCase();
       colMap = d.colMap;
-    } else {
-      text = String(rec.seq);
-    }
+    } else text = rec.seqCodes ? SEQ_FACADE_DECODER.decode(rec.seqCodes) : String(rec.seq);
     let map = null;
     for (const { re, key } of scanners) {
       re.lastIndex = 0;
@@ -2315,10 +2324,12 @@ async function regexSearchWithProgress(pattern, tabState, onMatch) {
     for (let start = 0; start < total; start += CHUNK) {
       const end = Math.min(start + CHUNK, total);
       for (let r = start; r < end; r++) {
+        const rec = records[r];
+        const text = rec.seqCodes ? SEQ_FACADE_DECODER.decode(rec.seqCodes) : rec.seq; // transient string — rec.seq would fire the lazy facade per row
         re.lastIndex = 0;
         let m;
-        while ((m = re.exec(records[r].seq)) !== null) {
-          if (onMatch) onMatch(r, m, records[r]);
+        while ((m = re.exec(text)) !== null) {
+          if (onMatch) onMatch(r, m, rec);
           matches.push({ row: r, index: m.index, text: m[0] });
           if (m[0].length === 0) re.lastIndex++; // zero-width safety
           if (cancelled) break;
@@ -2473,6 +2484,8 @@ async function scoreRowsParallel(records, scores, refCodes, T, isNuc, prog, tota
 // O(cells), so progress and yields are per-CELL. Byte-row tabs score in workers
 // past 64M cells (pull-based batches, transferred copies); string tabs and small
 // tabs take the serial path. Ties keep pre-sort order (stable sort).
+// Facade rule: NO all-rows .seq reads — rec.seq fires the lazy facade getter.
+// Codes-first everywhere; Uint8Array(length) zero-fill preserves facade OOB "-".
 async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
   if (virtualGate(tabState, "Sort by similarity")) return;
   const ref = tabState.records.find((r) => r.id === refId);
@@ -2487,9 +2500,9 @@ async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
   const isNuc = tabState.alphabet === "nucleotide";
   const matrix = isNuc ? null : SUBSTITUTION_MATRICES[matrixName] ? matrixName : "BLOSUM62";
   const prog = showProgressOverlay("Sorting by similarity");
-  const refLen = ref.seq.length;
+  const refLen = ref.seqCodes ? ref.seqCodes.length : ref.seq.length; // no facade
   let totalCells = 0;
-  for (const rec of records) totalCells += Math.min(rec.seq.length, refLen);
+  for (const rec of records) totalCells += Math.min(rec.seqCodes ? rec.seqCodes.length : rec.seq.length, refLen);
   prog.setLabel(`Scoring ${N.toLocaleString()} sequences${isNuc ? " (identity)" : ` (${matrix})`}…`);
   prog.setProgress(0, Math.max(1, totalCells));
   await new Promise((r) => setTimeout(r, 50)); // let the overlay paint
@@ -2532,9 +2545,9 @@ async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
       let doneCells = 0;
       for (let r = 0; r < N; r++) {
         const rec = records[r];
-        const len = Math.min(rec.seq.length, refLen);
         const codes = rec.seqCodes || null;
-        const s = codes ? null : rec.seq;
+        const s = codes ? null : rec.seq; // codes-first — .seq would fire the facade
+        const len = Math.min(codes ? codes.length : s.length, refLen);
         let score = 0;
         for (let c0 = 0; c0 < len; c0 += CELL_CHUNK) {
           const c1 = Math.min(len, c0 + CELL_CHUNK);
@@ -2569,7 +2582,7 @@ async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
     const order = records.map((_, i) => i).sort((x, y) => scores[y] - scores[x]);
     const sorted = order.map((i) => records[i]);
     records.length = 0;
-    records.push(...sorted);
+    for (let i = 0; i < sorted.length; i++) records.push(sorted[i]); // no spread — push(...6.7M) overflows the argument budget
     console.log(
       "[sort] applied. identity order?",
       order.every((v, i) => v === i)
@@ -3161,6 +3174,26 @@ function makeSeqFacade(codes) {
   });
 }
 
+// The lazy seq accessor lives ONCE on a shared prototype instead of per record —
+// 16M defineProperty-with-accessor calls (and the slow-object churn they cause)
+// become plain two-slot records with a prototype link.
+const BYTE_ROW_PROTO = {};
+Object.defineProperty(BYTE_ROW_PROTO, "seq", {
+  configurable: true,
+  get() {
+    const f = makeSeqFacade(this.seqCodes);
+    Object.defineProperty(this, "seq", { value: f, writable: true, configurable: true, enumerable: true });
+    return f;
+  },
+  set(v) {
+    Object.defineProperty(this, "seq", { value: v, writable: true, configurable: true, enumerable: true });
+  }
+});
+
+function attachLazyFacade(rec) {
+  Object.setPrototypeOf(rec, BYTE_ROW_PROTO);
+}
+
 // ===== Virtual rows: FASTA too big for RAM keeps rows in the File and pages them =====
 //const VIRTUAL_MIN_BYTES = 6 * 2 ** 30; // console override: window.SS_VIRTUAL_MIN
 const VIRTUAL_MIN_BYTES = Number.POSITIVE_INFINITY; // opt-in only: window.SS_VIRTUAL_MIN in the console enables virtual mode
@@ -3315,15 +3348,15 @@ function makeVirtualSeqFacade(vsrc, row, len) {
     },
     slice: (a, b) => {
       const c = peek();
-      return c ? SEQFACADEDECODER.decode(c.subarray(a, b)) : "";
+      return c ? SEQ_FACADE_DECODER.decode(c.subarray(a, b)) : "";
     },
     toString: () => {
       const c = peek();
-      return c ? SEQFACADEDECODER.decode(c) : "";
+      return c ? SEQ_FACADE_DECODER.decode(c) : "";
     },
     toUpperCase: () => {
       const c = peek();
-      return c ? SEQFACADEDECODER.decode(c).toUpperCase() : "";
+      return c ? SEQ_FACADE_DECODER.decode(c).toUpperCase() : "";
     }
   };
   return new Proxy(api, {
@@ -3585,7 +3618,9 @@ function showProgressOverlay(title) {
   };
 }
 
-// FASTA export: streams each record's sequence in ~1MB slices
+// FASTA export streams each record's sequence in 1MB slices. Rows decode
+// transiently from seqCodes — rec.seq would fire the lazy facade getter on
+// every row, and the cached facades would be retained after the export.
 async function exportFastaStreaming(records, filename) {
   const prog = showProgressOverlay("Exporting FASTA");
   try {
@@ -3593,17 +3628,18 @@ async function exportFastaStreaming(records, filename) {
       const tick = () => new Promise((r) => setTimeout(r, 0));
       let buf = "";
       const flush = async (force) => {
-        if (buf.length > 4000000 || (force && buf.length)) {
-          await sink.write(buf);
-          buf = "";
-          await tick();
-        }
+        if (buf.length < 4000000 && !force) return;
+        if (buf.length) await sink.write(buf);
+        buf = "";
+        await tick();
       };
       for (let r = 0; r < records.length; r++) {
         const rec = records[r];
-        buf += (r > 0 ? "\n" : "") + ">" + rec.header + "\n";
-        for (let off = 0; off < rec.seq.length; off += 1000000) {
-          buf += rec.seq.slice(off, off + 1000000);
+        const codes = rec.seqCodes;
+        const s = codes ? SEQ_FACADE_DECODER.decode(codes) : rec.seq; // transient — GC collects it, nothing retained
+        buf += (r === 0 ? "" : "\n") + ">" + rec.header + "\n";
+        for (let off = 0; off < s.length; off += 1000000) {
+          buf += s.slice(off, off + 1000000);
           await flush(false);
         }
         prog.setProgress(r + 1, records.length);
@@ -3669,8 +3705,25 @@ async function generateRtfV2(
   const SPACER = "  ";
   const MAX_INDEX_CHARS = 6;
 
-  const totalCharsPerRow = Math.round((fontSize / DEFAULT_FONTSIZE_RTF) * CHARS_PER_ROW_STD);
-  const charsPerRow = Math.max(1, totalCharsPerRow - 30);
+  // Line width must be exact: a wrapped row breaks the block layout.
+  // Geometry: \paperw11880 twips minus 650-twip margins; Courier New advances
+  // exactly 0.6 em -> fontSize * 12 twips per glyph at \fs fontSize*2.
+  const inset = 650;
+  const TEXT_WIDTH_TWIPS = 11880 - 2 * inset;
+  const GLYPH_TWIPS = fontSize * 12;
+
+  let maxNameChars = 0;
+  tabState.annotations.forEach((ann) => {
+    maxNameChars = Math.max(maxNameChars, ann.name.length);
+  });
+  tabState.records.forEach((rec) => {
+    maxNameChars = Math.max(maxNameChars, rec.header.length);
+  });
+  maxNameChars = Math.min(maxNameChars, maxNameCharsCap);
+
+  const headerGlyphs = maxNameChars + 2 + (showNumbering ? MAX_INDEX_CHARS : 0) + 2; // name + spacer + index + spacer
+  const SAFETY_GLYPHS = 2; // Word/LibreOffice/TextEdit metric drift
+  const charsPerRow = Math.max(1, Math.floor(TEXT_WIDTH_TWIPS / GLYPH_TWIPS) - headerGlyphs - SAFETY_GLYPHS);
 
   const hexToIndex = new Map();
   const dictionary = [];
@@ -3701,12 +3754,14 @@ async function generateRtfV2(
     });
   });
   tabState.records.forEach((rec, r) => {
+    const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+    const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
     rows.push({
       show: true,
       name: rec.header,
-      bgAt: (c) => resolveSeqColor(r, c, rec.seq[c] || "-"),
+      bgAt: (c) => resolveSeqColor(r, c, chAt(c)),
       cellAt: (c) => {
-        const ch = rec.seq[c] || "-";
+        const ch = chAt(c);
         const bgHex = resolveSeqColor(r, c, ch);
         return { ch, bgHex, fgHex: fgOf(bgHex) };
       }
@@ -3739,14 +3794,6 @@ async function generateRtfV2(
     }
   }
 
-  let maxNameChars = 0;
-  tabState.annotations.forEach((ann) => {
-    maxNameChars = Math.max(maxNameChars, ann.name.length);
-  });
-  tabState.records.forEach((rec) => {
-    maxNameChars = Math.max(maxNameChars, rec.header.length);
-  });
-  maxNameChars = Math.min(maxNameChars, maxNameCharsCap);
 
   const rowLabels = rows.map((row) => padOrTruncate(row.name, maxNameChars));
 
@@ -3775,7 +3822,6 @@ async function generateRtfV2(
   const setsOfRows = Math.max(1, Math.ceil(colCount / charsPerRow));
 
   // header / preamble (tiny), written once, up front
-  const inset = "650";
   await sink.write(
     [
       "{\\rtf1\\ansi\\deff0",
@@ -4027,13 +4073,15 @@ function renderAlignmentPng(
         }
         y += CH;
       }
-      // sequence rows, each cell's color resolved exactly once
+      // sequence rows — each cell's color resolved exactly once
       for (let r = 0; r < seqRows; r++, y += CH) {
         const rec = tabState.records[r];
+        const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+        const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
         const colors = new Array(c1 - c0);
-        for (let c = c0; c < c1; c++) colors[c - c0] = norm(resolveSeqColor(r, c, rec.seq[c] || "-"));
+        for (let c = c0; c < c1; c++) colors[c - c0] = norm(resolveSeqColor(r, c, chAt(c)));
         ctx.textAlign = "center";
-        drawRow(ctx, colors, (c) => rec.seq[c] || "-", c0, c1, nameW, y);
+        drawRow(ctx, colors, chAt, c0, c1, nameW, y);
       }
       // consensus row, resolve each column once, reused for color and char
       if (showConsensus) {
@@ -4224,11 +4272,13 @@ function svgForPrintPage(result, tabState, resolveSeqColor, resolveAnnoColor, re
       }
       for (let r = 0; r < seqRows; r++, y += CH) {
         const rec = tabState.records[r];
+        const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+        const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
         const colors = new Array(c1 - c0);
         const chars = new Array(c1 - c0);
         for (let c = c0; c < c1; c++) {
-          colors[c - c0] = norm(resolveSeqColor(r, c, rec.seq[c] || "-"));
-          chars[c - c0] = rec.seq[c] || "-";
+          colors[c - c0] = norm(resolveSeqColor(r, c, chAt(c)));
+          chars[c - c0] = chAt(c);
         }
         emitRow(colors, chars, y);
       }
@@ -5493,8 +5543,8 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
         buf += "$sequence_data{\n";
         for (let r = 0; r < tabState.records.length; r++) {
           const rec = tabState.records[r];
-          const codes = rec.seqCodes || null; // byte rows: raw reads, a facade trap per cell is a wall at this scale
-          buf += `%${rec.header}\n`;
+          const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+          buf += "%>" + rec.header + "\n";
           await writeCells((c) => {
             const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-";
             return { ch, bgHex: getSeqBgHex(r, c, ch) };
@@ -6494,7 +6544,8 @@ function showPrintPreviewModal(tabState, colCount, resolveSeqColor, resolveAnnoC
         first,
         baseName,
         (p) => renderAlignmentPng(tabState, colCount, resolveSeqColor, resolveAnnoColor, resolveConsensus, opts, p),
-        (resultObj) => svgForPrintPage(resultObj, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus)
+        (resultObj) => svgForPrintPage(resultObj, tabState, resolveSeqColor, resolveAnnoColor, resolveConsensus),
+        tabState
       );
     });
   });
@@ -6506,7 +6557,7 @@ function showPrintPreviewModal(tabState, colCount, resolveSeqColor, resolveAnnoC
   document.body.appendChild(overlay);
 }
 
-function showPngPreviewWindow(result, baseName, renderPage, renderSvg) {
+function showPngPreviewWindow(result, baseName, renderPage, renderSvg, tabState) {
   const MAXEDGE = 32767;
   const MAXAREA = 268435456;
   let current = result;
@@ -6704,7 +6755,15 @@ function buildSeqLogoSvg(tabState, colCount, opts) {
     const rgb = tabState.colors[tabState.alphabet][entry.code] || hexToRgbFloat(entry.hex);
     colorMap[entry.code] = rgbFloatToHex(rgb);
   });
-  const seqs = tabState.records.map((r) => r.seq.toUpperCase());
+  // windowed decode — never the full row, never the facade (rec.seq fires the lazy getter)
+  const seqs = tabState.records.map((r) => {
+    const codes = r.seqCodes;
+    if (codes)
+      return SEQ_FACADE_DECODER.decode(
+        codes.subarray(colOffset, Math.min(codes.length, colOffset + colCount))
+      ).toUpperCase();
+    return r.seq.slice(colOffset, colOffset + colCount).toUpperCase();
+  });
   const geom = { ORIGINX: 45, ORIGINY: 15, AXISWIDTH: 2, characterWidth, workingHeight };
   const width = geom.ORIGINX + colCount * characterWidth + 60;
   const height = geom.ORIGINY + workingHeight + 100;
@@ -6754,7 +6813,7 @@ function buildSeqLogoSvg(tabState, colCount, opts) {
   // onto the cell, the same squeeze/stretch as drawScaledGlyph, but vector)
   for (let index = 0; index < colCount; index++) {
     const column = [];
-    for (const seq of seqs) column.push(seq[index + colOffset] || "-");
+    for (const seq of seqs) column.push(seq[index] || "-"); // pre-sliced — no colOffset here
     const { freq, infoContent } = computeColumnLogoInfo(column, alphabetKeys, alphabetSize, useError);
     const columnWorkingHeight = maxInfo > 0 ? (infoContent / maxInfo) * actualWorkingHeight : 0;
     const entries = alphabetKeys
@@ -6794,11 +6853,19 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
     colorMap[entry.code] = rgbFloatToHex(rgb);
   });
 
-  const seqs = tabState.records.map((r) => r.seq.toUpperCase());
+  // windowed decode — never the full row, never the facade (rec.seq fires the lazy getter)
+  const seqs = tabState.records.map((r) => {
+    const codes = r.seqCodes;
+    if (codes)
+      return SEQ_FACADE_DECODER.decode(
+        codes.subarray(colOffset, Math.min(codes.length, colOffset + colCount))
+      ).toUpperCase();
+    return r.seq.slice(colOffset, colOffset + colCount).toUpperCase();
+  });
   const columns = [];
   for (let c = 0; c < colCount; c++) {
     const col = [];
-    for (const seq of seqs) col.push(seq[c + colOffset] || "-");
+    for (const seq of seqs) col.push(seq[c] || "-"); // seqs are pre-sliced to the window — no colOffset here
     columns.push(col);
   }
 
@@ -9693,6 +9760,7 @@ function createTab(name, records, presetState = null) {
     matrixCache: null,
     clustalXColors: null
   };
+  console.log("[createTab] state ready,", tabState.records.length, "rows");
 
   const invalidateMotifCaches = () => {
     for (const key of ["regex", "scanprosite"]) {
@@ -9715,16 +9783,18 @@ function createTab(name, records, presetState = null) {
   // already emits byte rows; this covers FASTA and .slim imports.
   {
     let totalCells = 0;
-    for (const rec of tabState.records) totalCells += rec.seq.length;
+    for (const rec of tabState.records) totalCells += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first — rec.seq would fire the lazy getter on 6M rows
     if (totalCells > 50e6) {
       for (const rec of tabState.records) {
-        if (typeof rec.seq !== "string") continue; // loader already emitted a byte row
+        if (rec.seqCodes || typeof rec.seq !== "string") continue; // byte rows (and lazy-facade rows) need no conversion — and typeof rec.seq would fire the getter
         const codes = encodeRowToBytes(rec.seq);
         if (codes) {
           rec.seqCodes = codes;
-          rec.seq = makeSeqFacade(codes); // the old string becomes collectable here
+          //rec.seq = makeSeqFacade(codes); // the old string becomes collectable here
+          attachLazyFacade(rec); // the old string becomes collectable here
         }
       }
+      console.log("[createTab] byte rows settled");
     }
   }
 
@@ -9840,6 +9910,8 @@ function createTab(name, records, presetState = null) {
     </div>`;
   document.getElementById("tabPanels").appendChild(panel);
   activateTab(tabId, btn);
+
+  console.log("[createTab] DOM mounted");
 
   // DOM refs
   const msaContainerEl = panel.querySelector(".msa-container");
@@ -10102,10 +10174,11 @@ function createTab(name, records, presetState = null) {
 
   function exportColumnsAsNewTab(lo, hi) {
     const newRecords = tabState.records.map((rec, r) => {
+      const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
       const newSeq = [];
       const newCharColors = {};
       for (let c = lo; c <= hi; c++) {
-        const ch = rec.seq[c] || "-";
+        const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-";
         newSeq.push(ch);
         const override = recordColorAt(rec, c);
         const bgHex = override || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
@@ -10396,7 +10469,7 @@ function createTab(name, records, presetState = null) {
             next.set(rec.seqCodes.subarray(0, lo), 0);
             next.set(rec.seqCodes.subarray(Math.min(hi + 1, L)), lo);
             rec.seqCodes = next;
-            rec.seq = makeSeqFacade(next);
+            attachLazyFacade(rec); // keep facades lazy — an eager one here re-inflates every row on each deletion
           }
         } else if (rec.seq.length > lo) {
           rec.seq = rec.seq.slice(0, lo) + rec.seq.slice(hi + 1);
@@ -10523,7 +10596,8 @@ function createTab(name, records, presetState = null) {
             rowCount: tabState.records.length,
             getColor: (r, c) => {
               const rec = tabState.records[r];
-              const ch = rec.seq[c] || "-";
+              const codes = rec.seqCodes;
+              const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-"; // codes-first — the Reset snapshot walks every row
               return recordColorAt(rec, c) || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
             },
             setColor: (r, c, hex) => {
@@ -10554,7 +10628,15 @@ function createTab(name, records, presetState = null) {
       hScrollTrack.scrollLeft += delta * hScrollScale;
     },
     onCopyColumns: (lo, hi) => {
-      const text = tabState.records.map((rec) => ">" + rec.header + "\n" + rec.seq.slice(lo, hi + 1)).join("\n");
+      const text = tabState.records
+        .map((rec) => {
+          const codes = rec.seqCodes; // codes-first — rec.seq would fire the lazy facade on every row
+          const slice = codes
+            ? SEQ_FACADE_DECODER.decode(codes.subarray(lo, Math.min(codes.length, hi + 1)))
+            : rec.seq.slice(lo, hi + 1);
+          return ">" + rec.header + "\n" + slice;
+        })
+        .join("\n");
       const done = () => {
         hoverInfoEl.textContent = `Copied columns ${lo + 1}\u2013${hi + 1} (${tabState.records.length} sequences)`;
       };
@@ -10593,6 +10675,8 @@ function createTab(name, records, presetState = null) {
       tabState.sequenceCache = null;
     }
   });
+
+  console.log("[createTab] renderer up");
 
   // dismiss column selection AND its popup on any interaction outside the selection drag
   panel.addEventListener(
@@ -10674,6 +10758,8 @@ function createTab(name, records, presetState = null) {
     isActive: () => panel.classList.contains("active")
   });
   const stripDestroyers = [overviewStrip, conservationStrip, logoStrip];
+
+  console.log("[createTab] strips up");
 
   const ro = new ResizeObserver(() => {
     if (!panel.classList.contains("active")) return; // hidden panels are 0-sized; they re-sync on activation
@@ -11388,11 +11474,14 @@ function createTab(name, records, presetState = null) {
           tabState.shadeCleared = true; // sequences render white via getShadeColor
           tabState.records.forEach((rec) => {
             rec.colorIdx = null;
+            rec.colorPacked = null; // baked .blim color plane
+            rec.colorSparse = null; // painted layer on top of packed
           });
           tabState.annotations.forEach((ann) => {
             ann.colors = {};
           });
           tabState.consensusColors = {};
+          if (tabState.consensusBaked) tabState.consensusBaked.colors = null; // baked consensus plane rides along
           const sp = tabState.shadeConfig.scanprosite,
             rx = tabState.shadeConfig.regex;
           sp.hitsByRow = null;
@@ -11485,6 +11574,8 @@ function createTab(name, records, presetState = null) {
   updateAlignmentHeight();
   updateHScrollSpacer();
   alignmentCtl.onScroll(realVScroll(), realHScroll());
+
+  console.log("[createTab] complete");
 
   return { refreshAfterRecordsChanged, tabState }; // tabState lets callers operate on the exact array the tab renders
 }
@@ -12025,6 +12116,12 @@ function showDereplicationModal(tabState, refreshFn, dupeIndices) {
   msgRow.textContent = "Duplicate sequences detected. Declutter the UI by dereplicating these?";
   box.appendChild(msgRow);
 
+  const warnRow = document.createElement("div");
+  warnRow.className = "shade-row";
+  warnRow.style.color = "#f66";
+  warnRow.textContent = "This operation is permanent, and collapsed sequences cannot be recovered.";
+  box.appendChild(warnRow);
+
   const detailRow = document.createElement("div");
   detailRow.className = "shade-row";
   detailRow.style.color = "#999";
@@ -12042,7 +12139,8 @@ function showDereplicationModal(tabState, refreshFn, dupeIndices) {
     const dupeSet = new Set(dupeIndices);
     const keep = records.filter((_, i) => !dupeSet.has(i));
     records.length = 0; // same array object, identity preserved for the tab
-    records.push(...keep);
+    //records.push(...keep);
+    for (const rec of keep) records.push(rec); // no spread — push(...6.7M) overflows the argument budget
     refreshFn();
   });
 
@@ -12222,9 +12320,28 @@ async function parseStripe(file, start, end, report, emitRows) {
 
   const flushRows = () => {
     if (!headers.length) return;
-    const transfers = [];
-    for (const c of codes) if (c) transfers.push(c.buffer);
-    emitRows(headers.slice(), codes.slice(), strings.slice(), transfers);
+    // arena packing: one backing store per 256MB batch, not one per row.
+    // Per-row stores pay allocator rounding (29833B rows land in 32KB bins)
+    // and blow the engine's typed-array reservation at 10M+ rows.
+    let total = 0;
+    for (const c of codes) if (c) total += (c.length + 3) & ~3; // 4-byte aligned offsets keep hashCodes' word-wise path legal
+    const arena = new Uint8Array(total);
+    const offs = new Uint32Array(codes.length);
+    const lens = new Uint32Array(codes.length);
+    let o = 0;
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i];
+      if (c) {
+        o = (o + 3) & ~3;
+        arena.set(c, o);
+        offs[i] = o;
+        lens[i] = c.length;
+        o += c.length;
+      } else {
+        offs[i] = 0xffffffff; // wide/string row sentinel — its text lives in strings[i]
+      }
+    }
+    emitRows(headers.slice(), strings.slice(), arena, offs, lens, [arena.buffer, offs.buffer, lens.buffer]);
     headers.length = 0; codes.length = 0; strings.length = 0; batchBytes = 0;
   };
 
@@ -12389,7 +12506,8 @@ onmessage = async (e) => {
     const r = await parseStripe(
       file, start, end,
       (done) => postMessage({ type: "progress", index, done }),
-      (headers, codes, strings, transfers) => postMessage({ type: "rows", index, headers, codes, strings }, transfers)
+      (headers, strings, arena, offs, lens, transfers) =>
+        postMessage({ type: "rows", index, headers, strings, arena, offs, lens }, transfers)
     );
     postMessage({
       type: "done", index, start, end,
@@ -12629,8 +12747,14 @@ async function parseFastaVirtualIndex(file, onProgress) {
       nonNuc = nonNuc || p.nonNuc;
       if (p.maxLen > maxLen) maxLen = p.maxLen;
     }
-    if (!total) return null;
-    if (hadWide || parts.some((p) => !p.planeCounts) || maxLen > 262144) return null;
+    if (!total) {
+      console.warn("[virtual] decline: zero rows indexed");
+      return null;
+    }
+    if (hadWide || parts.some((p) => !p.planeCounts) || maxLen > 262144) {
+      console.warn("[virtual] decline:", { hadWide, planeMissing: parts.some((p) => !p.planeCounts), maxLen });
+      return null;
+    }
     const headers = new Array(total);
     const offs = new Float64Array(total);
     const lens = new Uint32Array(total);
@@ -12643,8 +12767,15 @@ async function parseFastaVirtualIndex(file, onProgress) {
           lens[o] = b.lens[i];
           o++;
         }
-    if (o !== total) return null;
-    for (let r = 0; r < N0(total); r++) if (lens[r] !== maxLen) return null; // unaligned → resident flow owns the warning
+    if (o !== total) {
+      console.warn("[virtual] decline: row assembly", o, "!=", total);
+      return null;
+    }
+    for (let r = 0; r < N0(total); r++)
+      if (lens[r] !== maxLen) {
+        console.warn("[virtual] decline: unaligned at row", r, "—", lens[r], "vs", maxLen);
+        return null;
+      }
     const plane = mergePlanes(parts, maxLen); // existing merger, same shape
     const vsrc = makeVirtualRowSource(file, offs, lens);
     const records = new Array(total);
@@ -13012,7 +13143,10 @@ async function parseFastaStream(file, onProgress) {
       records.push({ header: cur.header, seq: cur.parts.join("") });
     } else {
       const codes = cur.len === cur.cap ? cur.codes : cur.codes.slice(0, cur.len);
-      records.push({ header: cur.header, seqCodes: codes, seq: makeSeqFacade(codes) });
+      //records.push({ header: cur.header, seqCodes: codes, seq: makeSeqFacade(codes) });
+      const rec = { header: cur.header, seqCodes: codes };
+      attachLazyFacade(rec);
+      records.push(rec);
     }
     cur = null;
   };
@@ -13217,18 +13351,46 @@ async function parseFastaParallel(file, onProgress) {
       if (p.maxLen > maxLen) maxLen = p.maxLen;
     }
     const records = new Array(total);
+    console.log("[parse] assembling", total, "records");
+    const tAsm = performance.now();
+    let lastAsm = tAsm;
     let o = 0;
-    for (const p of parts) {
-      const bs = batches[p.index] || [];
-      for (const m of bs) {
-        for (let i = 0; i < m.headers.length; i++) {
-          const cd = m.codes[i];
-          records[o++] = cd
-            ? { header: m.headers[i], seqCodes: cd, seq: makeSeqFacade(cd) }
-            : { header: m.headers[i], seq: m.strings[i] };
+    try {
+      for (const p of parts) {
+        const bs = batches[p.index] || [];
+        const emitted = bs.reduce((n, m) => n + m.headers.length, 0);
+        if (emitted !== p.rowCount)
+          console.warn("[parse] stripe", p.index, "reported", p.rowCount, "rows but emitted", emitted); // the smoking gun (names itself)
+        for (const m of bs) {
+          const ab = m.arena.buffer; // one backing store per batch — records get views, not allocations
+          for (let i = 0; i < m.headers.length; i++) {
+            const off = m.offs[i];
+            let rec;
+            if (off !== 0xffffffff) {
+              rec = { __proto__: BYTE_ROW_PROTO, header: m.headers[i], seqCodes: new Uint8Array(ab, off, m.lens[i]) };
+            } else {
+              rec = { header: m.headers[i], seq: m.strings[i] };
+            }
+            records[o] = rec;
+            o++;
+          }
+          if (performance.now() - lastAsm > 5000) {
+            // per batch (~9k rows), throttled by time — first tick lands within seconds
+            lastAsm = performance.now();
+            console.log("[parse] assembled", o, "/", total);
+            await new Promise((r) => setTimeout(r, 0)); // let GC breathe and the modal paint
+          }
         }
       }
+    } catch (err) {
+      console.error("[parse] assembly died at row", o, "of", total, ":", err);
+      throw err;
     }
+    if (o !== total) {
+      console.warn("[parse] row accounting mismatch: assembled", o, "of", total, "— truncating holes");
+      records.length = o; // forEach skipped these silently; for..of does not
+    }
+    console.log("[parse] assembly done");
     records.forEach((r, i) => (r.id = i));
 
     const plane = hadWide || parts.some((p) => !p.planeCounts) ? null : mergePlanes(parts, maxLen);
@@ -13326,6 +13488,10 @@ async function precomputeLoadPass(records, onProgress) {
     }
     for (let c = len; c < cols; c++) counts[(c << DENSE_SHIFT) + DENSE_GAP]++;
     if (r % 512 === 511) {
+      if ((r & 262143) === 262143) {
+        // every 262k rows
+        console.log("[plane] sweep row", r + 1, "of", N);
+      }
       if (onProgress) onProgress(r + 1, N);
       if (performance.now() - last > 30) {
         await tick();
@@ -13802,7 +13968,7 @@ async function parseBlimStream(file, onProgress) {
             const rec = { id: i, header: name.slice(1).replace(/^>+/, "") };
             if (chardictIsByte) {
               rec.seqCodes = codes; // refCharCodes is Uint8, so .slice() gave us Uint8
-              rec.seq = makeSeqFacade(codes);
+              attachLazyFacade(rec);
             } else {
               rec.seq = codesToString(codes);
             }
@@ -13841,7 +14007,7 @@ async function parseBlimStream(file, onProgress) {
           const codes = new Uint8Array(columns);
           for (let c = 0; c < columns; c++) codes[c] = charCodes[blimCodeAt(cplane, c, charBits)];
           rec.seqCodes = codes;
-          rec.seq = makeSeqFacade(codes);
+          attachLazyFacade(rec);
           if (keepRef) refCharCodes = codes;
         } else {
           const codes = keepRef ? decodeCharCodes(cplane, new Uint16Array(columns)) : null;
@@ -14094,7 +14260,8 @@ async function parseBlimParallel(file, onProgress) {
     }
     records.forEach((r, i) => {
       r.id = i;
-      if (r.seqCodes && !r.seq) r.seq = makeSeqFacade(r.seqCodes); // facades are main-thread
+      //if (r.seqCodes && !r.seq) r.seq = makeSeqFacade(r.seqCodes); // facades are main-thread
+      if (r.seqCodes && !("seq" in r)) attachLazyFacade(r); // facades are main-thread, and now lazy
       if (r.colorPacked) r.colorPack = colorPack; // per-tab pack: bits + palette + cols
     });
     if (records.length !== seqCount)
@@ -14397,6 +14564,13 @@ async function openFileContent(displayName, fileOrText) {
   const tick = () => new Promise((r) => setTimeout(r, 0));
   try {
     prog.setLabel("Reading file...");
+    console.log(
+      "[load] enter:",
+      displayName,
+      typeof fileOrText === "string"
+        ? "string " + fileOrText.length + " chars"
+        : (fileOrText.size / 2 ** 30).toFixed(1) + " GB"
+    );
     prog.setProgress(0, 1);
     await tick(); // paint the modal before any work
 
@@ -14504,6 +14678,12 @@ async function openFileContent(displayName, fileOrText) {
             const vix = await parseFastaVirtualIndex(fileOrText, (done, total) =>
               prog.setProgress(0.2 + (done / total) * 0.5, 1)
             );
+            console.log(
+              "[load] virtual index:",
+              vix
+                ? `OK — ${vix.records.length} rows x ${vix.maxLen} cols, plane ${vix.plane ? "yes" : "no"}`
+                : "DECLINED"
+            );
             if (vix) {
               prog.setLabel("Building tab…");
               prog.setProgress(0.75, 1);
@@ -14535,6 +14715,7 @@ async function openFileContent(displayName, fileOrText) {
             );
             records = out.records;
             parallelPlane = out.plane;
+            console.log("[load] parse returned:", records.length, "records, plane:", parallelPlane ? "yes" : "no");
           } catch (err) {
             console.warn("[fasta] parallel parse failed, falling back to single-thread:", err);
             records = await parseFastaStream(fileOrText, (done, total) =>
@@ -14585,9 +14766,11 @@ async function openFileContent(displayName, fileOrText) {
     let maxLen = 0,
       minLen = Infinity;
     for (const r of records) {
-      if (r.seq.length > maxLen) maxLen = r.seq.length;
-      if (r.seq.length < minLen) minLen = r.seq.length;
+      const len = r.seqCodes ? r.seqCodes.length : r.seq.length; // seqCodes first — r.seq fires the lazy facade getter 6.7M times
+      if (len > maxLen) maxLen = len;
+      if (len < minLen) minLen = len;
     }
+    console.log("[load] dims:", records.length, "x", maxLen, "- aligned:", minLen === maxLen);
     if (minLen !== maxLen) {
       prog.close();
       showUnalignedWarningModal(async () => {
@@ -14638,6 +14821,7 @@ async function openFileContent(displayName, fileOrText) {
 
     prog.setLabel("Computing consensus...");
     if (parallelPlane && parallelPlane.cols !== maxLen) parallelPlane = null; // defensive: plane width must match
+    console.log("[load] consensus path:", parallelPlane ? "plane" : "sweep");
     const pre = parallelPlane
       ? {
           chars: simpleConsensusCharsFromPlane(parallelPlane, records, tabState0(records)),
@@ -14647,18 +14831,34 @@ async function openFileContent(displayName, fileOrText) {
       : await precomputeLoadPass(records, (done, total) => prog.setProgress(0.7 + (done / total) * 0.05, 1));
     prog.setProgress(0.75, 1);
     await tick();
-    const tabApi = pre
-      ? createTab(displayName, records, {
-          alphabet: pre.alphabet,
-          refreshDelay: 0,
-          ...(pre.chars
-            ? {
-                consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) },
-                loadPlane: pre.plane // retained!!! simple/clustal modals never re-sweep
-              }
-            : {})
-        })
-      : createTab(displayName, records);
+    console.log(
+      "[load] pre-build:",
+      records.length,
+      "rows,",
+      maxLen,
+      "cols —",
+      ((records.length * maxLen) / 1e9).toFixed(1),
+      "Gcells"
+    );
+    let tabApi;
+    try {
+      tabApi = pre
+        ? createTab(displayName, records, {
+            alphabet: pre.alphabet,
+            refreshDelay: 0,
+            ...(pre.chars
+              ? {
+                  consensusBaked: { chars: pre.chars, colors: new Uint16Array(pre.chars.length) },
+                  loadPlane: pre.plane // retained!!! simple/clustal modals never re-sweep
+                }
+              : {})
+          })
+        : createTab(displayName, records);
+      console.log("[load] createTab OK");
+    } catch (err) {
+      console.error("[load] createTab FAILED:", err);
+      throw err;
+    }
     prog.setProgress(1, 1);
     //setTimeout(() => maybeOfferDereplication(tabApi), 0);
   } finally {
