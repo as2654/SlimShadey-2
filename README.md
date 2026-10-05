@@ -6,6 +6,8 @@ SlimShadey 2 is a complete reimplementation of the [original SlimShadey](https:/
 
 **[Try it here](https://slimshadey.adsbio.net)** · **Read the [user manual](https://slimshadey-manual.adsbio.net)**
 
+Example alignments available in the main interface are pulled from: [Example files](https://github.com/as2654/SlimShadey-Examples).
+
 ## Features
 
 ### Shading
