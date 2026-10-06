@@ -9152,7 +9152,7 @@ function initLogoStrip(cfg) {
   };
 }
 
-// Conservation bars (per visible column)
+// Conservation bars (per visible column), effectively percent identity to majority consensus
 function initConservationStrip(cfg) {
   const {
     tabState,
@@ -9523,7 +9523,7 @@ function initOverviewStrip(cfg) {
   };
 }
 
-//  Viewport (bird's-eye overview)
+//  Viewport (bird's-eye overview): identical to bottom viewport in functionality
 function showViewportModal(tabState, vp) {
   const rows0 = tabState.records.length;
   if (rows0 === 0) return;
@@ -9978,7 +9978,7 @@ function createTab(name, records, presetState = null) {
     const physicalHeight = Math.max(1, realHeight * vScrollScale) + "px";
 
     spacer.style.height = physicalHeight;
-    namesPanel._vScrollScale = vScrollScale; //<- this line! without it, renderNameWindow's
+    namesPanel._vScrollScale = vScrollScale; // <- this line! without it, renderNameWindow's
     //   (namesPanel._vScrollScale || 1) regenerates the
     //   full-height spacer on every render
 
@@ -10896,7 +10896,7 @@ function createTab(name, records, presetState = null) {
   }
   rebuildAnnotationNames();
 
-  //  Confirm-delete modal
+  // Confirm-delete modal
   function showConfirmDeleteModal(label, onConfirm) {
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
@@ -11657,7 +11657,6 @@ function reindexColumnCacheMap(map, lo, hi) {
 //  the DOM. A spacer provides the scroll range; a translated window holds the
 //  visible slice. Reordering is data-driven (by record id), so the DOM slice
 //  is disposable and re-rendered from tabState.records
-
 function buildNamesPanel(namesPanel, tabState, onStructureChanged) {
   if (!namesPanel._vstate) {
     const spacer = document.createElement("div");
@@ -11688,7 +11687,7 @@ function renderNameWindow(namesPanel, tabState, onStructureChanged, force) {
   const realHeight = rows * h;
   st.spacer.style.height = Math.max(1, realHeight * scale) + "px";
 
-  // the same max-normalized physical->logical mapping realVScroll uses -
+  // the same max-normalized physical -> logical mapping realVScroll uses -
   // NOT a linear divide-by-scale (they differ by the viewport height)
   const physicalMax = Math.max(0, realHeight * scale - namesPanel.clientHeight);
   const realMax = Math.max(0, realHeight - namesPanel.clientHeight);
@@ -11855,7 +11854,7 @@ function showSaveProjectModal(onBlim, onSlim) {
   document.body.appendChild(overlay);
 }
 
-//Confirm-delete modal\
+// Confirm-delete modal
 function showConfirmDeleteModal(label, onConfirm) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -12101,6 +12100,7 @@ async function runDereplication(tabState, refreshFn) {
   showDereplicationModal(tabState, refreshFn, dupes);
 }
 
+// offer dereplication on demand, user knows what they have!
 function showDereplicationModal(tabState, refreshFn, dupeIndices) {
   const records = tabState.records; // the exact array the tab renders from
   const overlay = document.createElement("div");
@@ -12528,7 +12528,7 @@ function fastaWorkerUrl() {
 // Index-only FASTA scan: emits (header, header byte offset, decoded length) per row
 // instead of sequence data, so a file of ANY size indexes into ~tens of MB. Still
 // builds the dense load plane per stripe, virtual tabs get instant loadPlane-tier
-// warmups, identical to resident byte tabs.
+// warmups, identical to resident byte tabs. NOT loaded into memory fully.
 const FASTAINDEXWORKER_SOURCE = `
 "use strict";
 const SHIFT = 5, SLOTS = 32, OTHER = 31, PLANEMAXCOLS = 262144;
@@ -13386,7 +13386,7 @@ async function parseFastaParallel(file, onProgress) {
     }
     if (o !== total) {
       console.warn("[parse] row accounting mismatch: assembled", o, "of", total, "- truncating holes");
-      records.length = o; // forEach skipped these silently; for..of does not
+      records.length = o; // forEach skipped these silently; for(_ of _) does not
     }
     console.log("[parse] assembly done");
     records.forEach((r, i) => (r.id = i));
