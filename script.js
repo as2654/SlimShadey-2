@@ -869,7 +869,7 @@ function detectAlphabet(records) {
   let total = 0;
   for (let i = 0; i < N; i++) {
     const rec = records[i];
-    total += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first — .seq fires the lazy facade getter on every row
+    total += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first - .seq fires the lazy facade getter on every row
   }
   const exact = total <= 50e6; // same gate as the byte-row conversion: below it, exactness is free
   const stride = exact ? 1 : Math.max(1, Math.floor(N / DETECT_MAX_ROWS));
@@ -1980,7 +1980,7 @@ async function scanOnMain(records, reps, patterns, degap, overlap, onProgress) {
     let text,
       colMap = null;
     if (degap) {
-      const d = degapWithColMap(rec.seqCodes ? null : rec.seq, rec.seqCodes); // argument evaluation fires the facade — gate it
+      const d = degapWithColMap(rec.seqCodes ? null : rec.seq, rec.seqCodes); // argument evaluation fires the facade - gate it
       text = d.degapped.toUpperCase();
       colMap = d.colMap;
     } else text = rec.seqCodes ? SEQ_FACADE_DECODER.decode(rec.seqCodes) : String(rec.seq);
@@ -2081,8 +2081,8 @@ async function scanWithWorkers(records, reps, patterns, degap, overlap, onProgre
   }
 }
 
-// Core parallel scan: dedup → stripe representatives across workers (hits arrive as
-// per-row Maps, expanded inside the workers) → fan hits out to duplicate rows by
+// Core parallel scan: dedup -> stripe representatives across workers (hits arrive as
+// per-row Maps, expanded inside the workers) -> fan hits out to duplicate rows by
 // SHARING the representative's Map (all consumers are read-only).
 // onProgress(done, total, phase), phase is "dedup" or "scan"; scan totals are in
 // pattern-searches so legacy overlays keep their meaning.
@@ -2325,7 +2325,7 @@ async function regexSearchWithProgress(pattern, tabState, onMatch) {
       const end = Math.min(start + CHUNK, total);
       for (let r = start; r < end; r++) {
         const rec = records[r];
-        const text = rec.seqCodes ? SEQ_FACADE_DECODER.decode(rec.seqCodes) : rec.seq; // transient string — rec.seq would fire the lazy facade per row
+        const text = rec.seqCodes ? SEQ_FACADE_DECODER.decode(rec.seqCodes) : rec.seq; // transient string - rec.seq would fire the lazy facade per row
         re.lastIndex = 0;
         let m;
         while ((m = re.exec(text)) !== null) {
@@ -2455,7 +2455,7 @@ async function scoreRowsParallel(records, scores, refCodes, T, isNuc, prog, tota
             bytes += records[nextRow].seqCodes.byteLength;
             nextRow++;
           }
-          console.log("[sort] batch", lo, "→", nextRow); // temporary probe
+          console.log("[sort] batch", lo, "->", nextRow); // temporary probe
           await sendBatch(w, lo, nextRow);
         }
       })
@@ -2479,18 +2479,18 @@ async function scoreRowsParallel(records, scores, refCodes, T, isNuc, prog, tota
 }
 
 // Sort rows by similarity to a reference sequence. Metric follows context:
-// nucleotide → Hamming identity; protein from the sequence modal → BLOSUM62
-// default; protein from the matrix modal → the matrix selected there. Work is
+// nucleotide -> Hamming identity; protein from the sequence modal -> BLOSUM62
+// default; protein from the matrix modal -> the matrix selected there. Work is
 // O(cells), so progress and yields are per-CELL. Byte-row tabs score in workers
 // past 64M cells (pull-based batches, transferred copies); string tabs and small
 // tabs take the serial path. Ties keep pre-sort order (stable sort).
-// Facade rule: NO all-rows .seq reads — rec.seq fires the lazy facade getter.
+// Facade rule: NO all-rows .seq reads - rec.seq fires the lazy facade getter.
 // Codes-first everywhere; Uint8Array(length) zero-fill preserves facade OOB "-".
 async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
   if (virtualGate(tabState, "Sort by similarity")) return;
   const ref = tabState.records.find((r) => r.id === refId);
   if (!ref) {
-    console.warn("[sort] no record with id", refId, "— silent exit"); // was a silent return
+    console.warn("[sort] no record with id", refId, "- silent exit"); // was a silent return
     return;
   }
   const records = tabState.records;
@@ -2546,7 +2546,7 @@ async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
       for (let r = 0; r < N; r++) {
         const rec = records[r];
         const codes = rec.seqCodes || null;
-        const s = codes ? null : rec.seq; // codes-first — .seq would fire the facade
+        const s = codes ? null : rec.seq; // codes-first - .seq would fire the facade
         const len = Math.min(codes ? codes.length : s.length, refLen);
         let score = 0;
         for (let c0 = 0; c0 < len; c0 += CELL_CHUNK) {
@@ -2582,7 +2582,7 @@ async function sortBySequenceSimilarity(tabState, refId, onDone, matrixName) {
     const order = records.map((_, i) => i).sort((x, y) => scores[y] - scores[x]);
     const sorted = order.map((i) => records[i]);
     records.length = 0;
-    for (let i = 0; i < sorted.length; i++) records.push(sorted[i]); // no spread — push(...6.7M) overflows the argument budget
+    for (let i = 0; i < sorted.length; i++) records.push(sorted[i]); // no spread - push(...6.7M) overflows the argument budget
     console.log(
       "[sort] applied. identity order?",
       order.every((v, i) => v === i)
@@ -3108,7 +3108,7 @@ async function openByteSink(filename, estBytes) {
 // MSB-first bit writer for .blim planes. Accumulates fixed-width codes and emits
 // whole-byte chunks (~1 MiB) via emit(Uint8Array). flush() is called at each plane
 // boundary: the final partial byte is zero-padded in its low bits (spec §3).
-// Codes are ≤16 bits (colordict cap), so the accumulator never exceeds 23 live
+// Codes are <=16 bits (colordict cap), so the accumulator never exceeds 23 live
 // bits, safely inside JS's 32-bit bitwise range.
 function makeBitWriter(emit, chunkBytes = 1 << 20) {
   let buf = new Uint8Array(chunkBytes);
@@ -3174,7 +3174,7 @@ function makeSeqFacade(codes) {
   });
 }
 
-// The lazy seq accessor lives ONCE on a shared prototype instead of per record —
+// The lazy seq accessor lives ONCE on a shared prototype instead of per record -
 // 16M defineProperty-with-accessor calls (and the slow-object churn they cause)
 // become plain two-slot records with a prototype link.
 const BYTE_ROW_PROTO = {};
@@ -3194,7 +3194,7 @@ function attachLazyFacade(rec) {
   Object.setPrototypeOf(rec, BYTE_ROW_PROTO);
 }
 
-// ===== Virtual rows: FASTA too big for RAM keeps rows in the File and pages them =====
+//  Virtual rows: FASTA too big for RAM keeps rows in the File and pages them 
 //const VIRTUAL_MIN_BYTES = 6 * 2 ** 30; // console override: window.SS_VIRTUAL_MIN
 const VIRTUAL_MIN_BYTES = Number.POSITIVE_INFINITY; // opt-in only: window.SS_VIRTUAL_MIN in the console enables virtual mode
 const VPAGE_BYTES = 32 * 2 ** 20; // raw file bytes per page
@@ -3202,7 +3202,7 @@ const VPAGE_CACHE_BYTES = 768 * 2 ** 20;
 
 // Replays parseFastaStream's line semantics over one raw page: '>' at line start
 // opens a record; content lines trimmed of ASCII whitespace (<=32), internal kept.
-// Row lengths come from the index, so a mismatch means the file is pathological —
+// Row lengths come from the index, so a mismatch means the file is pathological -
 // those rows stay null (placeholders), nothing crashes.
 function decodeVirtualPage(bytes, page, lens) {
   const n = page.endRow - page.startRow;
@@ -3315,7 +3315,7 @@ function makeVirtualRowSource(file, offs, lens) {
       return ent ? ent.rows[r - pages[p].startRow] : null;
     },
     ensureRow(r) {
-      // Promise → resident; the cell editor's lazy open
+      // Promise -> resident; the cell editor's lazy open
       const p = pageOf[r];
       if (cache.has(p)) return Promise.resolve();
       return fetchPage(p, true) || inflight.get(p) || Promise.resolve();
@@ -3488,7 +3488,7 @@ async function openStreamSink(filename) {
         onCredit = null;
         reject(
           new Error(
-            "The download never started. Check Chrome's address bar for a blocked " +
+            "The download never started. Check Browser's address bar for a blocked " +
               '"automatic downloads" icon (allow it for this site), then retry.'
           )
         );
@@ -3619,7 +3619,7 @@ function showProgressOverlay(title) {
 }
 
 // FASTA export streams each record's sequence in 1MB slices. Rows decode
-// transiently from seqCodes — rec.seq would fire the lazy facade getter on
+// transiently from seqCodes - rec.seq would fire the lazy facade getter on
 // every row, and the cached facades would be retained after the export.
 async function exportFastaStreaming(records, filename) {
   const prog = showProgressOverlay("Exporting FASTA");
@@ -3636,7 +3636,7 @@ async function exportFastaStreaming(records, filename) {
       for (let r = 0; r < records.length; r++) {
         const rec = records[r];
         const codes = rec.seqCodes;
-        const s = codes ? SEQ_FACADE_DECODER.decode(codes) : rec.seq; // transient — GC collects it, nothing retained
+        const s = codes ? SEQ_FACADE_DECODER.decode(codes) : rec.seq; // transient - GC collects it, nothing retained
         buf += (r === 0 ? "" : "\n") + ">" + rec.header + "\n";
         for (let off = 0; off < s.length; off += 1000000) {
           buf += s.slice(off, off + 1000000);
@@ -3754,7 +3754,7 @@ async function generateRtfV2(
     });
   });
   tabState.records.forEach((rec, r) => {
-    const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+    const codes = rec.seqCodes; // hoisted - per-cell rec.seq reads would fire the lazy facade on every row
     const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
     rows.push({
       show: true,
@@ -4073,10 +4073,10 @@ function renderAlignmentPng(
         }
         y += CH;
       }
-      // sequence rows — each cell's color resolved exactly once
+      // sequence rows - each cell's color resolved exactly once
       for (let r = 0; r < seqRows; r++, y += CH) {
         const rec = tabState.records[r];
-        const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+        const codes = rec.seqCodes; // hoisted - per-cell rec.seq reads would fire the lazy facade on every row
         const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
         const colors = new Array(c1 - c0);
         for (let c = c0; c < c1; c++) colors[c - c0] = norm(resolveSeqColor(r, c, chAt(c)));
@@ -4272,7 +4272,7 @@ function svgForPrintPage(result, tabState, resolveSeqColor, resolveAnnoColor, re
       }
       for (let r = 0; r < seqRows; r++, y += CH) {
         const rec = tabState.records[r];
-        const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+        const codes = rec.seqCodes; // hoisted - per-cell rec.seq reads would fire the lazy facade on every row
         const chAt = (c) => (codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-");
         const colors = new Array(c1 - c0);
         const chars = new Array(c1 - c0);
@@ -4515,7 +4515,7 @@ async function exportBlimStreamingSerial(tabState, colCount, getSeqBgHex, getAnn
       return (parseInt(h.slice(s), 16) || 0) & 0xffffff; // rare fallback
     };
     const registerColor = (bg) => {
-      // -> dictionary index; 0 = white, never listed. Registers on first sight.
+      // to dictionary index; 0 = white, never listed. Registers on first sight
       const rgb = hexToRgb(bg);
       if (rgb === 0xffffff) return 0;
       let i = colorDict[rgb];
@@ -4804,7 +4804,7 @@ async function exportBlimStreamingSerial(tabState, colCount, getSeqBgHex, getAnn
   }
 }
 
-// ============================================================================
+// =
 // blim-parallel.js v2, worker-pool .blim/.bcmm exporter
 //
 // INTEGRATION: replaces the previous blim-parallel module wholesale. The
@@ -4832,8 +4832,9 @@ async function exportBlimStreamingSerial(tabState, colCount, getSeqBgHex, getAnn
 //
 // [BIT-ORDER] the worker's bit writer must pack bits exactly like makeBitWriter.
 //   MSB-first is active; an LSB-first variant is provided at the marker.
-// ============================================================================
+// =
 
+// brute force debugging, kept for final build for consistency in error reporting
 ("use strict");
 
 function blimParallelEligible(tabState, colCount) {
@@ -4860,9 +4861,8 @@ function blimParallelEligible(tabState, colCount) {
   );
 }
 
-// ---------------------------------------------------------------------------
+
 // Worker source (self-contained; loaded via Blob URL)
-// ---------------------------------------------------------------------------
 const BLIM_WORKER_SRC = `
 "use strict";
 var CT = null, COLS = 0;
@@ -5014,9 +5014,8 @@ self.onmessage = function (e) {
 };
 `;
 
-// ---------------------------------------------------------------------------
+
 // Main-thread orchestrator
-// ---------------------------------------------------------------------------
 async function exportBlimParallel(tabState, colCount, getSeqBgHex, getAnnoBgHex, getConsensus, filename) {
   const prog = showProgressOverlay("Saving project");
   const t0 = performance.now();
@@ -5194,7 +5193,7 @@ async function exportBlimParallel(tabState, colCount, getSeqBgHex, getAnnoBgHex,
       return { triples: null, dense };
     };
 
-    // ---- round 1: parallel sweep (local dicts + .bcmm diff counts) ----
+    // round 1: parallel sweep (local dicts + .bcmm diff counts) 
     console.log("[blim] parallel: sweep,", stripeCount, "stripes x", stripeRowsN, "rows on", nWorkers, "workers");
     const sweepResults = new Array(stripeCount);
     const q1 = workers.map(() => Promise.resolve());
@@ -5400,7 +5399,7 @@ async function exportBlimParallel(tabState, colCount, getSeqBgHex, getAnnoBgHex,
     await sink.write(enc.encode("}\n"));
     await sink.write(enc.encode("$sequence_data{\n"));
 
-    // ---- round 2: parallel pack, written strictly in stripe order ----
+    // round 2: parallel pack, written strictly in stripe order 
     console.log("[blim] parallel: pack");
     const packPromises = new Array(stripeCount);
     const q2 = workers.map(() => Promise.resolve());
@@ -5543,7 +5542,7 @@ async function exportSlimStreaming(tabState, colCount, getSeqBgHex, getAnnoBgHex
         buf += "$sequence_data{\n";
         for (let r = 0; r < tabState.records.length; r++) {
           const rec = tabState.records[r];
-          const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+          const codes = rec.seqCodes; // hoisted - per-cell rec.seq reads would fire the lazy facade on every row
           buf += "%>" + rec.header + "\n";
           await writeCells((c) => {
             const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-";
@@ -6400,7 +6399,7 @@ function showRtfExportModal(tabState, onExport) {
   document.body.appendChild(overlay);
 }
 
-//  Print preview too large: offer direct SVG export
+// Print preview too large: offer direct SVG export
 function showPrintTooLargeModal(onExportSvg) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -6755,7 +6754,7 @@ function buildSeqLogoSvg(tabState, colCount, opts) {
     const rgb = tabState.colors[tabState.alphabet][entry.code] || hexToRgbFloat(entry.hex);
     colorMap[entry.code] = rgbFloatToHex(rgb);
   });
-  // windowed decode — never the full row, never the facade (rec.seq fires the lazy getter)
+  // windowed decode - never the full row, never the facade (rec.seq fires the lazy getter)
   const seqs = tabState.records.map((r) => {
     const codes = r.seqCodes;
     if (codes)
@@ -6813,7 +6812,7 @@ function buildSeqLogoSvg(tabState, colCount, opts) {
   // onto the cell, the same squeeze/stretch as drawScaledGlyph, but vector)
   for (let index = 0; index < colCount; index++) {
     const column = [];
-    for (const seq of seqs) column.push(seq[index] || "-"); // pre-sliced — no colOffset here
+    for (const seq of seqs) column.push(seq[index] || "-"); // pre-sliced - no colOffset here
     const { freq, infoContent } = computeColumnLogoInfo(column, alphabetKeys, alphabetSize, useError);
     const columnWorkingHeight = maxInfo > 0 ? (infoContent / maxInfo) * actualWorkingHeight : 0;
     const entries = alphabetKeys
@@ -6853,7 +6852,7 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
     colorMap[entry.code] = rgbFloatToHex(rgb);
   });
 
-  // windowed decode — never the full row, never the facade (rec.seq fires the lazy getter)
+  // windowed decode - never the full row, never the facade (rec.seq fires the lazy getter)
   const seqs = tabState.records.map((r) => {
     const codes = r.seqCodes;
     if (codes)
@@ -6865,7 +6864,7 @@ function showSequenceLogoWindow(tabState, colCount, opts) {
   const columns = [];
   for (let c = 0; c < colCount; c++) {
     const col = [];
-    for (const seq of seqs) col.push(seq[c] || "-"); // seqs are pre-sliced to the window — no colOffset here
+    for (const seq of seqs) col.push(seq[c] || "-"); // seqs are pre-sliced to the window - no colOffset here
     columns.push(col);
   }
 
@@ -7130,7 +7129,7 @@ async function computeClustalConsensus(tabState, colCount, onProgress) {
         if (ch !== "-" && ch !== ".") counts[ch] = (counts[ch] || 0) + 1;
       }
     }
-    // decision logic unchanged: identity → *, strong group → *, weak group → .
+    // decision logic unchanged: identity -> *, strong group -> *, weak group -> .
     const chars = Object.keys(counts);
     let symbol = " ";
     if (chars.length === 1 && counts[chars[0]] === rows) symbol = "*";
@@ -7303,7 +7302,7 @@ function showRegexShadeModal(tabState, ctx) {
         }
 
         // paint the hits, in yielded batches. Paint-over semantics: previous
-        // strokes stay, new strokes land on top. No revert, no bookkeeping —
+        // strokes stay, new strokes land on top. No revert, no bookkeeping -
         // Clear shading is the eraser, and it belongs to the user.
         let pending = [];
         const rows = cfg.hitsByRow;
@@ -7706,7 +7705,7 @@ function consensusCharAt(tabState, col) {
   if (ch === undefined) {
     ch = computeConsensusColumn(tabState.records, col);
     // V8's fast-elements backing store dies near 2^27 entries (Chrome-specific;
-    // spec allows 2^32-1). Stay far under: beyond this, recompute instead of cache —
+    // spec allows 2^32-1). Stay far under: beyond this, recompute instead of cache -
     // sweeps never revisit columns, so nothing of value is lost.
     if (col < 1 << 26) cache[col] = ch;
   }
@@ -8680,7 +8679,7 @@ function initAlignmentRenderer(canvas, alignPanel, spacer, config) {
         ]);
       }
     );
-    // virtual tab, row not resident yet: the popup opened on placeholder data —
+    // virtual tab, row not resident yet: the popup opened on placeholder data -
     // fetch the page and patch the popup in place when the real bytes land
     if (record.vsrc && !record.vsrc.peekRowQuiet(cellPos.row)) {
       const popup = document.querySelector(".cell-edit-popup");
@@ -9016,7 +9015,7 @@ function initLogoStrip(cfg) {
     blitScrollX = null;
   }
 
-  // Virtual tabs: exact per-column frequencies from the retained load plane —
+  // Virtual tabs: exact per-column frequencies from the retained load plane -
   // never touches paged rows (a sampled scan through facades would kick a fetch
   // per sampled row and storm the pager)
   function computeColFromPlane(col) {
@@ -9234,7 +9233,7 @@ function initConservationStrip(cfg) {
 
   // identity of most common non-gap char in col, returns {ch, pct} or null.
   // Row-sampled (same cap as the logo strip) and allocation-free: at 20k rows a
-  // full scan was 20k string allocations per column; now ≤1000 sampled reads.
+  // full scan was 20k string allocations per column; now <=1000 sampled reads.
   const ROW_SAMPLE = 1000;
   function colStats(col) {
     if (statCache.has(col)) return statCache.get(col);
@@ -9324,7 +9323,7 @@ function initConservationStrip(cfg) {
       lastTipCol = col;
       ensureTip();
       const s = colStats(col);
-      tipEl.textContent = s ? `Col ${col + 1}: ${s.ch} · ${s.pct.toFixed(1)}%` : `Col ${col + 1}: —`;
+      tipEl.textContent = s ? `Col ${col + 1}: ${s.ch} · ${s.pct.toFixed(1)}%` : `Col ${col + 1}: -`;
       tipEl.style.display = "block";
     }
     tipEl.style.left = e.clientX - 12 + "px";
@@ -9783,10 +9782,10 @@ function createTab(name, records, presetState = null) {
   // already emits byte rows; this covers FASTA and .slim imports.
   {
     let totalCells = 0;
-    for (const rec of tabState.records) totalCells += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first — rec.seq would fire the lazy getter on 6M rows
+    for (const rec of tabState.records) totalCells += rec.seqCodes ? rec.seqCodes.length : rec.seq.length; // seqCodes first - rec.seq would fire the lazy getter on 6M rows
     if (totalCells > 50e6) {
       for (const rec of tabState.records) {
-        if (rec.seqCodes || typeof rec.seq !== "string") continue; // byte rows (and lazy-facade rows) need no conversion — and typeof rec.seq would fire the getter
+        if (rec.seqCodes || typeof rec.seq !== "string") continue; // byte rows (and lazy-facade rows) need no conversion - and typeof rec.seq would fire the getter
         const codes = encodeRowToBytes(rec.seq);
         if (codes) {
           rec.seqCodes = codes;
@@ -10079,7 +10078,7 @@ function createTab(name, records, presetState = null) {
     const go = () => {
       const n = parseInt(input.value, 10);
       if (!Number.isNaN(n)) {
-        scrollToCol(n - 1); // UI is 1-based, internals are 0-based
+        scrollToCol(n - 1); // UI is 1-based, internals are 0-based! the one time i miss programming in R
         overlay.remove();
       }
     };
@@ -10174,7 +10173,7 @@ function createTab(name, records, presetState = null) {
 
   function exportColumnsAsNewTab(lo, hi) {
     const newRecords = tabState.records.map((rec, r) => {
-      const codes = rec.seqCodes; // hoisted — per-cell rec.seq reads would fire the lazy facade on every row
+      const codes = rec.seqCodes; // hoisted - per-cell rec.seq reads would fire the lazy facade on every row
       const newSeq = [];
       const newCharColors = {};
       for (let c = lo; c <= hi; c++) {
@@ -10469,7 +10468,7 @@ function createTab(name, records, presetState = null) {
             next.set(rec.seqCodes.subarray(0, lo), 0);
             next.set(rec.seqCodes.subarray(Math.min(hi + 1, L)), lo);
             rec.seqCodes = next;
-            attachLazyFacade(rec); // keep facades lazy — an eager one here re-inflates every row on each deletion
+            attachLazyFacade(rec); // keep facades lazy - an eager one here re-inflates every row on each deletion
           }
         } else if (rec.seq.length > lo) {
           rec.seq = rec.seq.slice(0, lo) + rec.seq.slice(hi + 1);
@@ -10525,7 +10524,7 @@ function createTab(name, records, presetState = null) {
       tabState.consensusColors = reindexColumnMap(tabState.consensusColors, lo, hi);
 
       // lazily reindex the column-keyed caches instead of wiping them: a column's
-      // stats don't depend on other columns, so surviving entries stay valid —
+      // stats don't depend on other columns, so surviving entries stay valid -
       // only their indexes shift. Panning after a delete stays cache-warm.
       reindexColumnCacheMap(consensusCache, lo, hi); // the Proxy's outer memo
       if (tabState.consensusCols) tabState.consensusCols.splice(lo, hi - lo + 1); // inner memo: splice shifts in place
@@ -10597,7 +10596,7 @@ function createTab(name, records, presetState = null) {
             getColor: (r, c) => {
               const rec = tabState.records[r];
               const codes = rec.seqCodes;
-              const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-"; // codes-first — the Reset snapshot walks every row
+              const ch = codes ? (c < codes.length ? charOfCode(codes[c]) : "-") : rec.seq[c] || "-"; // codes-first - the Reset snapshot walks every row
               return recordColorAt(rec, c) || rgbFloatToHex(getShadeColor(tabState, r, c, ch));
             },
             setColor: (r, c, hex) => {
@@ -10630,7 +10629,7 @@ function createTab(name, records, presetState = null) {
     onCopyColumns: (lo, hi) => {
       const text = tabState.records
         .map((rec) => {
-          const codes = rec.seqCodes; // codes-first — rec.seq would fire the lazy facade on every row
+          const codes = rec.seqCodes; // codes-first - rec.seq would fire the lazy facade on every row
           const slice = codes
             ? SEQ_FACADE_DECODER.decode(codes.subarray(lo, Math.min(codes.length, hi + 1)))
             : rec.seq.slice(lo, hi + 1);
@@ -11456,8 +11455,8 @@ function createTab(name, records, presetState = null) {
         overviewStrip.invalidate();
       }
     };
-    // virtual tabs: a paged row arriving from disk makes placeholder cells real —
-    // repaint. Every read path (colCodeAt → facade → peekRow) kicks its own fetch;
+    // virtual tabs: a paged row arriving from disk makes placeholder cells real -
+    // repaint. Every read path (colCodeAt -> facade -> peekRow) kicks its own fetch;
     // this is the only callback the pager needs.
     if (tabState.virtual)
       tabState.virtual.onMiss = () => {
@@ -11609,10 +11608,10 @@ function closeTab(tabId, btnEl) {
   if (entry) {
     entry.ctls.forEach((ctl) => ctl.suspend());
     if (entry.ac) entry.ac.abort();
-    entry.stripDestroyers.forEach((s) => s && s.destroy && s.destroy()); // strip controllers: { destroy, invalidate, reindex } — destroy() clears their setInterval timers
+    entry.stripDestroyers.forEach((s) => s && s.destroy && s.destroy()); // strip controllers: { destroy, invalidate, reindex } - destroy() clears their setInterval timers
     if (entry.ro) entry.ro.disconnect();
     tabRenderers.delete(tabId);
-    // sever the payload — any stray closure now holds empty containers, not gigabytes of typed arrays
+    // sever the payload - any stray closure now holds empty containers, not gigabytes of typed arrays
     if (entry.tabState) {
       entry.tabState.records.length = 0;
       entry.tabState.records.push({ id: 0, header: "", seq: "" }); // benign shape for late callbacks
@@ -11689,7 +11688,7 @@ function renderNameWindow(namesPanel, tabState, onStructureChanged, force) {
   const realHeight = rows * h;
   st.spacer.style.height = Math.max(1, realHeight * scale) + "px";
 
-  // the same max-normalized physical->logical mapping realVScroll uses —
+  // the same max-normalized physical->logical mapping realVScroll uses -
   // NOT a linear divide-by-scale (they differ by the viewport height)
   const physicalMax = Math.max(0, realHeight * scale - namesPanel.clientHeight);
   const realMax = Math.max(0, realHeight - namesPanel.clientHeight);
@@ -11890,7 +11889,7 @@ function showConfirmDeleteModal(label, onConfirm) {
 
   overlay.appendChild(box);
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.remove(); // clicking outside = cancel
+    if (e.target === overlay) overlay.remove(); // again, clicking outside = cancel
   });
   document.body.appendChild(overlay);
 }
@@ -11945,9 +11944,6 @@ const EXAMPLE_EXTS = [".blim", ".slim", ".mm", ".fasta", ".fa", ".faa", ".fna"];
 //const EXAMPLE_CACHE_KEY = "slimshadey.examples.v2";
 //const EXAMPLE_CACHE_TTL = 15 * 60 * 1000; // 15 min
 
-// Used if the API call fails (rate limit, offline) so the menu never comes up empty
-//const FALLBACK_EXAMPLES = ["100_Mitogenomes.slim", "16S_E_coli.slim", "HOXA1.mm"];
-
 function exampleRawUrl(file) {
   return (
     "https://raw.githubusercontent.com/" +
@@ -11993,6 +11989,8 @@ function fetchExampleList() {
   }
   return exampleListPromise;
 }
+
+// old fallbacks - do not use!
 const EXAMPLES_BASE_URL =
   "https://raw.githubusercontent.com/shaha65/slim-shadey/22c7a80728456b87491b7946b0b80d4571779e6d/src/resources/examples";
 
@@ -12044,7 +12042,7 @@ async function parseFastaAsync(text, onProgress) {
   return records;
 }
 
-// Word-wise FNV-1a: one op per 4 bytes via a Uint32 view. Collisions don't matter —
+// Word-wise FNV-1a: one op per 4 bytes via a Uint32 view. Collisions don't matter -
 // the bucket's eq() compare is the arbiter, so this exists purely to group fast.
 function hashCodes(codes) {
   let h = 0x811c9dc5;
@@ -12058,7 +12056,7 @@ function hashCodes(codes) {
   return h >>> 0;
 }
 
-// File ▸ Dereplicate: the scan runs on demand, never at load, and the offer
+// File -> Dereplicate: the scan runs on demand, never at load, and the offer
 // modal only appears when duplicates actually exist.
 async function runDereplication(tabState, refreshFn) {
   if (virtualGate(tabState, "Dereplication")) return;
@@ -12140,7 +12138,7 @@ function showDereplicationModal(tabState, refreshFn, dupeIndices) {
     const keep = records.filter((_, i) => !dupeSet.has(i));
     records.length = 0; // same array object, identity preserved for the tab
     //records.push(...keep);
-    for (const rec of keep) records.push(rec); // no spread — push(...6.7M) overflows the argument budget
+    for (const rec of keep) records.push(rec); // no spread - push(...6.7M) overflows the argument budget
     refreshFn();
   });
 
@@ -12247,7 +12245,7 @@ async function* readFileLines(file, onProgress) {
 
 // Same streamer, but yields arrays of lines, one promise per chunk instead of
 // one per line. On a 10GB .slim (~600M lines) this is the difference between
-// a snack and a weekend :)
+// a snack and a dinner :)
 async function* readFileLineBatches(file, onProgress) {
   const decoder = new TextDecoder("utf-8");
   const reader = file.stream().getReader();
@@ -12338,7 +12336,7 @@ async function parseStripe(file, start, end, report, emitRows) {
         lens[i] = c.length;
         o += c.length;
       } else {
-        offs[i] = 0xffffffff; // wide/string row sentinel — its text lives in strings[i]
+        offs[i] = 0xffffffff; // wide/string row sentinel - its text lives in strings[i]
       }
     }
     emitRows(headers.slice(), strings.slice(), arena, offs, lens, [arena.buffer, offs.buffer, lens.buffer]);
@@ -12773,7 +12771,7 @@ async function parseFastaVirtualIndex(file, onProgress) {
     }
     for (let r = 0; r < N0(total); r++)
       if (lens[r] !== maxLen) {
-        console.warn("[virtual] decline: unaligned at row", r, "—", lens[r], "vs", maxLen);
+        console.warn("[virtual] decline: unaligned at row", r, "-", lens[r], "vs", maxLen);
         return null;
       }
     const plane = mergePlanes(parts, maxLen); // existing merger, same shape
@@ -12794,8 +12792,8 @@ function N0(n) {
   return n;
 } // keeps the aligned-check loop above readable
 
-// fast code extraction from a packed plane: MSB-first, width ≤ 16 bits.
-// a 3-byte window always suffices: shift ≤ 7, bits ≤ 16 -> 7 + 16 ≤ 24
+// fast code extraction from a packed plane: MSB-first, width <= 16 bits.
+// a 3-byte window always suffices: shift <= 7, bits <= 16 -> 7 + 16 <= 24
 function blimCodeAt(bytes, i, bits) {
   const bit = i * bits;
   const byte = Math.floor(bit / 8); // not >> 3: i*bits overflows int32 past 2^31 (≈268M cols × 9 bits)
@@ -13340,7 +13338,7 @@ async function parseFastaParallel(file, onProgress) {
       );
     }
     const parts = await Promise.all(jobs);
-    parts.sort((a, b) => a.index - b.index); // stripes are contiguous → row order is stripe order
+    parts.sort((a, b) => a.index - b.index); // stripes are contiguous -> row order is stripe order
 
     let total = 0,
       hadWide = false,
@@ -13362,7 +13360,7 @@ async function parseFastaParallel(file, onProgress) {
         if (emitted !== p.rowCount)
           console.warn("[parse] stripe", p.index, "reported", p.rowCount, "rows but emitted", emitted); // the smoking gun (names itself)
         for (const m of bs) {
-          const ab = m.arena.buffer; // one backing store per batch — records get views, not allocations
+          const ab = m.arena.buffer; // one backing store per batch - records get views, not allocations
           for (let i = 0; i < m.headers.length; i++) {
             const off = m.offs[i];
             let rec;
@@ -13375,7 +13373,7 @@ async function parseFastaParallel(file, onProgress) {
             o++;
           }
           if (performance.now() - lastAsm > 5000) {
-            // per batch (~9k rows), throttled by time — first tick lands within seconds
+            // per batch (~9k rows), throttled by time - first tick lands within seconds
             lastAsm = performance.now();
             console.log("[parse] assembled", o, "/", total);
             await new Promise((r) => setTimeout(r, 0)); // let GC breathe and the modal paint
@@ -13387,7 +13385,7 @@ async function parseFastaParallel(file, onProgress) {
       throw err;
     }
     if (o !== total) {
-      console.warn("[parse] row accounting mismatch: assembled", o, "of", total, "— truncating holes");
+      console.warn("[parse] row accounting mismatch: assembled", o, "of", total, "- truncating holes");
       records.length = o; // forEach skipped these silently; for..of does not
     }
     console.log("[parse] assembly done");
@@ -13429,7 +13427,7 @@ function mergePlanes(parts, cols) {
   };
 }
 
-// argmax per column over a dense plane: strict >, ascending char codes —
+// argmax per column over a dense plane: strict >, ascending char codes -
 // computeConsensusColumn's tie-breaking. OTHER-bucket columns recompute exactly.
 function consensusCharsFromPlane(plane, records) {
   const { counts, denseChar, shift, otherSlot, cols } = plane;
@@ -13455,10 +13453,10 @@ function consensusCharsFromPlane(plane, records) {
 }
 
 // One chunked sweep over freshly parsed byte rows:
-//   chars   , the baked consensus plane (outcome identical to computeConsensusColumn)
+//   chars, the baked consensus plane (outcome identical to computeConsensusColumn)
 //   alphabet, kills detectAlphabet's full-alignment scan
-//   plane   , the dense counts plane, RETAINED on the tab: the simple/clustal
-//              consensus modals read it decision-only instead of re-sweeping
+//   plane, the dense counts plane, RETAINED on the tab: the simple/clustal
+//          consensus modals read it decision-only instead of re-sweeping
 // Returns null for tabs with any string/wide rows, those keep the legacy lazy paths.
 // (Row hashing no longer happens here: derep computes word-wise hashes on demand.)
 async function precomputeLoadPass(records, onProgress) {
@@ -14058,7 +14056,7 @@ async function parseBlimStream(file, onProgress) {
 // parses the .bcmm reference row (row 0) itself and broadcasts its decoded vectors
 // in each worker's config; workers stripe the rows from seqStart onward, flushing
 // ~256MB row batches home via transfer lists. Assembly keeps the first seqCount
-// records in stripe order (trailing stripes may emit the row-shaped %consensus row —
+// records in stripe order (trailing stripes may emit the row-shaped %consensus row -
 // capped away), then the single consensus row is parsed on the main thread at the
 // offset the boundary worker reported. Any irregularity throws, the caller falls
 // back to parseBlimStream.
@@ -14461,8 +14459,8 @@ function adjustLoadPlaneForRows(tabState, rows, sign) {
 }
 
 // THE Simple (default) consensus rule, computed plane-direct: unique argmax over
-// the alphabet → uppercase when its share ≥ (rows−1)/rows, else lowercase; a tie
-// for the top count → space; OTHER-bucket columns fall back to an exact row scan
+// the alphabet -> uppercase when its share ≥ (rows−1)/rows, else lowercase; a tie
+// for the top count -> space; OTHER-bucket columns fall back to an exact row scan
 // (null on virtual tabs, no lazy O(rows) there). charSet order decides ties, so
 // keep alphabet order here. Shared by read-in, post-delete recompute, and the modal.
 function simpleConsensusDecision(counts, charSet, seqNum, alphabet) {
@@ -14541,7 +14539,7 @@ function recomputeSimpleConsensus(tabState, prog) {
   tabState.consensusCols = null; // drop the per-column memo so the new bake shows
 }
 
-// 256-slot sweep-plane twin of simpleConsensusCharsFromPlane (no OTHER bucket —
+// 256-slot sweep-plane twin of simpleConsensusCharsFromPlane (no OTHER bucket -
 // every code is exact; >255 codes read as " ").
 function simpleConsensusCharsFromPlane256(plane, cols, records, tabState) {
   const alphaList = tabState.alphabet === "nucleotide" ? NUCLEOTIDE_ALPHABET : PROTEIN_ALPHABET;
@@ -14681,7 +14679,7 @@ async function openFileContent(displayName, fileOrText) {
             console.log(
               "[load] virtual index:",
               vix
-                ? `OK — ${vix.records.length} rows x ${vix.maxLen} cols, plane ${vix.plane ? "yes" : "no"}`
+                ? `OK - ${vix.records.length} rows x ${vix.maxLen} cols, plane ${vix.plane ? "yes" : "no"}`
                 : "DECLINED"
             );
             if (vix) {
@@ -14692,7 +14690,7 @@ async function openFileContent(displayName, fileOrText) {
                 alphabet: vix.alphabet,
                 refreshDelay: 0,
                 consensusBaked: {
-                  chars: simpleConsensusCharsFromPlane(vix.plane, null, { alphabet: vix.alphabet }), // Simple parity; records=null → OTHER columns " "
+                  chars: simpleConsensusCharsFromPlane(vix.plane, null, { alphabet: vix.alphabet }), // Simple parity; records=null -> OTHER columns " "
                   colors: new Uint16Array(vix.maxLen)
                 },
                 loadPlane: vix.plane, // virtual tabs warm every shade mode from this
@@ -14766,7 +14764,7 @@ async function openFileContent(displayName, fileOrText) {
     let maxLen = 0,
       minLen = Infinity;
     for (const r of records) {
-      const len = r.seqCodes ? r.seqCodes.length : r.seq.length; // seqCodes first — r.seq fires the lazy facade getter 6.7M times
+      const len = r.seqCodes ? r.seqCodes.length : r.seq.length; // seqCodes first - r.seq fires the lazy facade getter 6.7M times
       if (len > maxLen) maxLen = len;
       if (len < minLen) minLen = len;
     }
@@ -14836,7 +14834,7 @@ async function openFileContent(displayName, fileOrText) {
       records.length,
       "rows,",
       maxLen,
-      "cols —",
+      "cols -",
       ((records.length * maxLen) / 1e9).toFixed(1),
       "Gcells"
     );
@@ -14861,6 +14859,7 @@ async function openFileContent(displayName, fileOrText) {
     }
     prog.setProgress(1, 1);
     //setTimeout(() => maybeOfferDereplication(tabApi), 0);
+    //no longer offered on startup - the user knows what they have
   } finally {
     prog.close();
     const bytes = typeof fileOrText === "string" ? fileOrText.length : fileOrText.size || 0;
